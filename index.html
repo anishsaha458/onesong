@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your Favorite Song</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Loading Spinner -->
+    <div id="loading" class="loading hidden">
+        <div class="spinner"></div>
+    </div>
+
+    <!-- Auth Container (Login/Signup) -->
+    <div id="auth-container" class="container">
+        <div class="auth-box">
+            <h1>🎵 Your Favorite Song</h1>
+            <p class="subtitle">Keep your favorite song close to you</p>
+
+            <!-- Login Form -->
+            <div id="login-form" class="auth-form">
+                <h2>Login</h2>
+                <input type="email" id="login-email" placeholder="Email" required>
+                <input type="password" id="login-password" placeholder="Password" required>
+                <button onclick="login()">Login</button>
+                <p class="toggle-auth">
+                    Don't have an account? 
+                    <a href="#" onclick="showSignup()">Sign up</a>
+                </p>
+            </div>
+
+            <!-- Signup Form -->
+            <div id="signup-form" class="auth-form hidden">
+                <h2>Sign Up</h2>
+                <input type="text" id="signup-username" placeholder="Username" required>
+                <input type="email" id="signup-email" placeholder="Email" required>
+                <input type="password" id="signup-password" placeholder="Password" required>
+                <button onclick="signup()">Sign Up</button>
+                <p class="toggle-auth">
+                    Already have an account? 
+                    <a href="#" onclick="showLogin()">Login</a>
+                </p>
+            </div>
+
+            <div id="auth-error" class="error-message hidden"></div>
+        </div>
+    </div>
+
+    <!-- Main App Container (After Login) -->
+    <div id="app-container" class="container hidden">
+        <!-- Header -->
+        <div class="header">
+            <h1>🎵 Your Favorite Song</h1>
+            <div class="user-info">
+                <span id="username-display"></span>
+                <button onclick="logout()" class="logout-btn">Logout</button>
+            </div>
+        </div>
+
+        <!-- Song Display (When song exists) -->
+        <div id="song-display" class="song-display hidden">
+            <div class="welcome-message">
+                <h2 id="welcome-text">Welcome back!</h2>
+                <p>Here's your favorite song</p>
+            </div>
+
+            <div class="song-card">
+                <img id="song-album-art" src="" alt="Album Art" class="album-art">
+                <div class="song-info">
+                    <h3 id="song-name"></h3>
+                    <p id="song-artist"></p>
+                </div>
+            </div>
+
+            <!-- Spotify Player -->
+            <div id="spotify-player" class="spotify-player"></div>
+
+            <!-- Preview Audio Player (if available) -->
+            <audio id="preview-player" controls class="audio-player hidden">
+                Your browser does not support the audio element.
+            </audio>
+
+            <div class="song-actions">
+                <a id="spotify-link" href="#" target="_blank" class="btn btn-spotify">
+                    Open in Spotify
+                </a>
+                <button onclick="showSongSelection()" class="btn btn-secondary">
+                    Change Song
+                </button>
+            </div>
+        </div>
+
+        <!-- Song Selection (When no song or changing) -->
+        <div id="song-selection" class="song-selection hidden">
+            <h2>Choose Your Favorite Song</h2>
+            <p class="subtitle">This is the one song that represents you</p>
+
+            <div class="search-box">
+                <input 
+                    type="text" 
+                    id="song-search" 
+                    placeholder="Search for a song or artist..."
+                    onkeypress="handleSearchEnter(event)"
+                >
+                <button onclick="searchSongs()" class="btn-search">Search</button>
+            </div>
+
+            <div id="search-error" class="error-message hidden"></div>
+
+            <div id="search-results" class="search-results"></div>
+
+            <button onclick="cancelSongSelection()" class="btn btn-secondary">
+                Cancel
+            </button>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
