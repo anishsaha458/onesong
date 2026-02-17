@@ -1,0 +1,52 @@
+Primary AI: Claude Sonnet 4.5
+Interface: claude.ai web chat
+
+1. Initial Project Scoping
+Prompt: "Can I use Render to build an authentication service on the free tier?"
+Outcome: Learned about Render free tier limitations — 15-minute spin-down, cold starts of 30-60 seconds, free PostgreSQL with 90-day expiry. Decided these constraints were acceptable for a class project demo.
+
+2. Deciding What Auth Protects
+Prompt: "What can the login be used for?"
+Outcome: Explored many use cases — task managers, note apps, dashboards. This conversation helped narrow the scope toward something personal and emotionally meaningful rather than purely functional.
+
+3. The Favorite Songs List Concept
+Prompt: "What about a required authentication for a holding place to keep their favorite song?"
+Outcome: Initial concept was a list of favorite songs. Authentication gated a personal collection — clear purpose, simple to build, good for demonstrating full-stack auth patterns.
+
+4. The Breakthrough — One Song Only
+Prompt: "I just want one song and one song only that plays when they log in which adds to the personal experience immensely — as if they're keeping their favorite song close to them"
+Outcome: This single prompt transformed the project. Changed from a generic list CRUD app to something with emotional resonance. One song per user means simpler schema (song data lives directly on the users table), cleaner UX, and a memorable demo moment when the song plays on login.
+
+5. Spotify API Integration
+Prompt: "Does the Spotify API still exist?"
+Outcome: Confirmed Spotify Web API is active. Initially planned to use it for song search and metadata. Learned about Client Credentials Flow (no user OAuth needed for search), album art URLs, and 30-second preview clips.
+
+6. Switching to YouTube
+Prompt: "Instead of Spotify which requires premium, can we use a different medium like YouTube?"
+Outcome: Pivoted to YouTube embedding — no API keys required at all, full songs play (not 30-second previews), much simpler implementation. Users paste a YouTube URL, the backend extracts the video ID via regex, and the frontend embeds it. Also removed the requests library from requirements.txt.
+
+
+Multiple deployment troubleshooting sessions
+Pydantic build failure due to Python 3.14 on Render — fixed by adding runtime.txt specifying Python 3.11.9
+Module not found error — fixed by ensuring main.py is at repository root, not inside a backend/ subfolder
+Database connection failure — fixed by adding DATABASE_URL environment variable pointing to Render's internal PostgreSQL URL
+Duplicate environment variable entry — removed the empty DATABASE_URL row in Render dashboard
+
+
+Prompt: "I need the Python files for the backend and frontend"
+Outcome: Claude generated the complete FastAPI backend (main.py) with auth endpoints, YouTube URL parsing, PostgreSQL integration, and JWT middleware. Also generated index.html, styles.css, and app.js for the frontend. Both README.md and PROMPT_HISTORY.txt were included as class submission requirements.
+
+
+Architecture Decisions
+
+Framework: FastAPI over Flask
+Auto-generated API documentation at /docs
+Built-in Pydantic validation on all request bodies
+Modern async support and better performance
+Type hints throughout for better maintainability
+
+YouTube over Spotify
+No API keys required — zero external service dependencies
+Full song playback (Spotify free tier only allows 30-second previews)
+Simple URL parsing with regex covers all YouTube URL formats
+Native iframe embedding supported by all browsers
