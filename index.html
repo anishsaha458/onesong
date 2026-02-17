@@ -7,12 +7,13 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+
     <!-- Loading Spinner -->
     <div id="loading" class="loading hidden">
         <div class="spinner"></div>
     </div>
 
-    <!-- Auth Container (Login/Signup) -->
+    <!-- Auth Container -->
     <div id="auth-container" class="container">
         <div class="auth-box">
             <h1>🎵 Your Favorite Song</h1>
@@ -25,7 +26,7 @@
                 <input type="password" id="login-password" placeholder="Password" required>
                 <button onclick="login()">Login</button>
                 <p class="toggle-auth">
-                    Don't have an account? 
+                    Don't have an account?
                     <a href="#" onclick="showSignup()">Sign up</a>
                 </p>
             </div>
@@ -36,9 +37,9 @@
                 <input type="text" id="signup-username" placeholder="Username" required>
                 <input type="email" id="signup-email" placeholder="Email" required>
                 <input type="password" id="signup-password" placeholder="Password" required>
-                <button onclick="signup()">Sign Up</button>
+                <button onclick="signup()">Create Account</button>
                 <p class="toggle-auth">
-                    Already have an account? 
+                    Already have an account?
                     <a href="#" onclick="showLogin()">Login</a>
                 </p>
             </div>
@@ -47,8 +48,9 @@
         </div>
     </div>
 
-    <!-- Main App Container (After Login) -->
+    <!-- Main App Container -->
     <div id="app-container" class="container hidden">
+
         <!-- Header -->
         <div class="header">
             <h1>🎵 Your Favorite Song</h1>
@@ -58,62 +60,63 @@
             </div>
         </div>
 
-        <!-- Song Display (When song exists) -->
+        <!-- Song Display -->
         <div id="song-display" class="song-display hidden">
             <div class="welcome-message">
                 <h2 id="welcome-text">Welcome back!</h2>
-                <p>Here's your favorite song</p>
+                <p>Here's your song</p>
             </div>
 
-            <div class="song-card">
-                <img id="song-album-art" src="" alt="Album Art" class="album-art">
-                <div class="song-info">
+            <div class="song-info-card">
+                <div class="song-text">
                     <h3 id="song-name"></h3>
                     <p id="song-artist"></p>
                 </div>
             </div>
 
-            <!-- Spotify Player -->
-            <div id="spotify-player" class="spotify-player"></div>
-
-            <!-- Preview Audio Player (if available) -->
-            <audio id="preview-player" controls class="audio-player hidden">
-                Your browser does not support the audio element.
-            </audio>
+            <!-- YouTube Player -->
+            <div id="youtube-player" class="youtube-player"></div>
 
             <div class="song-actions">
-                <a id="spotify-link" href="#" target="_blank" class="btn btn-spotify">
-                    Open in Spotify
-                </a>
                 <button onclick="showSongSelection()" class="btn btn-secondary">
                     Change Song
                 </button>
             </div>
         </div>
 
-        <!-- Song Selection (When no song or changing) -->
+        <!-- Song Selection -->
         <div id="song-selection" class="song-selection hidden">
             <h2>Choose Your Favorite Song</h2>
             <p class="subtitle">This is the one song that represents you</p>
 
-            <div class="search-box">
-                <input 
-                    type="text" 
-                    id="song-search" 
-                    placeholder="Search for a song or artist..."
-                    onkeypress="handleSearchEnter(event)"
+            <div class="song-form">
+                <input
+                    type="text"
+                    id="input-song-name"
+                    placeholder="Song Name (e.g. Bohemian Rhapsody)"
                 >
-                <button onclick="searchSongs()" class="btn-search">Search</button>
+                <input
+                    type="text"
+                    id="input-artist-name"
+                    placeholder="Artist Name (e.g. Queen)"
+                >
+                <input
+                    type="text"
+                    id="input-youtube-url"
+                    placeholder="YouTube URL (paste from browser)"
+                >
+                <p class="hint">
+                    Go to YouTube, find your song, copy the URL from the address bar and paste it above
+                </p>
+                <div id="song-form-error" class="error-message hidden"></div>
+                <button onclick="saveSong()">Save My Song</button>
             </div>
 
-            <div id="search-error" class="error-message hidden"></div>
-
-            <div id="search-results" class="search-results"></div>
-
-            <button onclick="cancelSongSelection()" class="btn btn-secondary">
+            <button onclick="cancelSongSelection()" class="btn btn-secondary" id="cancel-btn">
                 Cancel
             </button>
         </div>
+
     </div>
 
     <script src="app.js"></script>
