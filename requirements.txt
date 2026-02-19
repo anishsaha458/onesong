@@ -5,5 +5,4 @@ bcrypt
 psycopg2-binary
 pydantic
 pydantic[email]
-requests
 python-multipart

@@ -1,5 +1,5 @@
 // Configuration - UPDATE THIS with your Render backend URL
-const API_BASE_URL = 'https://your-app-name.onrender.com'; // CHANGE THIS!
+const API_BASE_URL = 'https://onesong.onrender.com'; // CHANGE THIS!
 
 // State
 let currentUser = null;
