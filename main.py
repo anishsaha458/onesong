@@ -19,7 +19,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:8080",
         "http://127.0.0.1:8080",
-        "https://yourusername.github.io",  # UPDATE THIS
+        "https://anishsaha458.github.io/onesong/",  # UPDATE THIS
         "*"  # Remove in production
     ],
     allow_credentials=True,
