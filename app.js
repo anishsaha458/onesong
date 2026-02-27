@@ -1,247 +1,163 @@
-// Configuration - UPDATE THIS with your Render backend URL
-const API_BASE_URL = 'https://onesong.onrender.com'; // CHANGE THIS!
+const API_BASE_URL = 'https://onesong.onrender.com';
 
 // State
 let currentUser = null;
 let authToken = null;
 let hasSong = false;
 let currentSong = null;
+let serverReady = false;
 
 // ─────────────────────────────────────────────────────────────
-// LOCAL MUSIC RECOMMENDATION ENGINE
-// A curated knowledge base of songs with tags for genre, mood,
-// tempo, era, and style. We compute a similarity score between
-// the user's song and every entry, then surface the top 3.
-// No API key or internet needed — runs entirely in the browser.
+// RENDER WAKE-UP
+// Free Render services sleep after 15 min of inactivity and
+// take ~30s to wake. We ping /health on page load and show
+// a friendly toast so users know to wait, not refresh.
 // ─────────────────────────────────────────────────────────────
-
-const MUSIC_DB = [
-  // Classic Rock
-  { title: "Bohemian Rhapsody", artist: "Queen", tags: ["classic rock", "epic", "theatrical", "70s", "ballad", "operatic", "slow", "fast"] },
-  { title: "Hotel California", artist: "Eagles", tags: ["classic rock", "70s", "guitar", "mellow", "mysterious", "slow"] },
-  { title: "Stairway to Heaven", artist: "Led Zeppelin", tags: ["classic rock", "70s", "guitar", "epic", "slow", "mystical", "long"] },
-  { title: "Comfortably Numb", artist: "Pink Floyd", tags: ["classic rock", "70s", "psychedelic", "guitar", "slow", "emotional", "epic"] },
-  { title: "Don't Stop Me Now", artist: "Queen", tags: ["classic rock", "70s", "upbeat", "fast", "fun", "energetic", "party"] },
-  { title: "November Rain", artist: "Guns N' Roses", tags: ["rock", "80s", "ballad", "epic", "slow", "emotional", "guitar"] },
-  { title: "Sweet Child O' Mine", artist: "Guns N' Roses", tags: ["rock", "80s", "guitar", "upbeat", "romantic", "fast"] },
-  { title: "Free Bird", artist: "Lynyrd Skynyrd", tags: ["classic rock", "70s", "guitar", "epic", "slow", "fast", "long"] },
-  { title: "More Than a Feeling", artist: "Boston", tags: ["classic rock", "70s", "upbeat", "guitar", "emotional"] },
-  { title: "Dream On", artist: "Aerosmith", tags: ["classic rock", "70s", "ballad", "emotional", "slow", "powerful"] },
-  // Pop
-  { title: "Blinding Lights", artist: "The Weeknd", tags: ["pop", "synth", "80s vibes", "fast", "upbeat", "night", "emotional", "retro"] },
-  { title: "Shape of You", artist: "Ed Sheeran", tags: ["pop", "2010s", "upbeat", "dance", "romance", "catchy"] },
-  { title: "Rolling in the Deep", artist: "Adele", tags: ["pop", "soul", "powerful", "emotional", "2010s", "breakup", "upbeat"] },
-  { title: "Someone Like You", artist: "Adele", tags: ["pop", "ballad", "emotional", "2010s", "breakup", "slow", "piano"] },
-  { title: "Happy", artist: "Pharrell Williams", tags: ["pop", "2010s", "upbeat", "fun", "feel-good", "fast", "dance"] },
-  { title: "Shake It Off", artist: "Taylor Swift", tags: ["pop", "2010s", "upbeat", "fun", "fast", "dance", "catchy"] },
-  { title: "Anti-Hero", artist: "Taylor Swift", tags: ["pop", "2020s", "introspective", "mid-tempo", "catchy", "emotional"] },
-  { title: "As It Was", artist: "Harry Styles", tags: ["pop", "2020s", "synth", "emotional", "upbeat", "catchy"] },
-  { title: "Levitating", artist: "Dua Lipa", tags: ["pop", "disco", "2020s", "upbeat", "dance", "fun", "fast"] },
-  { title: "Bad Guy", artist: "Billie Eilish", tags: ["pop", "dark", "2010s", "bass", "moody", "cool", "slow"] },
-  { title: "Therefore I Am", artist: "Billie Eilish", tags: ["pop", "dark", "2020s", "bass", "moody", "slow", "attitude"] },
-  { title: "Watermelon Sugar", artist: "Harry Styles", tags: ["pop", "2020s", "upbeat", "fun", "catchy", "feel-good"] },
-  // Hip-Hop / Rap
-  { title: "HUMBLE.", artist: "Kendrick Lamar", tags: ["hip-hop", "rap", "2010s", "bass", "aggressive", "cool", "fast"] },
-  { title: "God's Plan", artist: "Drake", tags: ["hip-hop", "rap", "2010s", "slow", "emotional", "melodic", "inspirational"] },
-  { title: "Lose Yourself", artist: "Eminem", tags: ["hip-hop", "rap", "2000s", "fast", "motivational", "intense", "rock"] },
-  { title: "SICKO MODE", artist: "Travis Scott", tags: ["hip-hop", "trap", "2010s", "bass", "fast", "moody", "dark"] },
-  { title: "Alright", artist: "Kendrick Lamar", tags: ["hip-hop", "rap", "2010s", "upbeat", "inspirational", "jazz"] },
-  { title: "Old Town Road", artist: "Lil Nas X", tags: ["hip-hop", "country", "2010s", "fun", "catchy", "upbeat"] },
-  { title: "Rockstar", artist: "Post Malone", tags: ["hip-hop", "trap", "2010s", "slow", "dark", "bass", "moody"] },
-  // R&B / Soul
-  { title: "Redbone", artist: "Childish Gambino", tags: ["r&b", "soul", "funk", "2010s", "slow", "moody", "sexy", "groovy"] },
-  { title: "Superstition", artist: "Stevie Wonder", tags: ["soul", "funk", "70s", "upbeat", "groovy", "classic", "dance"] },
-  { title: "No Scrubs", artist: "TLC", tags: ["r&b", "90s", "upbeat", "attitude", "fun", "catchy"] },
-  { title: "Drunk in Love", artist: "Beyoncé", tags: ["r&b", "2010s", "slow", "sexy", "romantic", "bass"] },
-  { title: "Crazy in Love", artist: "Beyoncé", tags: ["r&b", "2000s", "upbeat", "energetic", "dance", "catchy"] },
-  { title: "I Will Always Love You", artist: "Whitney Houston", tags: ["r&b", "pop", "ballad", "emotional", "powerful", "slow", "90s"] },
-  { title: "At Last", artist: "Etta James", tags: ["soul", "jazz", "classic", "slow", "romantic", "emotional"] },
-  { title: "What's Going On", artist: "Marvin Gaye", tags: ["soul", "r&b", "70s", "slow", "emotional", "social", "mellow"] },
-  // Electronic / Dance
-  { title: "One More Time", artist: "Daft Punk", tags: ["electronic", "dance", "2000s", "upbeat", "fun", "euphoric", "fast"] },
-  { title: "Get Lucky", artist: "Daft Punk", tags: ["electronic", "funk", "2010s", "groovy", "upbeat", "dance", "feel-good"] },
-  { title: "Blue (Da Ba Dee)", artist: "Eiffel 65", tags: ["electronic", "dance", "90s", "upbeat", "fun", "fast", "catchy"] },
-  { title: "Sandstorm", artist: "Darude", tags: ["electronic", "trance", "2000s", "fast", "energetic", "intense"] },
-  { title: "Levels", artist: "Avicii", tags: ["electronic", "edm", "2010s", "upbeat", "euphoric", "fast", "feel-good"] },
-  { title: "Animals", artist: "Martin Garrix", tags: ["electronic", "edm", "2010s", "fast", "energetic", "intense", "bass"] },
-  { title: "Lean On", artist: "Major Lazer", tags: ["electronic", "pop", "2010s", "upbeat", "fun", "catchy", "dance"] },
-  // Indie / Alternative
-  { title: "Mr. Brightside", artist: "The Killers", tags: ["indie", "rock", "2000s", "upbeat", "emotional", "guitar", "fast"] },
-  { title: "Take Me Out", artist: "Franz Ferdinand", tags: ["indie", "rock", "2000s", "upbeat", "dance", "guitar", "cool"] },
-  { title: "Seven Nation Army", artist: "The White Stripes", tags: ["rock", "indie", "2000s", "bass", "cool", "slow", "intense"] },
-  { title: "Creep", artist: "Radiohead", tags: ["alternative", "rock", "90s", "slow", "emotional", "dark", "guitar"] },
-  { title: "Smells Like Teen Spirit", artist: "Nirvana", tags: ["rock", "grunge", "90s", "fast", "intense", "guitar", "aggressive"] },
-  { title: "Wonderwall", artist: "Oasis", tags: ["indie", "rock", "90s", "guitar", "slow", "romantic", "emotional"] },
-  { title: "Africa", artist: "Toto", tags: ["pop", "rock", "80s", "upbeat", "feel-good", "catchy", "guitar"] },
-  { title: "Come As You Are", artist: "Nirvana", tags: ["rock", "grunge", "90s", "slow", "moody", "guitar"] },
-  { title: "Everlong", artist: "Foo Fighters", tags: ["rock", "alternative", "90s", "fast", "emotional", "guitar", "epic"] },
-  // Country
-  { title: "Take Me Home, Country Roads", artist: "John Denver", tags: ["country", "folk", "70s", "upbeat", "nostalgic", "feel-good", "guitar"] },
-  { title: "Friends in Low Places", artist: "Garth Brooks", tags: ["country", "90s", "upbeat", "fun", "party", "sing-along"] },
-  { title: "Jolene", artist: "Dolly Parton", tags: ["country", "70s", "emotional", "slow", "guitar", "storytelling"] },
-  { title: "Before He Cheats", artist: "Carrie Underwood", tags: ["country", "2000s", "emotional", "mid-tempo", "attitude", "powerful"] },
-  // Jazz / Blues
-  { title: "So What", artist: "Miles Davis", tags: ["jazz", "cool", "60s", "slow", "mellow", "instrumental"] },
-  { title: "Take Five", artist: "Dave Brubeck Quartet", tags: ["jazz", "60s", "cool", "mid-tempo", "instrumental", "mellow"] },
-  { title: "Feeling Good", artist: "Nina Simone", tags: ["jazz", "soul", "60s", "slow", "powerful", "emotional", "inspirational"] },
-  // Latin
-  { title: "Despacito", artist: "Luis Fonsi", tags: ["latin", "reggaeton", "2010s", "upbeat", "dance", "romantic", "fun"] },
-  { title: "La Bamba", artist: "Ritchie Valens", tags: ["latin", "rock", "50s", "upbeat", "fun", "fast", "dance"] },
-  { title: "Smooth", artist: "Santana", tags: ["latin", "rock", "guitar", "90s", "groovy", "upbeat", "sexy"] },
-  // 80s / Synth
-  { title: "Take On Me", artist: "a-ha", tags: ["pop", "80s", "synth", "upbeat", "fun", "catchy", "romantic"] },
-  { title: "Girls Just Want to Have Fun", artist: "Cyndi Lauper", tags: ["pop", "80s", "upbeat", "fun", "feel-good", "catchy"] },
-  { title: "Don't You (Forget About Me)", artist: "Simple Minds", tags: ["pop", "rock", "80s", "emotional", "mid-tempo", "nostalgic"] },
-  { title: "Sweet Dreams", artist: "Eurythmics", tags: ["pop", "synth", "80s", "moody", "dark", "mid-tempo", "cool"] },
-  { title: "Time After Time", artist: "Cyndi Lauper", tags: ["pop", "80s", "slow", "emotional", "romantic", "piano"] },
-  { title: "Every Breath You Take", artist: "The Police", tags: ["pop", "rock", "80s", "slow", "moody", "guitar", "obsessive"] },
-  // Classics / Timeless
-  { title: "Yesterday", artist: "The Beatles", tags: ["pop", "rock", "60s", "slow", "emotional", "piano", "acoustic", "nostalgic"] },
-  { title: "Let It Be", artist: "The Beatles", tags: ["pop", "rock", "60s", "slow", "inspirational", "piano", "emotional"] },
-  { title: "Hey Jude", artist: "The Beatles", tags: ["pop", "rock", "60s", "emotional", "uplifting", "slow", "epic"] },
-  { title: "My Generation", artist: "The Who", tags: ["rock", "60s", "fast", "aggressive", "cool", "attitude"] },
-  { title: "Purple Haze", artist: "Jimi Hendrix", tags: ["rock", "psychedelic", "60s", "guitar", "intense", "upbeat"] },
-  { title: "Johnny B. Goode", artist: "Chuck Berry", tags: ["rock", "50s", "fast", "fun", "guitar", "upbeat", "classic"] },
-  { title: "Respect", artist: "Aretha Franklin", tags: ["soul", "r&b", "60s", "upbeat", "powerful", "feel-good", "classic"] },
-  { title: "Born to Run", artist: "Bruce Springsteen", tags: ["rock", "70s", "epic", "upbeat", "guitar", "emotional"] },
-  { title: "American Pie", artist: "Don McLean", tags: ["folk", "rock", "70s", "slow", "nostalgic", "storytelling", "long"] },
-  // 2020s
-  { title: "drivers license", artist: "Olivia Rodrigo", tags: ["pop", "2020s", "slow", "emotional", "breakup", "piano", "ballad"] },
-  { title: "good 4 u", artist: "Olivia Rodrigo", tags: ["pop", "rock", "2020s", "fast", "upbeat", "attitude", "fun"] },
-  { title: "Peaches", artist: "Justin Bieber", tags: ["pop", "r&b", "2020s", "slow", "groovy", "romantic", "chill"] },
-  { title: "Stay", artist: "The Kid LAROI & Justin Bieber", tags: ["pop", "2020s", "upbeat", "fast", "catchy", "emotional"] },
-  { title: "Heat Waves", artist: "Glass Animals", tags: ["indie", "pop", "2020s", "slow", "emotional", "dreamy", "synth"] },
-  { title: "Montero", artist: "Lil Nas X", tags: ["pop", "hip-hop", "2020s", "upbeat", "fun", "attitude", "catchy"] },
-  { title: "About Damn Time", artist: "Lizzo", tags: ["pop", "funk", "2020s", "upbeat", "feel-good", "dance", "empowering"] },
-];
-
-// Extract likely tags from a song name + artist string using keyword heuristics
-function inferTagsFromText(text) {
-  const t = text.toLowerCase();
-  const inferred = [];
-
-  const keywordMap = {
-    "love": ["romantic", "emotional"],
-    "night": ["night", "dark", "moody"],
-    "dance": ["dance", "upbeat"],
-    "cry": ["emotional", "slow", "ballad"],
-    "dream": ["dreamy", "slow"],
-    "run": ["fast", "energetic"],
-    "fire": ["intense", "fast", "energetic"],
-    "rain": ["slow", "emotional", "moody"],
-    "sun": ["upbeat", "feel-good"],
-    "fly": ["upbeat", "inspirational"],
-    "death|dead|die": ["dark", "slow", "emotional"],
-    "happy|joy": ["upbeat", "feel-good", "fun"],
-    "sad|blue": ["slow", "emotional", "dark"],
-    "rock": ["rock", "guitar"],
-    "soul": ["soul", "emotional"],
-    "jazz": ["jazz", "mellow"],
-    "blues": ["blues", "guitar", "slow"],
-    "funk": ["funk", "groovy", "upbeat"],
-    "electric|synth": ["synth", "electronic"],
-    "acoustic": ["acoustic", "guitar", "slow"],
-    "piano": ["piano", "slow"],
-    "party": ["party", "upbeat", "fun"],
-    "god|heaven|angel": ["inspirational", "slow", "emotional"],
-    "street|city": ["cool", "urban"],
-    "summer": ["feel-good", "upbeat"],
-    "winter|cold": ["slow", "moody"],
-  };
-
-  for (const [pattern, tags] of Object.entries(keywordMap)) {
-    if (new RegExp(pattern).test(t)) inferred.push(...tags);
-  }
-  return inferred;
+function showToast(msg, color = '#a78bfa', spin = false) {
+    let el = document.getElementById('wake-toast');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'wake-toast';
+        el.style.cssText = `
+            position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+            background:#17171a;border:1px solid ${color};color:#f0ede8;
+            padding:12px 20px;border-radius:12px;
+            font-family:'DM Sans',sans-serif;font-size:14px;
+            display:flex;align-items:center;gap:10px;
+            box-shadow:0 8px 32px rgba(0,0,0,0.5);z-index:10000;
+            transition:opacity 0.4s;white-space:nowrap;
+        `;
+        document.body.appendChild(el);
+    }
+    el.style.borderColor = color;
+    el.style.opacity = '1';
+    el.innerHTML = (spin
+        ? `<div style="width:13px;height:13px;border:2px solid rgba(167,139,250,0.25);border-top-color:${color};border-radius:50%;animation:spin 0.8s linear infinite;flex-shrink:0"></div>`
+        : '') + `<span>${msg}</span>`;
+    el.style.display = 'flex';
 }
 
-// Jaccard similarity between two tag arrays
-function similarity(tagsA, tagsB) {
-  const setA = new Set(tagsA);
-  const setB = new Set(tagsB);
-  const intersection = [...setA].filter(t => setB.has(t)).length;
-  const union = new Set([...setA, ...setB]).size;
-  return union === 0 ? 0 : intersection / union;
+function hideToast() {
+    const el = document.getElementById('wake-toast');
+    if (el) { el.style.opacity = '0'; setTimeout(() => el && (el.style.display = 'none'), 400); }
 }
 
-function getRecommendations() {
+async function pingServer() {
+    try {
+        const res = await fetch(`${API_BASE_URL}/health`, {
+            signal: AbortSignal.timeout(65000)
+        });
+        if (res.ok) {
+            serverReady = true;
+            showToast('✓ Server ready', '#4ade80');
+            setTimeout(hideToast, 2000);
+            return true;
+        }
+    } catch (e) {
+        showToast('⚠ Server offline — try refreshing in 30s', '#e57373');
+    }
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────
+// LAST.FM RECOMMENDATION ENGINE
+// Uses the real Last.fm API (track.getSimilar) to fetch
+// genuinely similar songs based on the user's chosen track.
+// Falls back to track.search if the exact track isn't found.
+// ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// LAST.FM RECOMMENDATIONS
+// The API key lives in Render as an environment variable.
+// The frontend calls our own backend /recommendations endpoint,
+// which proxies to Last.fm — key never touches the browser.
+// ─────────────────────────────────────────────────────────────
+async function getRecommendations() {
   if (!currentSong) return;
 
   const recBtn = document.getElementById('rec-btn');
   const recSection = document.getElementById('recommendations-section');
+  const recLoading = document.getElementById('rec-loading');
+  const recError = document.getElementById('rec-error');
   const recList = document.getElementById('rec-list');
 
   recBtn.disabled = true;
   recBtn.textContent = '✦ Finding matches...';
+  recSection.classList.add('hidden');
+  recError.classList.add('hidden');
+  recLoading.classList.remove('hidden');
 
-  // Give the UI a moment to update before doing the work
-  setTimeout(() => {
-    const searchText = `${currentSong.song_name} ${currentSong.artist_name}`;
-    const inferredTags = inferTagsFromText(searchText);
-
-    // Find the user's song in the DB if it exists, merge its tags
-    const knownEntry = MUSIC_DB.find(
-      e => e.title.toLowerCase() === currentSong.song_name.toLowerCase() ||
-           e.artist.toLowerCase() === currentSong.artist_name.toLowerCase()
+  try {
+    const res = await fetch(
+      `${API_BASE_URL}/recommendations?track=${encodeURIComponent(currentSong.song_name)}&artist=${encodeURIComponent(currentSong.artist_name)}`,
+      { headers: { 'Authorization': `Bearer ${authToken}` } }
     );
-    const userTags = knownEntry
-      ? [...new Set([...knownEntry.tags, ...inferredTags])]
-      : inferredTags;
 
-    // Score every DB entry, exclude the user's own song
-    const scored = MUSIC_DB
-      .filter(e => e.title.toLowerCase() !== currentSong.song_name.toLowerCase())
-      .map(e => ({
-        ...e,
-        score: similarity(userTags, e.tags),
-        // Add tiny random noise so ties aren't always the same order
-        tiebreak: Math.random() * 0.01,
-      }))
-      .sort((a, b) => (b.score + b.tiebreak) - (a.score + a.tiebreak));
+    const data = await res.json();
 
-    const top3 = scored.slice(0, 3);
+    if (!res.ok) {
+      recError.textContent = data.detail || 'Could not fetch recommendations.';
+      recError.classList.remove('hidden');
+      return;
+    }
 
-    // Render
-    recList.innerHTML = top3.map((rec, i) => {
-      const matchPct = Math.round(rec.score * 100);
-      const sharedTags = rec.tags
-        .filter(t => userTags.includes(t))
-        .slice(0, 3)
-        .join(', ');
-      const reason = sharedTags
-        ? `Shares a ${sharedTags} vibe with your song.`
-        : `A great stylistic complement to your taste.`;
-      const query = encodeURIComponent(`${rec.title} ${rec.artist}`);
+    if (!data.tracks || data.tracks.length === 0) {
+      recError.textContent = 'No similar songs found for this track. Try a more well-known song!';
+      recError.classList.remove('hidden');
+      return;
+    }
 
+    recList.innerHTML = data.tracks.map(track => {
+      const query = encodeURIComponent(`${track.name} ${track.artist}`);
       return `
         <div class="rec-item">
           <div class="rec-item-header">
             <div class="rec-item-info">
-              <div class="rec-song-title">${rec.title}</div>
-              <div class="rec-artist">${rec.artist}</div>
+              <div class="rec-song-title">${escapeHtml(track.name)}</div>
+              <div class="rec-artist">${escapeHtml(track.artist)}</div>
             </div>
-            <div class="rec-match">${matchPct}% match</div>
+            ${track.match !== null ? `<div class="rec-match">${track.match}% match</div>` : ''}
           </div>
-          <div class="rec-reason">🎵 ${reason}</div>
-          <a class="rec-search-link"
-             href="https://www.youtube.com/results?search_query=${query}"
-             target="_blank" rel="noopener noreferrer">
-            Search on YouTube →
-          </a>
+          <div class="rec-reason">🎵 Recommended by Last.fm based on listener patterns similar to yours.</div>
+          <div class="rec-links">
+            <a class="rec-search-link"
+               href="https://www.youtube.com/results?search_query=${query}"
+               target="_blank" rel="noopener noreferrer">Search on YouTube →</a>
+            <a class="rec-search-link"
+               href="${escapeHtml(track.url)}"
+               target="_blank" rel="noopener noreferrer">View on Last.fm →</a>
+          </div>
         </div>`;
     }).join('');
 
     recSection.classList.remove('hidden');
     recBtn.textContent = '✦ Refresh Recommendations';
+
+  } catch (err) {
+    recError.textContent = 'Could not fetch recommendations. Check your connection and try again.';
+    recError.classList.remove('hidden');
+    console.error('Recommendations error:', err);
+  } finally {
+    recLoading.classList.add('hidden');
     recBtn.disabled = false;
-  }, 300);
+  }
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 // ─────────────────────────────────────────────
 // AUTH & APP LOGIC
 // ─────────────────────────────────────────────
 
-document.addEventListener('DOMContentLoaded', () => { checkAuth(); });
+document.addEventListener('DOMContentLoaded', () => {
+    showToast('⏳ Waking up server…', '#a78bfa', true);
+    pingServer().then(() => checkAuth());
+});
 
 function checkAuth() {
   authToken = localStorage.getItem('authToken');

@@ -1,8 +1,6 @@
 fastapi
 uvicorn
-PyJWT
-bcrypt
 psycopg2-binary
-pydantic
-pydantic[email]
-python-multipart
+pyjwt
+bcrypt
+httpx

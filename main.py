@@ -9,17 +9,17 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
 import re
+import httpx
 from datetime import datetime, timedelta
 
 app = FastAPI()
 
-# CORS configuration - UPDATE THIS with your GitHub Pages URL
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:8080",
         "http://127.0.0.1:8080",
-        "https://anishsaha458.github.io/onesong/",  # UPDATE THIS
+        "https://anishsaha458.github.io",
         "*"  # Remove in production
     ],
     allow_credentials=True,
@@ -27,14 +27,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Security
 security = HTTPBearer()
 
-# Environment variables (set these in Render dashboard)
 JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-this")
 DATABASE_URL = os.getenv("DATABASE_URL")
+LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")  # Set this in Render dashboard
+LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/"
 
-# Pydantic models
 class UserSignup(BaseModel):
     email: EmailStr
     username: str
@@ -49,9 +48,7 @@ class SongData(BaseModel):
     artist_name: str
     youtube_url: str
 
-# Helper: Extract YouTube video ID from URL
 def extract_youtube_id(url: str) -> Optional[str]:
-    """Extract YouTube video ID from various URL formats"""
     patterns = [
         r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
         r'(?:embed\/)([0-9A-Za-z_-]{11})',
@@ -64,9 +61,7 @@ def extract_youtube_id(url: str) -> Optional[str]:
             return match.group(1)
     return None
 
-# Database connection
 def get_db_connection():
-    """Get database connection"""
     try:
         conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
         return conn
@@ -74,12 +69,9 @@ def get_db_connection():
         print(f"Database connection error: {e}")
         raise HTTPException(status_code=500, detail="Database connection failed")
 
-# Initialize database tables
 def init_db():
-    """Create tables if they don't exist"""
     conn = get_db_connection()
     cur = conn.cursor()
-
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -94,14 +86,11 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
     conn.commit()
     cur.close()
     conn.close()
 
-# JWT functions
 def create_jwt_token(user_id: int, email: str) -> str:
-    """Create JWT token"""
     payload = {
         "user_id": user_id,
         "email": email,
@@ -110,7 +99,6 @@ def create_jwt_token(user_id: int, email: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    """Verify JWT token and return payload"""
     try:
         token = credentials.credentials
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
@@ -120,26 +108,18 @@ def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Depends(securit
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-# Routes
 @app.get("/")
 async def root():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "message": "Favorite Song API",
-        "version": "2.0.0"
-    }
+    return {"status": "healthy", "message": "OneSong API", "version": "3.0.0"}
 
 @app.get("/health")
 async def health_check():
-    """Detailed health check"""
     db_status = "healthy"
     try:
         conn = get_db_connection()
         conn.close()
     except:
         db_status = "unhealthy"
-
     return {
         "status": "healthy" if db_status == "healthy" else "degraded",
         "database": db_status,
@@ -148,184 +128,143 @@ async def health_check():
 
 @app.post("/auth/signup")
 async def signup(user: UserSignup):
-    """Create new user account"""
     conn = get_db_connection()
     cur = conn.cursor()
-
-    # Check if email already exists
     cur.execute("SELECT id FROM users WHERE email = %s", (user.email,))
     if cur.fetchone():
         cur.close()
         conn.close()
         raise HTTPException(status_code=400, detail="Email already registered")
-
-    # Hash password
     password_hash = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-    # Insert user
     cur.execute(
         "INSERT INTO users (email, username, password_hash) VALUES (%s, %s, %s) RETURNING id",
         (user.email, user.username, password_hash)
     )
     user_id = cur.fetchone()['id']
-
     conn.commit()
     cur.close()
     conn.close()
-
     token = create_jwt_token(user_id, user.email)
-
-    return {
-        "message": "User created successfully",
-        "token": token,
-        "user": {
-            "id": user_id,
-            "email": user.email,
-            "username": user.username
-        }
-    }
+    return {"message": "User created successfully", "token": token, "user": {"id": user_id, "email": user.email, "username": user.username}}
 
 @app.post("/auth/login")
 async def login(user: UserLogin):
-    """Login user"""
     conn = get_db_connection()
     cur = conn.cursor()
-
-    cur.execute(
-        "SELECT id, email, username, password_hash FROM users WHERE email = %s",
-        (user.email,)
-    )
+    cur.execute("SELECT id, email, username, password_hash FROM users WHERE email = %s", (user.email,))
     db_user = cur.fetchone()
-
     cur.close()
     conn.close()
-
     if not db_user:
         raise HTTPException(status_code=401, detail="Invalid email or password")
-
     if not bcrypt.checkpw(user.password.encode('utf-8'), db_user['password_hash'].encode('utf-8')):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-
     token = create_jwt_token(db_user['id'], db_user['email'])
-
-    return {
-        "message": "Login successful",
-        "token": token,
-        "user": {
-            "id": db_user['id'],
-            "email": db_user['email'],
-            "username": db_user['username']
-        }
-    }
+    return {"message": "Login successful", "token": token, "user": {"id": db_user['id'], "email": db_user['email'], "username": db_user['username']}}
 
 @app.get("/auth/verify")
 async def verify_token(payload: dict = Depends(verify_jwt_token)):
-    """Verify if token is valid"""
-    return {
-        "valid": True,
-        "user_id": payload['user_id'],
-        "email": payload['email']
-    }
+    return {"valid": True, "user_id": payload['user_id'], "email": payload['email']}
 
 @app.get("/user/song")
 async def get_user_song(payload: dict = Depends(verify_jwt_token)):
-    """Get user's favorite song"""
     user_id = payload['user_id']
-
     conn = get_db_connection()
     cur = conn.cursor()
-
-    cur.execute(
-        "SELECT song_name, artist_name, youtube_url, youtube_video_id FROM users WHERE id = %s",
-        (user_id,)
-    )
+    cur.execute("SELECT song_name, artist_name, youtube_url, youtube_video_id FROM users WHERE id = %s", (user_id,))
     user = cur.fetchone()
-
     cur.close()
     conn.close()
-
     if not user or not user['youtube_url']:
         return {"has_song": False, "song": None}
-
-    return {
-        "has_song": True,
-        "song": {
-            "song_name": user['song_name'],
-            "artist_name": user['artist_name'],
-            "youtube_url": user['youtube_url'],
-            "youtube_video_id": user['youtube_video_id']
-        }
-    }
+    return {"has_song": True, "song": {"song_name": user['song_name'], "artist_name": user['artist_name'], "youtube_url": user['youtube_url'], "youtube_video_id": user['youtube_video_id']}}
 
 @app.put("/user/song")
 async def update_user_song(song: SongData, payload: dict = Depends(verify_jwt_token)):
-    """Set or update user's favorite song"""
     user_id = payload['user_id']
-
-    # Extract YouTube video ID
     video_id = extract_youtube_id(song.youtube_url)
     if not video_id:
         raise HTTPException(status_code=400, detail="Invalid YouTube URL. Please paste a valid YouTube link.")
-
     conn = get_db_connection()
     cur = conn.cursor()
-
     cur.execute(
-        """UPDATE users SET
-           song_name = %s,
-           artist_name = %s,
-           youtube_url = %s,
-           youtube_video_id = %s,
-           updated_at = CURRENT_TIMESTAMP
-           WHERE id = %s""",
+        """UPDATE users SET song_name=%s, artist_name=%s, youtube_url=%s, youtube_video_id=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s""",
         (song.song_name, song.artist_name, song.youtube_url, video_id, user_id)
     )
-
     conn.commit()
     cur.close()
     conn.close()
+    return {"message": "Song saved successfully!", "song": {"song_name": song.song_name, "artist_name": song.artist_name, "youtube_url": song.youtube_url, "youtube_video_id": video_id}}
 
-    return {
-        "message": "Song saved successfully!",
-        "song": {
-            "song_name": song.song_name,
-            "artist_name": song.artist_name,
-            "youtube_url": song.youtube_url,
-            "youtube_video_id": video_id
+@app.get("/recommendations")
+async def get_recommendations(track: str, artist: str, payload: dict = Depends(verify_jwt_token)):
+    """Proxy Last.fm track.getSimilar — API key never exposed to browser."""
+    if not LASTFM_API_KEY:
+        raise HTTPException(status_code=500, detail="Last.fm API key not configured on server.")
+
+    async with httpx.AsyncClient() as client:
+        # Try track.getSimilar first
+        resp = await client.get(LASTFM_BASE, params={
+            "method": "track.getSimilar",
+            "track": track,
+            "artist": artist,
+            "api_key": LASTFM_API_KEY,
+            "format": "json",
+            "limit": "5",
+            "autocorrect": "1",
+        })
+        data = resp.json()
+        raw = data.get("similartracks", {}).get("track", [])
+
+        # Fallback: search then retry getSimilar
+        if not raw:
+            search_resp = await client.get(LASTFM_BASE, params={
+                "method": "track.search",
+                "track": track,
+                "api_key": LASTFM_API_KEY,
+                "format": "json",
+                "limit": "1",
+            })
+            results = search_resp.json().get("results", {}).get("trackmatches", {}).get("track", [])
+            if results:
+                found = results[0] if isinstance(results, list) else results
+                retry = await client.get(LASTFM_BASE, params={
+                    "method": "track.getSimilar",
+                    "track": found["name"],
+                    "artist": found["artist"],
+                    "api_key": LASTFM_API_KEY,
+                    "format": "json",
+                    "limit": "5",
+                    "autocorrect": "1",
+                })
+                raw = retry.json().get("similartracks", {}).get("track", [])
+
+    tracks = [
+        {
+            "name": t["name"],
+            "artist": t["artist"]["name"],
+            "match": round(float(t.get("match", 0)) * 100),
+            "url": t.get("url", ""),
         }
-    }
+        for t in raw[:3]
+    ]
+    return {"tracks": tracks}
 
 @app.get("/user/profile")
 async def get_user_profile(payload: dict = Depends(verify_jwt_token)):
-    """Get user profile information"""
     user_id = payload['user_id']
-
     conn = get_db_connection()
     cur = conn.cursor()
-
-    cur.execute(
-        "SELECT id, email, username, created_at FROM users WHERE id = %s",
-        (user_id,)
-    )
+    cur.execute("SELECT id, email, username, created_at FROM users WHERE id = %s", (user_id,))
     user = cur.fetchone()
-
     cur.close()
     conn.close()
-
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    return {"id": user['id'], "email": user['email'], "username": user['username'], "created_at": user['created_at'].isoformat() if user['created_at'] else None}
 
-    return {
-        "id": user['id'],
-        "email": user['email'],
-        "username": user['username'],
-        "created_at": user['created_at'].isoformat() if user['created_at'] else None
-    }
-
-# Initialize database on startup
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database tables on startup"""
     try:
         init_db()
         print("Database initialized successfully")
