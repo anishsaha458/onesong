@@ -3,7 +3,10 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Your Favorite Song</title>
+    <title>OneSong — Your Signature Track</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -16,31 +19,32 @@
     <!-- Auth Container -->
     <div id="auth-container" class="container">
         <div class="auth-box">
-            <h1>🎵 Your Favorite Song</h1>
-            <p class="subtitle">Keep your favorite song close to you</p>
+            <div class="auth-logo">
+                <span class="logo-note">♪</span>
+                <h1>OneSong</h1>
+            </div>
+            <p class="subtitle">The one song that defines you</p>
 
             <!-- Login Form -->
             <div id="login-form" class="auth-form">
-                <h2>Login</h2>
-                <input type="email" id="login-email" placeholder="Email" required>
+                <h2>Welcome back</h2>
+                <input type="email" id="login-email" placeholder="Email address" required>
                 <input type="password" id="login-password" placeholder="Password" required>
-                <button onclick="login()">Login</button>
+                <button onclick="login()">Sign In</button>
                 <p class="toggle-auth">
-                    Don't have an account?
-                    <a href="#" onclick="showSignup()">Sign up</a>
+                    New here? <a href="#" onclick="showSignup()">Create account</a>
                 </p>
             </div>
 
             <!-- Signup Form -->
             <div id="signup-form" class="auth-form hidden">
-                <h2>Sign Up</h2>
+                <h2>Join OneSong</h2>
                 <input type="text" id="signup-username" placeholder="Username" required>
-                <input type="email" id="signup-email" placeholder="Email" required>
-                <input type="password" id="signup-password" placeholder="Password" required>
+                <input type="email" id="signup-email" placeholder="Email address" required>
+                <input type="password" id="signup-password" placeholder="Password (min 6 chars)" required>
                 <button onclick="signup()">Create Account</button>
                 <p class="toggle-auth">
-                    Already have an account?
-                    <a href="#" onclick="showLogin()">Login</a>
+                    Already a member? <a href="#" onclick="showLogin()">Sign in</a>
                 </p>
             </div>
 
@@ -53,7 +57,10 @@
 
         <!-- Header -->
         <div class="header">
-            <h1>🎵 Your Favorite Song</h1>
+            <div class="header-logo">
+                <span class="logo-note-sm">♪</span>
+                <span class="header-title">OneSong</span>
+            </div>
             <div class="user-info">
                 <span id="username-display"></span>
                 <button onclick="logout()" class="logout-btn">Logout</button>
@@ -63,11 +70,12 @@
         <!-- Song Display -->
         <div id="song-display" class="song-display hidden">
             <div class="welcome-message">
+                <p class="welcome-label">YOUR SIGNATURE TRACK</p>
                 <h2 id="welcome-text">Welcome back!</h2>
-                <p>Here's your song</p>
             </div>
 
             <div class="song-info-card">
+                <div class="song-vinyl">🎵</div>
                 <div class="song-text">
                     <h3 id="song-name"></h3>
                     <p id="song-artist"></p>
@@ -77,7 +85,27 @@
             <!-- YouTube Player -->
             <div id="youtube-player" class="youtube-player"></div>
 
+            <!-- AI Recommendations Section -->
+            <div id="recommendations-section" class="recommendations-section hidden">
+                <div class="rec-header">
+                    <span class="rec-badge">✦ AI</span>
+                    <h3>Songs You Might Love</h3>
+                    <p class="rec-subtitle">Based on your taste, our AI picked these for you</p>
+                </div>
+                <div id="rec-list" class="rec-list"></div>
+            </div>
+
+            <div id="rec-loading" class="rec-loading hidden">
+                <div class="rec-spinner"></div>
+                <p>Finding matches...</p>
+            </div>
+
+            <div id="rec-error" class="rec-error hidden"></div>
+
             <div class="song-actions">
+                <button onclick="getRecommendations()" class="btn btn-ai" id="rec-btn">
+                    ✦ Get Song Recommendations
+                </button>
                 <button onclick="showSongSelection()" class="btn btn-secondary">
                     Change Song
                 </button>
@@ -86,27 +114,18 @@
 
         <!-- Song Selection -->
         <div id="song-selection" class="song-selection hidden">
-            <h2>Choose Your Favorite Song</h2>
-            <p class="subtitle">This is the one song that represents you</p>
+            <div class="selection-header">
+                <p class="welcome-label">CHOOSE WISELY</p>
+                <h2>Your One Song</h2>
+                <p class="subtitle">This single track will define your musical identity</p>
+            </div>
 
             <div class="song-form">
-                <input
-                    type="text"
-                    id="input-song-name"
-                    placeholder="Song Name (e.g. Bohemian Rhapsody)"
-                >
-                <input
-                    type="text"
-                    id="input-artist-name"
-                    placeholder="Artist Name (e.g. Queen)"
-                >
-                <input
-                    type="text"
-                    id="input-youtube-url"
-                    placeholder="YouTube URL (paste from browser)"
-                >
+                <input type="text" id="input-song-name" placeholder="Song name (e.g. Bohemian Rhapsody)">
+                <input type="text" id="input-artist-name" placeholder="Artist name (e.g. Queen)">
+                <input type="text" id="input-youtube-url" placeholder="YouTube URL (paste from browser)">
                 <p class="hint">
-                    Go to YouTube, find your song, copy the URL from the address bar and paste it above
+                    🔗 Go to YouTube → find your song → copy the URL from the address bar → paste above
                 </p>
                 <div id="song-form-error" class="error-message hidden"></div>
                 <button onclick="saveSong()">Save My Song</button>
