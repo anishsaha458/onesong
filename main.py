@@ -258,6 +258,29 @@ async def recommendations(track: str, artist: str, payload: dict = Depends(auth)
         for t in raw[:3]
     ]}
 
+
+@app.get("/mood")
+async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
+    """Fetch Last.fm tags and return them for client-side mood mapping."""
+    if not LASTFM_KEY:
+        raise HTTPException(500, "Last.fm API key not configured")
+    tags = []
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(LASTFM_BASE, params={
+            "method": "track.getTopTags", "track": track, "artist": artist,
+            "api_key": LASTFM_KEY, "format": "json", "autocorrect": "1",
+        })
+        raw = r.json().get("toptags", {}).get("tag", [])
+        tags = [t["name"].lower() for t in raw if int(t.get("count", 0)) > 10]
+        if len(tags) < 3:
+            r2 = await client.get(LASTFM_BASE, params={
+                "method": "artist.getTopTags", "artist": artist,
+                "api_key": LASTFM_KEY, "format": "json", "autocorrect": "1",
+            })
+            artist_tags = r2.json().get("toptags", {}).get("tag", [])
+            tags += [t["name"].lower() for t in artist_tags[:10]]
+    return {"tags": tags[:20]}
+
 @app.get("/user/profile")
 def profile(payload: dict = Depends(auth)):
     conn = get_db(); cur = conn.cursor()

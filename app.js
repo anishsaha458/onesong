@@ -9,9 +9,6 @@ let serverReady = false;
 
 // ─────────────────────────────────────────────────────────────
 // RENDER WAKE-UP
-// Free Render services sleep after 15 min of inactivity and
-// take ~30s to wake. We ping /health on page load and show
-// a friendly toast so users know to wait, not refresh.
 // ─────────────────────────────────────────────────────────────
 function showToast(msg, color = '#a78bfa', spin = false) {
     let el = document.getElementById('wake-toast');
@@ -60,16 +57,7 @@ async function pingServer() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// LAST.FM RECOMMENDATION ENGINE
-// Uses the real Last.fm API (track.getSimilar) to fetch
-// genuinely similar songs based on the user's chosen track.
-// Falls back to track.search if the exact track isn't found.
-// ─────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────
 // LAST.FM RECOMMENDATIONS
-// The API key lives in Render as an environment variable.
-// The frontend calls our own backend /recommendations endpoint,
-// which proxies to Last.fm — key never touches the browser.
 // ─────────────────────────────────────────────────────────────
 async function getRecommendations() {
   if (!currentSong) return;
@@ -155,6 +143,9 @@ function escapeHtml(str) {
 // ─────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', () => {
+    // Start the ambient WebGL background immediately
+    Ambient.init();
+
     showToast('⏳ Waking up server…', '#a78bfa', true);
     pingServer().then(() => checkAuth());
 });
@@ -183,6 +174,7 @@ async function verifyToken() {
 function showAuthContainer() {
   document.getElementById('auth-container').classList.remove('hidden');
   document.getElementById('app-container').classList.add('hidden');
+  Ambient.reset(); // calm default on auth screen
 }
 
 function showAppContainer() {
@@ -265,6 +257,7 @@ function logout() {
   authToken = null; currentUser = null; hasSong = false; currentSong = null;
   localStorage.removeItem('authToken');
   localStorage.removeItem('currentUser');
+  Ambient.reset();
   showAuthContainer();
 }
 
@@ -283,15 +276,13 @@ async function loadUserSong() {
 }
 
 // ─────────────────────────────────────────────
-// YOUTUBE EMBED FIX
-// Uses youtube-nocookie.com to bypass most
-// embedding restrictions, plus proper attributes.
+// YOUTUBE EMBED — autoplay + muted for background
 // ─────────────────────────────────────────────
 function buildYouTubeEmbed(videoId) {
   const origin = encodeURIComponent(window.location.origin || 'https://localhost');
   return `<iframe
     width="100%" height="100%"
-    src="https://www.youtube-nocookie.com/embed/${videoId}?rel=0&modestbranding=1&origin=${origin}"
+    src="https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&mute=1&loop=1&playlist=${videoId}&controls=0&disablekb=1&rel=0&modestbranding=1&playsinline=1&origin=${origin}"
     title="YouTube video player"
     frameborder="0"
     allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
@@ -313,6 +304,9 @@ function displaySong(song) {
   const recBtn = document.getElementById('rec-btn');
   recBtn.disabled = false;
   recBtn.textContent = '✦ Get Song Recommendations';
+
+  // ✦ Trigger AI ambient background for this song
+  Ambient.setSong(song.song_name, song.artist_name, authToken);
 }
 
 function showSongSelection() {
