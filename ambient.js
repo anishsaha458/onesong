@@ -1,11 +1,14 @@
 // ─────────────────────────────────────────────────────────────
-// AMBIENT ENGINE v2 — Last.fm tag-driven visual mood system
+// AMBIENT ENGINE v3 — BPM-synced, mood-driven visual system
 //
-// Flow:
-//   song name + artist → /mood endpoint → Last.fm tags
-//   → keyword mapper → palette → WebGL fluid shader
+// BPM resolution pipeline (4 layers):
+//   1. AcousticBrainz archive  → exact BPM
+//   2. Last.fm tag BPM hints   → "120bpm", "fast", "slow"
+//   3. Genre/mood BPM estimate → techno≈130, ballad≈70
+//   4. Default pulse           → 80 BPM, always looks good
 //
-// Falls back to a hash-based palette if tags are unavailable.
+// The beat drives a real-time "kick" uniform in the shader,
+// causing the whole fluid to surge and bloom on every beat.
 // ─────────────────────────────────────────────────────────────
 
 const Ambient = (() => {
@@ -17,6 +20,12 @@ const Ambient = (() => {
   let targetPalette  = null;
   let lerpT = 1;
 
+  // Beat state
+  let bpm         = 80;
+  let beatTimer   = null;
+  let kickValue   = 0;      // 0→1, decays each frame
+  let kickDecay   = 0.92;   // how fast the beat flash fades
+
   const DEFAULT = {
     colors:     [[0.08,0.06,0.12],[0.14,0.10,0.22],[0.06,0.08,0.16]],
     speed:      0.18,
@@ -26,7 +35,37 @@ const Ambient = (() => {
     brightness: 0.55,
   };
 
-  // ── TAG → MOOD RULES ───────────────────────────────────────
+  // ── GENRE/MOOD → BPM ESTIMATES (Layer 3 fallback) ─────────
+  const GENRE_BPM = [
+    { keys: ['drum and bass','dnb','jungle'],          bpm: 170 },
+    { keys: ['hardstyle','hardcore','gabber'],          bpm: 160 },
+    { keys: ['techno','hard techno'],                   bpm: 140 },
+    { keys: ['trance','psytrance','uplifting trance'],  bpm: 138 },
+    { keys: ['house','electro house','tech house'],     bpm: 128 },
+    { keys: ['edm','electronic dance','dance'],         bpm: 128 },
+    { keys: ['dubstep'],                                bpm: 140 },
+    { keys: ['disco','funk'],                           bpm: 118 },
+    { keys: ['hip hop','hiphop','hip-hop','trap'],      bpm: 90  },
+    { keys: ['rap'],                                    bpm: 88  },
+    { keys: ['reggaeton','latin'],                      bpm: 95  },
+    { keys: ['punk','hardcore punk'],                   bpm: 160 },
+    { keys: ['metal','heavy metal','death metal'],      bpm: 150 },
+    { keys: ['rock','hard rock','alternative rock'],    bpm: 120 },
+    { keys: ['indie rock','indie pop'],                 bpm: 115 },
+    { keys: ['pop'],                                    bpm: 118 },
+    { keys: ['r&b','rnb','soul'],                       bpm: 90  },
+    { keys: ['jazz'],                                   bpm: 120 },
+    { keys: ['blues'],                                  bpm: 80  },
+    { keys: ['classical','orchestral','symphony'],      bpm: 72  },
+    { keys: ['ambient','drone','experimental'],         bpm: 60  },
+    { keys: ['folk','acoustic','country','americana'],  bpm: 88  },
+    { keys: ['reggae','dub'],                           bpm: 80  },
+    { keys: ['ballad','sad','slow','melancholic'],      bpm: 68  },
+    { keys: ['chill','chillout','lo-fi','lofi'],        bpm: 75  },
+    { keys: ['energetic','energy','upbeat','fast'],     bpm: 130 },
+  ];
+
+  // ── TAG → MOOD RULES ──────────────────────────────────────
   const MOOD_RULES = [
     {
       keys: ['sad','melancholic','melancholy','heartbreak','heartbroken',
@@ -163,14 +202,64 @@ const Ambient = (() => {
     },
   ];
 
+  // ── BPM extraction helpers ─────────────────────────────────
+
+  // Layer 2: scan Last.fm tags for explicit BPM mentions
+  function bpmFromTags(tags) {
+    if (!tags || !tags.length) return null;
+
+    // Look for explicit numeric BPM tags like "120bpm", "120 bpm", "bpm120"
+    for (const tag of tags) {
+      const m = tag.match(/(\d{2,3})\s*bpm/i) || tag.match(/bpm\s*(\d{2,3})/i);
+      if (m) {
+        const val = parseInt(m[1]);
+        if (val >= 40 && val <= 220) return val;
+      }
+    }
+
+    // Text tempo descriptors
+    const tempoMap = [
+      { keys: ['very fast','blazing','breakneck'],      bpm: 180 },
+      { keys: ['fast','uptempo','up-tempo','speedy'],    bpm: 140 },
+      { keys: ['moderate','mid-tempo','midtempo'],       bpm: 100 },
+      { keys: ['slow','downtempo','down-tempo'],         bpm: 70  },
+      { keys: ['very slow','glacial','drone'],           bpm: 55  },
+    ];
+    for (const { keys, bpm } of tempoMap) {
+      if (keys.some(k => tags.some(t => t.includes(k)))) return bpm;
+    }
+    return null;
+  }
+
+  // Layer 3: estimate BPM from genre/mood tags
+  function bpmFromGenre(tags) {
+    if (!tags || !tags.length) return null;
+    for (const { keys, bpm } of GENRE_BPM) {
+      if (keys.some(k => tags.some(t => t.includes(k) || k.includes(t)))) return bpm;
+    }
+    return null;
+  }
+
+  // ── Beat clock ─────────────────────────────────────────────
+  function setBPM(newBpm) {
+    bpm = Math.max(40, Math.min(220, newBpm));
+    if (beatTimer) clearInterval(beatTimer);
+    const interval = (60 / bpm) * 1000; // ms per beat
+    beatTimer = setInterval(() => {
+      kickValue = 1.0; // full kick on beat
+    }, interval);
+    console.log(`[Ambient] BPM set to ${bpm} (${Math.round(interval)}ms/beat)`);
+  }
+
+  // ── Palette helpers ────────────────────────────────────────
   function tagsToMood(tags) {
-    if (!tags || tags.length === 0) return null;
+    if (!tags || !tags.length) return null;
     const matched = [];
     for (const rule of MOOD_RULES) {
       const hits = rule.keys.filter(k => tags.some(t => t.includes(k) || k.includes(t)));
       if (hits.length > 0) matched.push({ palette: rule.palette, weight: hits.length });
     }
-    if (matched.length === 0) return null;
+    if (!matched.length) return null;
 
     const totalWeight = matched.reduce((s, m) => s + m.weight, 0);
     const blended = {
@@ -192,40 +281,41 @@ const Ambient = (() => {
     return blended;
   }
 
-  // ── Hash fallback ──────────────────────────────────────────
   function hashPalette(songName, artistName) {
     const str = (songName + artistName).toLowerCase();
     let h = 0;
     for (let i = 0; i < str.length; i++) h = Math.imul(31, h) + str.charCodeAt(i) | 0;
-    const rand = (seed) => { let x = Math.sin(seed + h) * 43758.5453; return x - Math.floor(x); };
+    const rand = s => { let x = Math.sin(s + h) * 43758.5453; return x - Math.floor(x); };
     const hue = rand(1) * 360;
     const hsl2rgb = (h, s, l) => {
       h /= 360; s /= 100; l /= 100;
       const a = s * Math.min(l, 1 - l);
-      const f = n => { const k = (n + h * 12) % 12; return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
+      const f = n => { const k = (n + h*12)%12; return l - a*Math.max(-1,Math.min(k-3,9-k,1)); };
       return [f(0), f(8), f(4)];
     };
     return {
-      colors: [hsl2rgb(hue, 40, 12), hsl2rgb(hue+30, 45, 18), hsl2rgb(hue-20, 35, 10)],
-      speed:      0.12 + rand(2) * 0.15,
-      turbulence: 0.40 + rand(3) * 0.50,
-      pulseRate:  0.40 + rand(4) * 0.80,
-      orbCount:   2 + Math.round(rand(5) * 3),
-      brightness: 0.45 + rand(6) * 0.25,
+      colors: [hsl2rgb(hue,40,12), hsl2rgb(hue+30,45,18), hsl2rgb(hue-20,35,10)],
+      speed:      0.12 + rand(2)*0.15,
+      turbulence: 0.40 + rand(3)*0.50,
+      pulseRate:  0.40 + rand(4)*0.80,
+      orbCount:   2 + Math.round(rand(5)*3),
+      brightness: 0.45 + rand(6)*0.25,
     };
   }
 
-  // ── GLSL ───────────────────────────────────────────────────
+  // ── GLSL — kick uniform drives beat bloom ─────────────────
   const VERT = `
     attribute vec2 a_pos;
     void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
   `;
+
   const FRAG = `
     precision highp float;
     uniform float u_time;
     uniform vec2  u_res;
     uniform vec3  u_c0, u_c1, u_c2;
     uniform float u_speed, u_turb, u_pulse, u_orbs, u_bright;
+    uniform float u_kick;   // 0→1, beat impulse
 
     vec3 hash3(vec2 p) {
       vec3 q=vec3(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3)),dot(p,vec2(419.2,371.9)));
@@ -242,38 +332,58 @@ const Ambient = (() => {
       for(int i=0;i<5;i++){v+=a*noise(p);p=p*2.1+vec2(1.7,9.2);a*=0.5;}
       return v;
     }
+
     void main() {
       vec2 uv=gl_FragCoord.xy/u_res; uv.x*=u_res.x/u_res.y;
+
+      // Beat distorts the UV space — fluid lurches on kick
+      float kickPush = u_kick * 0.018;
+      vec2 center = vec2(0.5*u_res.x/u_res.y, 0.5);
+      vec2 toCenter = normalize(uv - center);
+      float distToCenter = length(uv - center);
+      uv += toCenter * kickPush * (1.0 - smoothstep(0.0, 0.8, distToCenter));
+
       float t=u_time*u_speed;
-      vec2 q=vec2(fbm(uv+t*0.4),fbm(uv+vec2(5.2,1.3)));
+      vec2 q=vec2(fbm(uv+t*0.4), fbm(uv+vec2(5.2,1.3)));
       vec2 r=vec2(fbm(uv+u_turb*q+vec2(1.7,9.2)+t*0.15),
                   fbm(uv+u_turb*q+vec2(8.3,2.8)+t*0.12));
       float f=fbm(uv+u_turb*r+t*0.1);
+
       float orbs=0.0;
       for(float i=0.0;i<6.0;i++){
         if(i>=u_orbs) break;
         float fi=i/max(u_orbs-1.0,1.0);
         float angle=fi*6.2832+t*(0.3+fi*0.2);
-        float radius=0.25+fi*0.18;
-        vec2 center=vec2(0.5*u_res.x/u_res.y+cos(angle)*radius,0.5+sin(angle)*radius*0.7);
-        float dist=length(uv-center);
+        // Orbs expand outward on kick
+        float radius=(0.25+fi*0.18)*(1.0+u_kick*0.15);
+        vec2 oc=vec2(0.5*u_res.x/u_res.y+cos(angle)*radius, 0.5+sin(angle)*radius*0.7);
+        float dist=length(uv-oc);
         float pulse=1.0+0.12*sin(t*u_pulse*6.2832+fi*2.094);
-        orbs+=(0.06*pulse)/(dist+0.001);
+        orbs+=(0.06*pulse*(1.0+u_kick*0.8))/(dist+0.001);
       }
+
       vec3 col=mix(u_c0,u_c1,clamp(f*f*f*2.5+orbs*0.3,0.0,1.0));
       col=mix(col,u_c2,clamp(length(q)*0.5+orbs*0.15,0.0,1.0));
-      float pulse=1.0+0.06*sin(t*u_pulse*6.2832);
-      col*=u_bright*pulse;
+
+      // Beat flash: brief brightness surge + slight hue push toward white
+      float beatFlash = u_kick * 0.35;
+      col = col + beatFlash * (vec3(1.0,1.0,1.0) - col) * 0.4;
+      col *= (u_bright + u_kick * 0.20);
+
       vec2 vig=uv-vec2(0.5*u_res.x/u_res.y,0.5);
-      col*=1.0-dot(vig,vig)*0.6;
-      gl_FragColor=vec4(col,1.0);
+      col*=1.0-dot(vig,vig)*(0.6 - u_kick*0.15);
+
+      gl_FragColor=vec4(clamp(col,0.0,1.0),1.0);
     }
   `;
 
   // ── WebGL init ─────────────────────────────────────────────
   function compile(type, src) {
     const s = gl.createShader(type);
-    gl.shaderSource(s, src); gl.compileShader(s); return s;
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      console.error('[Ambient] Shader:', gl.getShaderInfoLog(s));
+    return s;
   }
 
   function initGL() {
@@ -292,7 +402,8 @@ const Ambient = (() => {
     const loc = gl.getAttribLocation(program, 'a_pos');
     gl.enableVertexAttribArray(loc);
     gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    ['u_time','u_res','u_c0','u_c1','u_c2','u_speed','u_turb','u_pulse','u_orbs','u_bright']
+    ['u_time','u_res','u_c0','u_c1','u_c2',
+     'u_speed','u_turb','u_pulse','u_orbs','u_bright','u_kick']
       .forEach(n => uniforms[n] = gl.getUniformLocation(program, n));
     return true;
   }
@@ -308,23 +419,30 @@ const Ambient = (() => {
   function lerpPalette(a,b,t){
     return {
       colors: a.colors.map((c,i)=>lerpColor(c,b.colors[i],t)),
-      speed:      lerp(a.speed,b.speed,t),
-      turbulence: lerp(a.turbulence,b.turbulence,t),
-      pulseRate:  lerp(a.pulseRate,b.pulseRate,t),
-      orbCount:   lerp(a.orbCount,b.orbCount,t),
-      brightness: lerp(a.brightness,b.brightness,t),
+      speed:      lerp(a.speed,      b.speed,      t),
+      turbulence: lerp(a.turbulence, b.turbulence, t),
+      pulseRate:  lerp(a.pulseRate,  b.pulseRate,  t),
+      orbCount:   lerp(a.orbCount,   b.orbCount,   t),
+      brightness: lerp(a.brightness, b.brightness, t),
     };
   }
 
   function draw() {
     requestAnimationFrame(draw);
     if (!gl) return;
+
+    // Palette transition
     if (targetPalette && lerpT < 1) {
       lerpT = Math.min(lerpT + 0.004, 1);
       currentPalette = lerpPalette(currentPalette, targetPalette, lerpT);
     }
+
+    // Decay kick each frame
+    kickValue *= kickDecay;
+
     const p = currentPalette || DEFAULT;
     const t = (Date.now() - startTime) / 1000;
+
     gl.uniform1f(uniforms.u_time,   t);
     gl.uniform2f(uniforms.u_res,    canvas.width, canvas.height);
     gl.uniform3fv(uniforms.u_c0,    p.colors[0]);
@@ -335,6 +453,8 @@ const Ambient = (() => {
     gl.uniform1f(uniforms.u_pulse,  p.pulseRate);
     gl.uniform1f(uniforms.u_orbs,   p.orbCount);
     gl.uniform1f(uniforms.u_bright, p.brightness);
+    gl.uniform1f(uniforms.u_kick,   kickValue);
+
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
@@ -342,39 +462,69 @@ const Ambient = (() => {
   function init() {
     if (!initGL()) { console.warn('[Ambient] WebGL unavailable'); return; }
     currentPalette = JSON.parse(JSON.stringify(DEFAULT));
+    setBPM(80);
     resize();
     window.addEventListener('resize', resize);
     requestAnimationFrame(draw);
   }
 
   async function setSong(songName, artistName, authToken) {
-    // Instant hash palette — something shifts immediately
+    // Layer 4 default
+    let resolvedBpm = 80;
+
+    // Instant hash palette
     targetPalette = hashPalette(songName, artistName);
     lerpT = 0;
 
-    // Then upgrade with real Last.fm mood tags
     try {
+      // Fetch mood tags + BPM from backend in one call
       const res = await fetch(
-        `https://onesong.onrender.com/mood?track=${encodeURIComponent(songName)}&artist=${encodeURIComponent(artistName)}`,
+        `https://onesong.onrender.com/bpm?track=${encodeURIComponent(songName)}&artist=${encodeURIComponent(artistName)}`,
         { headers: { 'Authorization': `Bearer ${authToken}` } }
       );
-      if (!res.ok) return;
-      const data = await res.json();
-      const moodPalette = tagsToMood(data.tags);
-      if (moodPalette) {
-        targetPalette = moodPalette;
-        lerpT = 0;
-        console.log('[Ambient] Mood from tags:', data.tags.slice(0,5).join(', '));
+      if (res.ok) {
+        const data = await res.json();
+        const tags = data.tags || [];
+
+        // Upgrade palette from mood tags
+        const moodPalette = tagsToMood(tags);
+        if (moodPalette) {
+          targetPalette = moodPalette;
+          lerpT = 0;
+        }
+
+        // Layer 1: exact BPM from AcousticBrainz
+        if (data.bpm && data.bpm > 0) {
+          resolvedBpm = data.bpm;
+          console.log(`[Ambient] BPM from AcousticBrainz: ${resolvedBpm}`);
+        }
+        // Layer 2: BPM from tag text
+        else if (bpmFromTags(tags)) {
+          resolvedBpm = bpmFromTags(tags);
+          console.log(`[Ambient] BPM from tags: ${resolvedBpm}`);
+        }
+        // Layer 3: BPM from genre
+        else if (bpmFromGenre(tags)) {
+          resolvedBpm = bpmFromGenre(tags);
+          console.log(`[Ambient] BPM from genre: ${resolvedBpm}`);
+        }
+        else {
+          console.log(`[Ambient] BPM: using default ${resolvedBpm}`);
+        }
       }
-    } catch (e) {
-      console.warn('[Ambient] Tag fetch failed, using hash palette');
+    } catch(e) {
+      console.warn('[Ambient] BPM/mood fetch failed, using defaults', e);
     }
+
+    setBPM(resolvedBpm);
   }
 
   function reset() {
     targetPalette = JSON.parse(JSON.stringify(DEFAULT));
     lerpT = 0;
+    setBPM(80);
   }
 
   return { init, setSong, reset };
+
 })();
