@@ -79,21 +79,17 @@ async function getRecommendations() {
       `${API_BASE_URL}/recommendations?track=${encodeURIComponent(currentSong.song_name)}&artist=${encodeURIComponent(currentSong.artist_name)}`,
       { headers: { 'Authorization': `Bearer ${authToken}` } }
     );
-
     const data = await res.json();
-
     if (!res.ok) {
       recError.textContent = data.detail || 'Could not fetch recommendations.';
       recError.classList.remove('hidden');
       return;
     }
-
     if (!data.tracks || data.tracks.length === 0) {
-      recError.textContent = 'No similar songs found for this track. Try a more well-known song!';
+      recError.textContent = 'No similar songs found for this track.';
       recError.classList.remove('hidden');
       return;
     }
-
     recList.innerHTML = data.tracks.map(track => {
       const query = encodeURIComponent(`${track.name} ${track.artist}`);
       return `
@@ -107,23 +103,18 @@ async function getRecommendations() {
           </div>
           <div class="rec-reason">🎵 Recommended by Last.fm based on listener patterns similar to yours.</div>
           <div class="rec-links">
-            <a class="rec-search-link"
-               href="https://www.youtube.com/results?search_query=${query}"
+            <a class="rec-search-link" href="https://www.youtube.com/results?search_query=${query}"
                target="_blank" rel="noopener noreferrer">Search on YouTube →</a>
-            <a class="rec-search-link"
-               href="${escapeHtml(track.url)}"
+            <a class="rec-search-link" href="${escapeHtml(track.url)}"
                target="_blank" rel="noopener noreferrer">View on Last.fm →</a>
           </div>
         </div>`;
     }).join('');
-
     recSection.classList.remove('hidden');
     recBtn.textContent = '✦ Refresh Recommendations';
-
   } catch (err) {
-    recError.textContent = 'Could not fetch recommendations. Check your connection and try again.';
+    recError.textContent = 'Could not fetch recommendations. Check your connection.';
     recError.classList.remove('hidden');
-    console.error('Recommendations error:', err);
   } finally {
     recLoading.classList.add('hidden');
     recBtn.disabled = false;
@@ -132,18 +123,15 @@ async function getRecommendations() {
 
 function escapeHtml(str) {
   return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 // ─────────────────────────────────────────────
 // AUTH & APP LOGIC
 // ─────────────────────────────────────────────
-
 document.addEventListener('DOMContentLoaded', () => {
-    // Start the ambient WebGL background immediately
+    // Init ambient engine after DOM is ready
     Ambient.init();
 
     showToast('⏳ Waking up server…', '#a78bfa', true);
@@ -174,7 +162,7 @@ async function verifyToken() {
 function showAuthContainer() {
   document.getElementById('auth-container').classList.remove('hidden');
   document.getElementById('app-container').classList.add('hidden');
-  Ambient.reset(); // calm default on auth screen
+  Ambient.reset();
 }
 
 function showAppContainer() {
@@ -276,13 +264,16 @@ async function loadUserSong() {
 }
 
 // ─────────────────────────────────────────────
-// YOUTUBE EMBED — autoplay + muted for background
+// YOUTUBE EMBED
+// - Shows controls so user can adjust volume
+// - NO mute, NO autoplay (browser blocks unmuted autoplay anyway)
+// - Interaction overlay removed so controls work
 // ─────────────────────────────────────────────
 function buildYouTubeEmbed(videoId) {
   const origin = encodeURIComponent(window.location.origin || 'https://localhost');
   return `<iframe
     width="100%" height="100%"
-    src="https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&mute=1&loop=1&playlist=${videoId}&controls=0&disablekb=1&rel=0&modestbranding=1&playsinline=1&origin=${origin}"
+    src="https://www.youtube-nocookie.com/embed/${videoId}?rel=0&modestbranding=1&playsinline=1&origin=${origin}"
     title="YouTube video player"
     frameborder="0"
     allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
@@ -305,7 +296,7 @@ function displaySong(song) {
   recBtn.disabled = false;
   recBtn.textContent = '✦ Get Song Recommendations';
 
-  // ✦ Trigger AI ambient background for this song
+  // Trigger ambient background
   Ambient.setSong(song.song_name, song.artist_name, authToken);
 }
 

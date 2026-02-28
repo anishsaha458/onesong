@@ -524,12 +524,22 @@ const Ambient = (() => {
 
   // ── Public API ─────────────────────────────────────────────
   function init() {
-    if (!initGL()) { console.warn('[Ambient] WebGL unavailable'); return; }
+    if (!initGL()) {
+      console.warn('[Ambient] WebGL unavailable — falling back to CSS gradient');
+      // Fallback: animated CSS gradient so something always shows
+      document.body.style.background = `
+        radial-gradient(ellipse at 20% 30%, rgba(80,40,120,0.6) 0%, transparent 60%),
+        radial-gradient(ellipse at 80% 70%, rgba(40,60,120,0.5) 0%, transparent 60%),
+        #0d0d0f
+      `;
+      return;
+    }
     currentPalette = JSON.parse(JSON.stringify(DEFAULT));
     setBPM(80);
     resize();
     window.addEventListener('resize', resize);
     requestAnimationFrame(draw);
+    console.log('[Ambient] WebGL canvas running ✓');
   }
 
   async function setSong(songName, artistName, authToken) {
