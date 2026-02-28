@@ -1,14 +1,5 @@
 // ─────────────────────────────────────────────────────────────
 // AMBIENT ENGINE v3 — BPM-synced, mood-driven visual system
-//
-// BPM resolution pipeline (4 layers):
-//   1. AcousticBrainz archive  → exact BPM
-//   2. Last.fm tag BPM hints   → "120bpm", "fast", "slow"
-//   3. Genre/mood BPM estimate → techno≈130, ballad≈70
-//   4. Default pulse           → 80 BPM, always looks good
-//
-// The beat drives a real-time "kick" uniform in the shader,
-// causing the whole fluid to surge and bloom on every beat.
 // ─────────────────────────────────────────────────────────────
 
 const Ambient = (() => {
@@ -35,7 +26,6 @@ const Ambient = (() => {
     brightness: 0.55,
   };
 
-  // ── GENRE/MOOD → BPM ESTIMATES (Layer 3 fallback) ─────────
   const GENRE_BPM = [
     { keys: ['drum and bass','dnb','jungle'],          bpm: 170 },
     { keys: ['hardstyle','hardcore','gabber'],          bpm: 160 },
@@ -65,7 +55,6 @@ const Ambient = (() => {
     { keys: ['energetic','energy','upbeat','fast'],     bpm: 130 },
   ];
 
-  // ── TAG → MOOD RULES ──────────────────────────────────────
   const MOOD_RULES = [
     {
       keys: ['sad','melancholic','melancholy','heartbreak','heartbroken',
@@ -202,13 +191,8 @@ const Ambient = (() => {
     },
   ];
 
-  // ── BPM extraction helpers ─────────────────────────────────
-
-  // Layer 2: scan Last.fm tags for explicit BPM mentions
   function bpmFromTags(tags) {
     if (!tags || !tags.length) return null;
-
-    // Look for explicit numeric BPM tags like "120bpm", "120 bpm", "bpm120"
     for (const tag of tags) {
       const m = tag.match(/(\d{2,3})\s*bpm/i) || tag.match(/bpm\s*(\d{2,3})/i);
       if (m) {
@@ -216,8 +200,6 @@ const Ambient = (() => {
         if (val >= 40 && val <= 220) return val;
       }
     }
-
-    // Text tempo descriptors
     const tempoMap = [
       { keys: ['very fast','blazing','breakneck'],      bpm: 180 },
       { keys: ['fast','uptempo','up-tempo','speedy'],    bpm: 140 },
@@ -231,7 +213,6 @@ const Ambient = (() => {
     return null;
   }
 
-  // Layer 3: estimate BPM from genre/mood tags
   function bpmFromGenre(tags) {
     if (!tags || !tags.length) return null;
     for (const { keys, bpm } of GENRE_BPM) {
@@ -240,11 +221,7 @@ const Ambient = (() => {
     return null;
   }
 
-  // Layer 1.5: BPM from song title + artist name
-  // Catches classical markings, dance forms, and tempo words
-  // before falling through to genre tags.
   const TITLE_BPM = [
-    // Classical tempo markings (Italian)
     { keys: ['grave','larghissimo'],                      bpm: 40  },
     { keys: ['largo','lento','adagissimo'],               bpm: 50  },
     { keys: ['adagio'],                                   bpm: 60  },
@@ -255,7 +232,6 @@ const Ambient = (() => {
     { keys: ['vivace','vivacissimo'],                     bpm: 156 },
     { keys: ['presto'],                                   bpm: 168 },
     { keys: ['prestissimo'],                              bpm: 188 },
-    // Dance forms
     { keys: ['waltz','valse','vals'],                     bpm: 90  },
     { keys: ['mazurka'],                                  bpm: 112 },
     { keys: ['polka'],                                    bpm: 120 },
@@ -271,7 +247,6 @@ const Ambient = (() => {
     { keys: ['cha cha','cha-cha'],                        bpm: 120 },
     { keys: ['foxtrot'],                                  bpm: 120 },
     { keys: ['quickstep'],                                bpm: 200 },
-    // Common English tempo words in titles
     { keys: ['lullaby','cradle','berceuse','nocturne'],   bpm: 56  },
     { keys: ['hymn','chorale','prayer','requiem'],        bpm: 60  },
     { keys: ['elegy','funeral','dirge'],                  bpm: 52  },
@@ -284,7 +259,6 @@ const Ambient = (() => {
     { keys: ['etude','étude','prelude','prélude'],        bpm: 100 },
     { keys: ['fantasia','fantasy','impromptu'],           bpm: 96  },
     { keys: ['rhapsody'],                                 bpm: 108 },
-    // Modern tempo words that appear in titles
     { keys: ['slow jam','slow burn'],                     bpm: 65  },
     { keys: ['hypersonic','lightning','rocket','blitz'],  bpm: 180 },
     { keys: ['crawl','creep','drift','float'],            bpm: 58  },
@@ -295,7 +269,6 @@ const Ambient = (() => {
   function bpmFromTitle(songName, artistName) {
     const text = (songName + ' ' + artistName).toLowerCase();
     for (const { keys, bpm } of TITLE_BPM) {
-      // Use word-boundary-aware check so "largo" doesn't match "enlarge"
       if (keys.some(k => {
         const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         return new RegExp(`(?:^|[\\s\\-_(,])${escaped}(?:[\\s\\-_),]|$)`).test(text);
@@ -304,15 +277,40 @@ const Ambient = (() => {
     return null;
   }
 
-  // ── Beat clock ─────────────────────────────────────────────
+  // ── Beat sync controls ──────────────────────────────────────
   function setBPM(newBpm) {
     bpm = Math.max(40, Math.min(220, newBpm));
+    console.log(`[Ambient] BPM set to ${bpm} (${Math.round((60/bpm)*1000)}ms/beat)`);
+    // Restart timer if it was already running to match new BPM
+    if (beatTimer) startBeat(); 
+  }
+
+  function startBeat() {
     if (beatTimer) clearInterval(beatTimer);
-    const interval = (60 / bpm) * 1000; // ms per beat
+    const interval = (60 / bpm) * 1000;
+    kickValue = 1.0; 
     beatTimer = setInterval(() => {
-      kickValue = 1.0; // full kick on beat
+      kickValue = 1.0;
     }, interval);
-    console.log(`[Ambient] BPM set to ${bpm} (${Math.round(interval)}ms/beat)`);
+    console.log('[Ambient] Beat timer started');
+  }
+
+  function stopBeat() {
+    if (beatTimer) {
+      clearInterval(beatTimer);
+      beatTimer = null;
+      console.log('[Ambient] Beat timer stopped');
+    }
+  }
+
+  function syncBeat() {
+    // Called when the user presses spacebar to realign the downbeat
+    if (beatTimer) clearInterval(beatTimer);
+    kickValue = 1.0; 
+    const interval = (60 / bpm) * 1000;
+    beatTimer = setInterval(() => {
+      kickValue = 1.0;
+    }, interval);
   }
 
   // ── Palette helpers ────────────────────────────────────────
@@ -367,7 +365,6 @@ const Ambient = (() => {
     };
   }
 
-  // ── GLSL — kick uniform drives beat bloom ─────────────────
   const VERT = `
     attribute vec2 a_pos;
     void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
@@ -379,7 +376,7 @@ const Ambient = (() => {
     uniform vec2  u_res;
     uniform vec3  u_c0, u_c1, u_c2;
     uniform float u_speed, u_turb, u_pulse, u_orbs, u_bright;
-    uniform float u_kick;   // 0→1, beat impulse
+    uniform float u_kick;
 
     vec3 hash3(vec2 p) {
       vec3 q=vec3(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3)),dot(p,vec2(419.2,371.9)));
@@ -400,7 +397,6 @@ const Ambient = (() => {
     void main() {
       vec2 uv=gl_FragCoord.xy/u_res; uv.x*=u_res.x/u_res.y;
 
-      // Beat distorts the UV space — fluid lurches on kick
       float kickPush = u_kick * 0.018;
       vec2 center = vec2(0.5*u_res.x/u_res.y, 0.5);
       vec2 toCenter = normalize(uv - center);
@@ -418,7 +414,6 @@ const Ambient = (() => {
         if(i>=u_orbs) break;
         float fi=i/max(u_orbs-1.0,1.0);
         float angle=fi*6.2832+t*(0.3+fi*0.2);
-        // Orbs expand outward on kick
         float radius=(0.25+fi*0.18)*(1.0+u_kick*0.15);
         vec2 oc=vec2(0.5*u_res.x/u_res.y+cos(angle)*radius, 0.5+sin(angle)*radius*0.7);
         float dist=length(uv-oc);
@@ -429,7 +424,6 @@ const Ambient = (() => {
       vec3 col=mix(u_c0,u_c1,clamp(f*f*f*2.5+orbs*0.3,0.0,1.0));
       col=mix(col,u_c2,clamp(length(q)*0.5+orbs*0.15,0.0,1.0));
 
-      // Beat flash: brief brightness surge + slight hue push toward white
       float beatFlash = u_kick * 0.35;
       col = col + beatFlash * (vec3(1.0,1.0,1.0) - col) * 0.4;
       col *= (u_bright + u_kick * 0.20);
@@ -441,7 +435,6 @@ const Ambient = (() => {
     }
   `;
 
-  // ── WebGL init ─────────────────────────────────────────────
   function compile(type, src) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src); gl.compileShader(s);
@@ -477,7 +470,6 @@ const Ambient = (() => {
     if (gl) gl.viewport(0, 0, canvas.width, canvas.height);
   }
 
-  // ── Render loop ────────────────────────────────────────────
   function lerp(a,b,t){return a+(b-a)*t;}
   function lerpColor(a,b,t){return a.map((v,i)=>lerp(v,b[i],t));}
   function lerpPalette(a,b,t){
@@ -495,13 +487,11 @@ const Ambient = (() => {
     requestAnimationFrame(draw);
     if (!gl) return;
 
-    // Palette transition
     if (targetPalette && lerpT < 1) {
       lerpT = Math.min(lerpT + 0.004, 1);
       currentPalette = lerpPalette(currentPalette, targetPalette, lerpT);
     }
 
-    // Decay kick each frame
     kickValue *= kickDecay;
 
     const p = currentPalette || DEFAULT;
@@ -522,11 +512,9 @@ const Ambient = (() => {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
-  // ── Public API ─────────────────────────────────────────────
   function init() {
     if (!initGL()) {
       console.warn('[Ambient] WebGL unavailable — falling back to CSS gradient');
-      // Fallback: animated CSS gradient so something always shows
       document.body.style.background = `
         radial-gradient(ellipse at 20% 30%, rgba(80,40,120,0.6) 0%, transparent 60%),
         radial-gradient(ellipse at 80% 70%, rgba(40,60,120,0.5) 0%, transparent 60%),
@@ -543,15 +531,11 @@ const Ambient = (() => {
   }
 
   async function setSong(songName, artistName, authToken) {
-    // Layer 4 default
     let resolvedBpm = 80;
-
-    // Instant hash palette
     targetPalette = hashPalette(songName, artistName);
     lerpT = 0;
 
     try {
-      // Fetch mood tags + BPM from backend in one call
       const res = await fetch(
         `https://onesong.onrender.com/bpm?track=${encodeURIComponent(songName)}&artist=${encodeURIComponent(artistName)}`,
         { headers: { 'Authorization': `Bearer ${authToken}` } }
@@ -560,48 +544,30 @@ const Ambient = (() => {
         const data = await res.json();
         const tags = data.tags || [];
 
-        // Upgrade palette from mood tags
         const moodPalette = tagsToMood(tags);
         if (moodPalette) {
           targetPalette = moodPalette;
           lerpT = 0;
         }
 
-        // Layer 1: exact BPM from AcousticBrainz
         if (data.bpm && data.bpm > 0) {
           resolvedBpm = data.bpm;
-          console.log(`[Ambient] BPM from AcousticBrainz: ${resolvedBpm}`);
-        }
-        // Layer 1.5: BPM from song title / artist name
-        else if (bpmFromTitle(songName, artistName)) {
+        } else if (bpmFromTitle(songName, artistName)) {
           resolvedBpm = bpmFromTitle(songName, artistName);
-          console.log(`[Ambient] BPM from title: ${resolvedBpm}`);
-        }
-        // Layer 2: BPM from tag text
-        else if (bpmFromTags(tags)) {
+        } else if (bpmFromTags(tags)) {
           resolvedBpm = bpmFromTags(tags);
-          console.log(`[Ambient] BPM from tags: ${resolvedBpm}`);
-        }
-        // Layer 3: BPM from genre
-        else if (bpmFromGenre(tags)) {
+        } else if (bpmFromGenre(tags)) {
           resolvedBpm = bpmFromGenre(tags);
-          console.log(`[Ambient] BPM from genre: ${resolvedBpm}`);
-        }
-        // Layer 4: hash-based BPM from title length/chars for a unique feel
-        else {
+        } else {
           const titleHash = songName.split('').reduce((h,c) => Math.imul(31,h) + c.charCodeAt(0)|0, 0);
-          const hashBpm = 60 + Math.abs(titleHash % 80); // range 60–140
-          resolvedBpm = hashBpm;
-          console.log(`[Ambient] BPM from hash: ${resolvedBpm}`);
+          resolvedBpm = 60 + Math.abs(titleHash % 80); 
         }
       }
     } catch(e) {
-      console.warn('[Ambient] BPM/mood fetch failed, using title/hash fallback', e);
-      // Still try title-based BPM even without network
+      console.warn('[Ambient] BPM/mood fetch failed', e);
       const titleBpm = bpmFromTitle(songName, artistName);
       if (titleBpm) {
         resolvedBpm = titleBpm;
-        console.log(`[Ambient] BPM from title (offline): ${resolvedBpm}`);
       } else {
         const titleHash = songName.split('').reduce((h,c) => Math.imul(31,h) + c.charCodeAt(0)|0, 0);
         resolvedBpm = 60 + Math.abs(titleHash % 80);
@@ -614,9 +580,11 @@ const Ambient = (() => {
   function reset() {
     targetPalette = JSON.parse(JSON.stringify(DEFAULT));
     lerpT = 0;
+    stopBeat(); // Stop beating if reset
     setBPM(80);
   }
 
-  return { init, setSong, reset };
+  // Expose the new sync methods
+  return { init, setSong, reset, startBeat, stopBeat, syncBeat };
 
 })();

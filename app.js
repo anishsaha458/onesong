@@ -6,6 +6,7 @@ let authToken = null;
 let hasSong = false;
 let currentSong = null;
 let serverReady = false;
+let ytPlayer = null; // YouTube Player instance
 
 // ─────────────────────────────────────────────────────────────
 // RENDER WAKE-UP
@@ -131,9 +132,7 @@ function escapeHtml(str) {
 // AUTH & APP LOGIC
 // ─────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-    // Init ambient engine after DOM is ready
     Ambient.init();
-
     showToast('⏳ Waking up server…', '#a78bfa', true);
     pingServer().then(() => checkAuth());
 });
@@ -245,6 +244,7 @@ function logout() {
   authToken = null; currentUser = null; hasSong = false; currentSong = null;
   localStorage.removeItem('authToken');
   localStorage.removeItem('currentUser');
+  if (ytPlayer && ytPlayer.destroy) ytPlayer.destroy();
   Ambient.reset();
   showAuthContainer();
 }
@@ -264,23 +264,52 @@ async function loadUserSong() {
 }
 
 // ─────────────────────────────────────────────
-// YOUTUBE EMBED
-// - Shows controls so user can adjust volume
-// - NO mute, NO autoplay (browser blocks unmuted autoplay anyway)
-// - Interaction overlay removed so controls work
+// YOUTUBE EMBED API & BEAT SYNC LOGIC
 // ─────────────────────────────────────────────
-function buildYouTubeEmbed(videoId) {
-  const origin = encodeURIComponent(window.location.origin || 'https://localhost');
-  return `<iframe
-    width="100%" height="100%"
-    src="https://www.youtube-nocookie.com/embed/${videoId}?rel=0&modestbranding=1&playsinline=1&origin=${origin}"
-    title="YouTube video player"
-    frameborder="0"
-    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-    allowfullscreen
-    referrerpolicy="strict-origin-when-cross-origin">
-  </iframe>`;
+function initYouTubePlayer(videoId) {
+    if (!window.YT) {
+        const tag = document.createElement('script');
+        tag.src = "https://www.youtube.com/iframe_api";
+        const firstScriptTag = document.getElementsByTagName('script')[0];
+        firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
+        window.onYouTubeIframeAPIReady = () => createPlayer(videoId);
+    } else {
+        createPlayer(videoId);
+    }
 }
+
+function createPlayer(videoId) {
+    if (ytPlayer) ytPlayer.destroy(); // clear out old player if changing songs
+
+    document.getElementById('youtube-player').innerHTML = '<div id="yt-iframe-container"></div>';
+    
+    ytPlayer = new YT.Player('yt-iframe-container', {
+        height: '100%', width: '100%', videoId: videoId,
+        playerVars: { 'rel': 0, 'modestbranding': 1, 'playsinline': 1 },
+        events: { 'onStateChange': onPlayerStateChange }
+    });
+}
+
+function onPlayerStateChange(event) {
+    // Only pulse visuals if music is playing
+    if (event.data === YT.PlayerState.PLAYING) {
+        Ambient.startBeat(); 
+    } else if (event.data === YT.PlayerState.PAUSED || event.data === YT.PlayerState.BUFFERING) {
+        Ambient.stopBeat();
+    }
+}
+
+// Global Keyboard Listener for Tap Sync
+document.addEventListener('keydown', (e) => {
+    // Make sure we only trigger if a song is loaded, and they aren't typing in an input!
+    if (e.code === 'Space' && hasSong && document.activeElement.tagName !== 'INPUT') {
+        e.preventDefault(); // Stop page from scrolling
+        Ambient.syncBeat();
+        showToast('🥁 Beat synced!', '#c8a96e');
+        setTimeout(hideToast, 1200);
+    }
+});
+
 
 function displaySong(song) {
   document.getElementById('song-display').classList.remove('hidden');
@@ -288,7 +317,10 @@ function displaySong(song) {
   document.getElementById('welcome-text').textContent = `Hello, ${currentUser.username}`;
   document.getElementById('song-name').textContent = song.song_name;
   document.getElementById('song-artist').textContent = song.artist_name;
-  document.getElementById('youtube-player').innerHTML = buildYouTubeEmbed(song.youtube_video_id);
+  
+  // Setup the interactive YouTube API
+  initYouTubePlayer(song.youtube_video_id);
+  document.getElementById('sync-hint').classList.remove('hidden');
 
   // Reset recommendations
   document.getElementById('recommendations-section').classList.add('hidden');

@@ -258,10 +258,8 @@ async def recommendations(track: str, artist: str, payload: dict = Depends(auth)
         for t in raw[:3]
     ]}
 
-
 @app.get("/mood")
 async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
-    """Fetch Last.fm tags and return them for client-side mood mapping."""
     if not LASTFM_KEY:
         raise HTTPException(500, "Last.fm API key not configured")
     tags = []
@@ -293,16 +291,8 @@ def profile(payload: dict = Depends(auth)):
         raise HTTPException(404, "User not found")
     return {**dict(row), "created_at": row["created_at"].isoformat() if row["created_at"] else None}
 
-
 @app.get("/bpm")
 async def get_bpm(track: str, artist: str, payload: dict = Depends(auth)):
-    """
-    All-in-one endpoint: returns Last.fm mood tags + BPM from AcousticBrainz.
-    BPM resolution:
-      1. MusicBrainz recording ID lookup
-      2. AcousticBrainz high-level data (BPM)
-      3. Returns tags so frontend can do layer 2/3/4 fallbacks
-    """
     if not LASTFM_KEY:
         raise HTTPException(500, "Last.fm API key not configured")
 
@@ -310,8 +300,6 @@ async def get_bpm(track: str, artist: str, payload: dict = Depends(auth)):
     bpm  = None
 
     async with httpx.AsyncClient(timeout=15) as client:
-
-        # ── Step 1: Last.fm tags ──────────────────────────────
         r = await client.get(LASTFM_BASE, params={
             "method": "track.getTopTags", "track": track, "artist": artist,
             "api_key": LASTFM_KEY, "format": "json", "autocorrect": "1",
@@ -319,7 +307,6 @@ async def get_bpm(track: str, artist: str, payload: dict = Depends(auth)):
         raw_tags = r.json().get("toptags", {}).get("tag", [])
         tags = [t["name"].lower() for t in raw_tags if int(t.get("count", 0)) > 10]
 
-        # Fallback to artist tags if sparse
         if len(tags) < 3:
             r2 = await client.get(LASTFM_BASE, params={
                 "method": "artist.getTopTags", "artist": artist,
@@ -328,7 +315,6 @@ async def get_bpm(track: str, artist: str, payload: dict = Depends(auth)):
             artist_tags = r2.json().get("toptags", {}).get("tag", [])
             tags += [t["name"].lower() for t in artist_tags[:10]]
 
-        # ── Step 2: MusicBrainz recording ID ─────────────────
         try:
             mb_url = "https://musicbrainz.org/ws/2/recording"
             mb_r = await client.get(mb_url, params={
@@ -339,14 +325,10 @@ async def get_bpm(track: str, artist: str, payload: dict = Depends(auth)):
             if recordings:
                 recording_id = recordings[0].get("id")
 
-                # ── Step 3: AcousticBrainz BPM ───────────────
                 if recording_id:
                     ab_url = f"https://acousticbrainz.org/{recording_id}/high-level"
                     ab_r = await client.get(ab_url)
                     if ab_r.status_code == 200:
-                        ab_data = ab_r.json()
-                        # BPM lives in rhythm_bpm in low-level, but high-level
-                        # has tempo classification — try the low-level endpoint
                         ab_ll = await client.get(
                             f"https://acousticbrainz.org/{recording_id}/low-level"
                         )

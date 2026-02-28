@@ -10,22 +10,20 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+    <canvas id="ambient-canvas"></canvas>
 
-    <!-- Loading Spinner -->
     <div id="loading" class="loading hidden">
         <div class="spinner"></div>
     </div>
 
-    <!-- Auth Container -->
     <div id="auth-container" class="container">
         <div class="auth-box">
             <div class="auth-logo">
-
+                <span class="logo-note"></span>
                 <h1>OneSong</h1>
             </div>
             <p class="subtitle">The one song that defines you</p>
 
-            <!-- Login Form -->
             <div id="login-form" class="auth-form">
                 <h2>Welcome back</h2>
                 <input type="email" id="login-email" placeholder="Email address" required>
@@ -36,7 +34,6 @@
                 </p>
             </div>
 
-            <!-- Signup Form -->
             <div id="signup-form" class="auth-form hidden">
                 <h2>Join OneSong</h2>
                 <input type="text" id="signup-username" placeholder="Username" required>
@@ -44,7 +41,7 @@
                 <input type="password" id="signup-password" placeholder="Password (min 6 chars)" required>
                 <button onclick="signup()">Create Account</button>
                 <p class="toggle-auth">
-                    Already a member? <a href="#" onclick="showLogin()">Sign in</a>
+                     <a href="#" onclick="showLogin()">Sign in</a>
                 </p>
             </div>
 
@@ -52,10 +49,8 @@
         </div>
     </div>
 
-    <!-- Main App Container -->
     <div id="app-container" class="container hidden">
 
-        <!-- Header -->
         <div class="header">
             <div class="header-logo">
                 <span class="logo-note-sm">♪</span>
@@ -67,7 +62,6 @@
             </div>
         </div>
 
-        <!-- Song Display -->
         <div id="song-display" class="song-display hidden">
             <div class="welcome-message">
                 <p class="welcome-label">YOUR SIGNATURE TRACK</p>
@@ -82,15 +76,15 @@
                 </div>
             </div>
 
-            <!-- YouTube Player -->
             <div id="youtube-player" class="youtube-player"></div>
+            
+            <p id="sync-hint" class="sync-hint hidden">Tap <strong>Spacebar</strong> to the beat to align the visuals</p>
 
-            <!-- AI Recommendations Section -->
             <div id="recommendations-section" class="recommendations-section hidden">
                 <div class="rec-header">
                     <span class="rec-badge">✦ AI</span>
-                    <h3>Songs You Might Love</h3>
-                    <p class="rec-subtitle">Based on your taste, our AI picked these for you</p>
+                    <h3>songs you might like</h3>
+                    <p class="rec-subtitle">Based on your taste, our AI has picked this out for you</p>
                 </div>
                 <div id="rec-list" class="rec-list"></div>
             </div>
@@ -112,20 +106,19 @@
             </div>
         </div>
 
-        <!-- Song Selection -->
         <div id="song-selection" class="song-selection hidden">
             <div class="selection-header">
                 <p class="welcome-label">CHOOSE WISELY</p>
                 <h2>Your One Song</h2>
-                <p class="subtitle">This single track will define your musical identity</p>
+                <p class="subtitle">close to who you are</p>
             </div>
 
             <div class="song-form">
-                <input type="text" id="input-song-name" placeholder="Song name (e.g. Bohemian Rhapsody)">
-                <input type="text" id="input-artist-name" placeholder="Artist name (e.g. Queen)">
+                <input type="text" id="input-song-name" placeholder="song name">
+                <input type="text" id="input-artist-name" placeholder="artist">
                 <input type="text" id="input-youtube-url" placeholder="YouTube URL (paste from browser)">
                 <p class="hint">
-                    🔗 Go to YouTube → find your song → copy the URL from the address bar → paste above
+                    find your song on youtube and paste here
                 </p>
                 <div id="song-form-error" class="error-message hidden"></div>
                 <button onclick="saveSong()">Save My Song</button>
@@ -138,6 +131,7 @@
 
     </div>
 
+    <script src="ambient.js"></script>
     <script src="app.js"></script>
 </body>
 </html>
