@@ -240,6 +240,70 @@ const Ambient = (() => {
     return null;
   }
 
+  // Layer 1.5: BPM from song title + artist name
+  // Catches classical markings, dance forms, and tempo words
+  // before falling through to genre tags.
+  const TITLE_BPM = [
+    // Classical tempo markings (Italian)
+    { keys: ['grave','larghissimo'],                      bpm: 40  },
+    { keys: ['largo','lento','adagissimo'],               bpm: 50  },
+    { keys: ['adagio'],                                   bpm: 60  },
+    { keys: ['adagietto','andante'],                      bpm: 72  },
+    { keys: ['andantino','moderato'],                     bpm: 88  },
+    { keys: ['allegretto'],                               bpm: 108 },
+    { keys: ['allegro'],                                  bpm: 128 },
+    { keys: ['vivace','vivacissimo'],                     bpm: 156 },
+    { keys: ['presto'],                                   bpm: 168 },
+    { keys: ['prestissimo'],                              bpm: 188 },
+    // Dance forms
+    { keys: ['waltz','valse','vals'],                     bpm: 90  },
+    { keys: ['mazurka'],                                  bpm: 112 },
+    { keys: ['polka'],                                    bpm: 120 },
+    { keys: ['minuet','menuet'],                          bpm: 126 },
+    { keys: ['march','marche','marcia'],                  bpm: 120 },
+    { keys: ['gavotte'],                                  bpm: 118 },
+    { keys: ['gigue','jig'],                              bpm: 160 },
+    { keys: ['bolero'],                                   bpm: 72  },
+    { keys: ['tango'],                                    bpm: 60  },
+    { keys: ['samba'],                                    bpm: 100 },
+    { keys: ['bossa nova','bossanova'],                   bpm: 130 },
+    { keys: ['rumba'],                                    bpm: 108 },
+    { keys: ['cha cha','cha-cha'],                        bpm: 120 },
+    { keys: ['foxtrot'],                                  bpm: 120 },
+    { keys: ['quickstep'],                                bpm: 200 },
+    // Common English tempo words in titles
+    { keys: ['lullaby','cradle','berceuse','nocturne'],   bpm: 56  },
+    { keys: ['hymn','chorale','prayer','requiem'],        bpm: 60  },
+    { keys: ['elegy','funeral','dirge'],                  bpm: 52  },
+    { keys: ['serenade'],                                 bpm: 76  },
+    { keys: ['intermezzo'],                               bpm: 88  },
+    { keys: ['scherzo'],                                  bpm: 152 },
+    { keys: ['rondo','tarantella'],                       bpm: 168 },
+    { keys: ['barcarolle'],                               bpm: 66  },
+    { keys: ['caprice','capriccio'],                      bpm: 144 },
+    { keys: ['etude','étude','prelude','prélude'],        bpm: 100 },
+    { keys: ['fantasia','fantasy','impromptu'],           bpm: 96  },
+    { keys: ['rhapsody'],                                 bpm: 108 },
+    // Modern tempo words that appear in titles
+    { keys: ['slow jam','slow burn'],                     bpm: 65  },
+    { keys: ['hypersonic','lightning','rocket','blitz'],  bpm: 180 },
+    { keys: ['crawl','creep','drift','float'],            bpm: 58  },
+    { keys: ['gallop','sprint','dash','rush'],            bpm: 160 },
+    { keys: ['groove','bounce','bop','swing'],            bpm: 100 },
+  ];
+
+  function bpmFromTitle(songName, artistName) {
+    const text = (songName + ' ' + artistName).toLowerCase();
+    for (const { keys, bpm } of TITLE_BPM) {
+      // Use word-boundary-aware check so "largo" doesn't match "enlarge"
+      if (keys.some(k => {
+        const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return new RegExp(`(?:^|[\\s\\-_(,])${escaped}(?:[\\s\\-_),]|$)`).test(text);
+      })) return bpm;
+    }
+    return null;
+  }
+
   // ── Beat clock ─────────────────────────────────────────────
   function setBPM(newBpm) {
     bpm = Math.max(40, Math.min(220, newBpm));
@@ -498,6 +562,11 @@ const Ambient = (() => {
           resolvedBpm = data.bpm;
           console.log(`[Ambient] BPM from AcousticBrainz: ${resolvedBpm}`);
         }
+        // Layer 1.5: BPM from song title / artist name
+        else if (bpmFromTitle(songName, artistName)) {
+          resolvedBpm = bpmFromTitle(songName, artistName);
+          console.log(`[Ambient] BPM from title: ${resolvedBpm}`);
+        }
         // Layer 2: BPM from tag text
         else if (bpmFromTags(tags)) {
           resolvedBpm = bpmFromTags(tags);
@@ -508,12 +577,25 @@ const Ambient = (() => {
           resolvedBpm = bpmFromGenre(tags);
           console.log(`[Ambient] BPM from genre: ${resolvedBpm}`);
         }
+        // Layer 4: hash-based BPM from title length/chars for a unique feel
         else {
-          console.log(`[Ambient] BPM: using default ${resolvedBpm}`);
+          const titleHash = songName.split('').reduce((h,c) => Math.imul(31,h) + c.charCodeAt(0)|0, 0);
+          const hashBpm = 60 + Math.abs(titleHash % 80); // range 60–140
+          resolvedBpm = hashBpm;
+          console.log(`[Ambient] BPM from hash: ${resolvedBpm}`);
         }
       }
     } catch(e) {
-      console.warn('[Ambient] BPM/mood fetch failed, using defaults', e);
+      console.warn('[Ambient] BPM/mood fetch failed, using title/hash fallback', e);
+      // Still try title-based BPM even without network
+      const titleBpm = bpmFromTitle(songName, artistName);
+      if (titleBpm) {
+        resolvedBpm = titleBpm;
+        console.log(`[Ambient] BPM from title (offline): ${resolvedBpm}`);
+      } else {
+        const titleHash = songName.split('').reduce((h,c) => Math.imul(31,h) + c.charCodeAt(0)|0, 0);
+        resolvedBpm = 60 + Math.abs(titleHash % 80);
+      }
     }
 
     setBPM(resolvedBpm);
