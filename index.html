@@ -1,137 +1,157 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OneSong — Your Signature Track</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OneSong — Your Signature Track</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <canvas id="ambient-canvas"></canvas>
 
-    <div id="loading" class="loading hidden">
-        <div class="spinner"></div>
+  <!-- GPGPU canvas — Three.js renders here -->
+  <canvas id="ambient-canvas"></canvas>
+
+  <!-- Global loading overlay -->
+  <div id="loading" class="loading hidden">
+    <div class="spinner"></div>
+  </div>
+
+  <!-- ── AUTH ──────────────────────────────────────── -->
+  <div id="auth-container" class="container">
+    <div class="auth-box">
+      <div class="auth-logo">
+        <span class="logo-note">♪</span>
+        <h1>OneSong</h1>
+      </div>
+      <p class="subtitle">The one song that defines you</p>
+
+      <div id="login-form" class="auth-form">
+        <h2>Welcome back</h2>
+        <input type="email" id="login-email" placeholder="Email address" autocomplete="email" required>
+        <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required>
+        <button onclick="login()">Sign In</button>
+        <p class="toggle-auth">New here? <a href="#" onclick="showSignup()">Create account</a></p>
+      </div>
+
+      <div id="signup-form" class="auth-form hidden">
+        <h2>Join OneSong</h2>
+        <input type="text" id="signup-username" placeholder="Username" autocomplete="username" required>
+        <input type="email" id="signup-email" placeholder="Email address" autocomplete="email" required>
+        <input type="password" id="signup-password" placeholder="Password (min 6 chars)" autocomplete="new-password" required>
+        <button onclick="signup()">Create Account</button>
+        <p class="toggle-auth">Already have an account? <a href="#" onclick="showLogin()">Sign in</a></p>
+      </div>
+
+      <div id="auth-error" class="error-message hidden"></div>
+    </div>
+  </div>
+
+  <!-- ── APP ───────────────────────────────────────── -->
+  <div id="app-container" class="container hidden">
+
+    <div class="header">
+      <div class="header-logo">
+        <span class="logo-note-sm">♪</span>
+        <span class="header-title">OneSong</span>
+      </div>
+      <div class="user-info">
+        <span id="username-display"></span>
+        <button onclick="logout()" class="logout-btn">Logout</button>
+      </div>
     </div>
 
-    <div id="auth-container" class="container">
-        <div class="auth-box">
-            <div class="auth-logo">
-                <span class="logo-note"></span>
-                <h1>OneSong</h1>
-            </div>
-            <p class="subtitle">The one song that defines you</p>
+    <!-- Song display -->
+    <div id="song-display" class="song-display hidden">
+      <div class="welcome-message">
+        <p class="welcome-label">YOUR SIGNATURE TRACK</p>
+        <h2 id="welcome-text">Welcome back!</h2>
+      </div>
 
-            <div id="login-form" class="auth-form">
-                <h2>Welcome back</h2>
-                <input type="email" id="login-email" placeholder="Email address" required>
-                <input type="password" id="login-password" placeholder="Password" required>
-                <button onclick="login()">Sign In</button>
-                <p class="toggle-auth">
-                    New here? <a href="#" onclick="showSignup()">Create account</a>
-                </p>
-            </div>
-
-            <div id="signup-form" class="auth-form hidden">
-                <h2>Join OneSong</h2>
-                <input type="text" id="signup-username" placeholder="Username" required>
-                <input type="email" id="signup-email" placeholder="Email address" required>
-                <input type="password" id="signup-password" placeholder="Password (min 6 chars)" required>
-                <button onclick="signup()">Create Account</button>
-                <p class="toggle-auth">
-                     <a href="#" onclick="showLogin()">Sign in</a>
-                </p>
-            </div>
-
-            <div id="auth-error" class="error-message hidden"></div>
+      <div class="song-info-card">
+        <div class="song-vinyl">🎵</div>
+        <div class="song-text">
+          <h3 id="song-name"></h3>
+          <p id="song-artist"></p>
         </div>
+      </div>
+
+      <!-- YouTube IFrame API renders here -->
+      <div id="youtube-player" class="youtube-player"></div>
+
+      <p id="sync-hint" class="sync-hint hidden">
+        Tap <strong>Spacebar</strong> to the beat to sync the particle field
+      </p>
+
+      <!-- Recommendations -->
+      <div id="recommendations-section" class="recommendations-section hidden">
+        <div class="rec-header">
+          <span class="rec-badge">✦ AI</span>
+          <h3>songs you might like</h3>
+          <p class="rec-subtitle">Based on your taste, curated by Last.fm listener patterns</p>
+        </div>
+        <div id="rec-list" class="rec-list"></div>
+      </div>
+
+      <div id="rec-loading" class="rec-loading hidden">
+        <div class="rec-spinner"></div>
+        <p>Finding matches...</p>
+      </div>
+
+      <div id="rec-error" class="rec-error hidden"></div>
+
+      <div class="song-actions">
+        <button onclick="getRecommendations()" class="btn btn-ai" id="rec-btn">
+          ✦ Get Song Recommendations
+        </button>
+        <button onclick="showSongSelection()" class="btn btn-secondary">
+          Change Song
+        </button>
+      </div>
     </div>
 
-    <div id="app-container" class="container hidden">
+    <!-- Song selection form -->
+    <div id="song-selection" class="song-selection hidden">
+      <div class="selection-header">
+        <p class="welcome-label">CHOOSE WISELY</p>
+        <h2>Your One Song</h2>
+        <p class="subtitle">close to who you are</p>
+      </div>
 
-        <div class="header">
-            <div class="header-logo">
-                <span class="logo-note-sm">♪</span>
-                <span class="header-title">OneSong</span>
-            </div>
-            <div class="user-info">
-                <span id="username-display"></span>
-                <button onclick="logout()" class="logout-btn">Logout</button>
-            </div>
-        </div>
+      <div class="song-form">
+        <input type="text" id="input-song-name" placeholder="Song name">
+        <input type="text" id="input-artist-name" placeholder="Artist">
+        <input type="text" id="input-youtube-url" placeholder="YouTube URL (paste from browser)">
+        <p class="hint">Find your song on YouTube and paste the URL above</p>
+        <div id="song-form-error" class="error-message hidden"></div>
+        <button onclick="saveSong()">Save My Song</button>
+      </div>
 
-        <div id="song-display" class="song-display hidden">
-            <div class="welcome-message">
-                <p class="welcome-label">YOUR SIGNATURE TRACK</p>
-                <h2 id="welcome-text">Welcome back!</h2>
-            </div>
-
-            <div class="song-info-card">
-                <div class="song-vinyl">🎵</div>
-                <div class="song-text">
-                    <h3 id="song-name"></h3>
-                    <p id="song-artist"></p>
-                </div>
-            </div>
-
-            <div id="youtube-player" class="youtube-player"></div>
-            
-            <p id="sync-hint" class="sync-hint hidden">Tap <strong>Spacebar</strong> to the beat to align the visuals</p>
-
-            <div id="recommendations-section" class="recommendations-section hidden">
-                <div class="rec-header">
-                    <span class="rec-badge">✦ AI</span>
-                    <h3>songs you might like</h3>
-                    <p class="rec-subtitle">Based on your taste, our AI has picked this out for you</p>
-                </div>
-                <div id="rec-list" class="rec-list"></div>
-            </div>
-
-            <div id="rec-loading" class="rec-loading hidden">
-                <div class="rec-spinner"></div>
-                <p>Finding matches...</p>
-            </div>
-
-            <div id="rec-error" class="rec-error hidden"></div>
-
-            <div class="song-actions">
-                <button onclick="getRecommendations()" class="btn btn-ai" id="rec-btn">
-                    ✦ Get Song Recommendations
-                </button>
-                <button onclick="showSongSelection()" class="btn btn-secondary">
-                    Change Song
-                </button>
-            </div>
-        </div>
-
-        <div id="song-selection" class="song-selection hidden">
-            <div class="selection-header">
-                <p class="welcome-label">CHOOSE WISELY</p>
-                <h2>Your One Song</h2>
-                <p class="subtitle">close to who you are</p>
-            </div>
-
-            <div class="song-form">
-                <input type="text" id="input-song-name" placeholder="song name">
-                <input type="text" id="input-artist-name" placeholder="artist">
-                <input type="text" id="input-youtube-url" placeholder="YouTube URL (paste from browser)">
-                <p class="hint">
-                    find your song on youtube and paste here
-                </p>
-                <div id="song-form-error" class="error-message hidden"></div>
-                <button onclick="saveSong()">Save My Song</button>
-            </div>
-
-            <button onclick="cancelSongSelection()" class="btn btn-secondary" id="cancel-btn">
-                Cancel
-            </button>
-        </div>
-
+      <button onclick="cancelSongSelection()" class="btn btn-secondary" id="cancel-btn">
+        Cancel
+      </button>
     </div>
 
-    <script src="ambient.js"></script>
-    <script src="app.js"></script>
+  </div><!-- /#app-container -->
+
+  <!--
+    Three.js r128 — GPGPU particle system
+    Must load before ambient.js
+  -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <!--
+    Load order:
+      1. three.js          (WebGL math & FBO infrastructure)
+      2. gradientController (audio timeline + gfx state)
+      3. ambient.js         (GPGPU render loop, reads GradientController.gfx)
+      4. app.js             (auth, YT player, polls playhead every 250ms)
+  -->
+  <script src="gradientController.js"></script>
+  <script src="ambient.js"></script>
+  <script src="app.js"></script>
+
 </body>
 </html>

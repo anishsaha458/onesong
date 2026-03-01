@@ -1,14 +1,19 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
-from typing import Optional
+from typing import Optional, List
 import jwt
 import bcrypt
 import os
 import re
 import httpx
+import json
+import asyncio
+import tempfile
+import subprocess
 from datetime import datetime, timedelta
+from pathlib import Path
 
 try:
     import psycopg2
@@ -17,10 +22,22 @@ try:
 except ImportError:
     PSYCOPG2_AVAILABLE = False
 
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    NUMPY_AVAILABLE = False
+
+try:
+    import essentia.standard as es
+    ESSENTIA_AVAILABLE = True
+except ImportError:
+    ESSENTIA_AVAILABLE = False
+
 app = FastAPI()
 
 # ─────────────────────────────────────────────────────────────
-# CORS middleware — wraps EVERY response including unhandled 500s
+# CORS
 # ─────────────────────────────────────────────────────────────
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -47,6 +64,9 @@ JWT_SECRET   = os.getenv("JWT_SECRET", "change-me-in-production")
 DATABASE_URL = os.getenv("DATABASE_URL")
 LASTFM_KEY   = os.getenv("LASTFM_API_KEY")
 LASTFM_BASE  = "https://ws.audioscrobbler.com/2.0/"
+
+# In-memory analysis cache (keyed by "track|artist")
+_analysis_cache: dict = {}
 
 security = HTTPBearer()
 
@@ -84,13 +104,12 @@ def extract_youtube_id(url: str) -> Optional[str]:
 
 def get_db():
     if not PSYCOPG2_AVAILABLE:
-        raise HTTPException(503, "psycopg2 not installed — check requirements.txt")
+        raise HTTPException(503, "psycopg2 not installed")
     if not DATABASE_URL:
-        raise HTTPException(503, "DATABASE_URL not set in Render environment variables")
+        raise HTTPException(503, "DATABASE_URL not set")
     try:
         return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     except Exception as e:
-        print(f"[DB] connection failed: {e}")
         raise HTTPException(503, "Database temporarily unavailable")
 
 def make_token(user_id: int, email: str) -> str:
@@ -103,18 +122,141 @@ def auth(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     try:
         return jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
     except jwt.ExpiredSignatureError:
-        raise HTTPException(401, "Token has expired")
+        raise HTTPException(401, "Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(401, "Invalid token")
 
 # ─────────────────────────────────────────────────────────────
-# STARTUP — never crash even if DB is missing
+# AUDIO ANALYSIS — Essentia + yt-dlp pipeline
+# ─────────────────────────────────────────────────────────────
+
+def _download_audio(youtube_id: str, out_path: str) -> bool:
+    """Download audio from YouTube using yt-dlp, convert to 22050Hz mono WAV."""
+    try:
+        cmd = [
+            "yt-dlp",
+            f"https://www.youtube.com/watch?v={youtube_id}",
+            "--extract-audio",
+            "--audio-format", "wav",
+            "--audio-quality", "5",        # ~128kbps source
+            "--postprocessor-args", "-ar 22050 -ac 1",
+            "--output", out_path,
+            "--no-playlist",
+            "--quiet",
+            "--max-filesize", "50m",       # safety limit
+        ]
+        result = subprocess.run(cmd, timeout=90, capture_output=True, text=True)
+        return result.returncode == 0 and Path(out_path).exists()
+    except Exception as e:
+        print(f"[yt-dlp] error: {e}")
+        return False
+
+
+def _analyze_with_essentia(wav_path: str) -> dict:
+    """
+    Run Essentia analysis pipeline.
+    Extracts at 60Hz: Loudness, Spectral Centroid, 8 Melbands, Beat positions.
+    Returns normalized JSON-serializable dict.
+    """
+    if not ESSENTIA_AVAILABLE or not NUMPY_AVAILABLE:
+        raise RuntimeError("Essentia or NumPy not installed")
+
+    # ── Load audio ──
+    loader = es.MonoLoader(filename=wav_path, sampleRate=22050)
+    audio  = loader()
+    sr     = 22050
+
+    # ── Rhythm analysis ──
+    rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
+    bpm, beats, beats_confidence, _, beats_intervals = rhythm_extractor(audio)
+
+    # ── Frame-level analysis @ 60Hz ──
+    # hop_size = sr / 60 ≈ 368 samples
+    frame_size = 1024
+    hop_size   = int(sr / 60)   # exactly 60 Hz output
+
+    # Windowing & spectrum
+    w         = es.Windowing(type='hann')
+    spectrum  = es.Spectrum()
+    centroid  = es.SpectralCentroidNormalized()
+    mel_bands = es.MelBands(numberBands=8, sampleRate=sr, lowFrequencyBound=20, highFrequencyBound=8000)
+    loudness  = es.Loudness()
+
+    loudness_frames  = []
+    centroid_frames  = []
+    melband_frames   = []
+    bass_frames      = []
+
+    for i, frame in enumerate(es.FrameGenerator(audio, frameSize=frame_size, hopSize=hop_size)):
+        t = i * hop_size / sr
+
+        # Loudness (dB → normalize to 0–1 via tanh)
+        loud_db  = float(loudness(frame))
+        loud_norm = float(np.tanh(max(0.0, (loud_db + 60) / 60)))   # -60dBFS → 0, 0dBFS → 1
+
+        # Spectrum → centroid
+        spec      = spectrum(w(frame))
+        cent_norm = float(centroid(spec))
+
+        # Mel bands (8 bands, normalize each to 0–1 peak)
+        mels = mel_bands(spec)
+        mels_norm = [float(np.tanh(max(0.0, (v + 80) / 80)) ) for v in mels]
+
+        # Bass energy (bands 0–1 = ~20–500Hz)
+        bass_energy = float(np.mean(mels_norm[:2]))
+
+        loudness_frames.append( {"t": round(t, 4), "v": round(loud_norm,  4)} )
+        centroid_frames.append( {"t": round(t, 4), "c": round(cent_norm,  4)} )
+        melband_frames.append(  {"t": round(t, 4), "bands": [round(m, 4) for m in mels_norm]} )
+        bass_frames.append(     {"t": round(t, 4), "b": round(bass_energy, 4)} )
+
+    beat_list = [{"t": round(float(b), 4)} for b in beats]
+
+    return {
+        "tempo":    round(float(bpm), 2),
+        "beats":    beat_list,
+        "loudness": loudness_frames,
+        "spectral": centroid_frames,
+        "melbands": melband_frames,
+        "bass":     bass_frames,
+    }
+
+
+def _fallback_analysis(duration_estimate: float = 240.0) -> dict:
+    """
+    Returns a synthetic 60Hz analysis when Essentia is unavailable.
+    Generates smooth sinusoidal patterns so visuals still animate nicely.
+    """
+    import math
+    tempo  = 120.0
+    beat_t = 60.0 / tempo
+    beats  = [{"t": round(i * beat_t, 4)} for i in range(int(duration_estimate / beat_t))]
+
+    loudness, spectral, melbands, bass = [], [], [], []
+    for i in range(int(duration_estimate * 60)):
+        t = i / 60.0
+        v  = round(0.5 + 0.35 * math.sin(t * 0.8) + 0.15 * math.sin(t * 3.1), 4)
+        c  = round(0.4 + 0.3  * math.sin(t * 0.5 + 1.2), 4)
+        b  = round(0.3 + 0.25 * abs(math.sin(t * math.pi * 2.0)), 4)
+        ms = [round(0.2 + 0.2 * math.sin(t * (0.4 + k * 0.15) + k), 4) for k in range(8)]
+
+        loudness.append({"t": round(t, 4), "v": v})
+        spectral.append({"t": round(t, 4), "c": c})
+        bass.append(    {"t": round(t, 4), "b": b})
+        melbands.append({"t": round(t, 4), "bands": ms})
+
+    return {"tempo": tempo, "beats": beats, "loudness": loudness,
+            "spectral": spectral, "melbands": melbands, "bass": bass}
+
+
+# ─────────────────────────────────────────────────────────────
+# STARTUP
 # ─────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     try:
         conn = get_db()
-        cur = conn.cursor()
+        cur  = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id               SERIAL PRIMARY KEY,
@@ -129,19 +271,18 @@ async def startup():
                 updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        conn.commit()
-        cur.close()
-        conn.close()
+        conn.commit(); cur.close(); conn.close()
         print("[startup] DB ready ✓")
     except Exception as e:
-        print(f"[startup] DB init skipped (will retry on first request): {e}")
+        print(f"[startup] DB init skipped: {e}")
 
 # ─────────────────────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "OneSong API", "version": "3.2.0"}
+    return {"status": "ok", "message": "OneSong API", "version": "4.0.0-gpgpu",
+            "essentia": ESSENTIA_AVAILABLE}
 
 @app.get("/health")
 def health():
@@ -153,15 +294,14 @@ def health():
     return {
         "status": "healthy" if db_ok else "degraded",
         "database": "healthy" if db_ok else "unavailable",
-        "psycopg2": PSYCOPG2_AVAILABLE,
-        "database_url_set": bool(DATABASE_URL),
+        "essentia": ESSENTIA_AVAILABLE,
+        "numpy": NUMPY_AVAILABLE,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
 @app.post("/auth/signup")
 def signup(user: UserSignup):
-    conn = get_db()
-    cur = conn.cursor()
+    conn = get_db(); cur = conn.cursor()
     try:
         cur.execute("SELECT id FROM users WHERE email = %s", (user.email,))
         if cur.fetchone():
@@ -171,8 +311,7 @@ def signup(user: UserSignup):
             "INSERT INTO users (email, username, password_hash) VALUES (%s,%s,%s) RETURNING id",
             (user.email, user.username, pw_hash)
         )
-        uid = cur.fetchone()["id"]
-        conn.commit()
+        uid = cur.fetchone()["id"]; conn.commit()
     finally:
         cur.close(); conn.close()
     return {"token": make_token(uid, user.email),
@@ -180,8 +319,7 @@ def signup(user: UserSignup):
 
 @app.post("/auth/login")
 def login(user: UserLogin):
-    conn = get_db()
-    cur = conn.cursor()
+    conn = get_db(); cur = conn.cursor()
     try:
         cur.execute("SELECT id,email,username,password_hash FROM users WHERE email=%s", (user.email,))
         row = cur.fetchone()
@@ -194,16 +332,14 @@ def login(user: UserLogin):
 
 @app.get("/auth/verify")
 def verify(payload: dict = Depends(auth)):
-    return {"valid": True, "user_id": payload["user_id"], "email": payload["email"]}
+    return {"valid": True, "user_id": payload["user_id"]}
 
 @app.get("/user/song")
 def get_song(payload: dict = Depends(auth)):
     conn = get_db(); cur = conn.cursor()
     try:
-        cur.execute(
-            "SELECT song_name,artist_name,youtube_url,youtube_video_id FROM users WHERE id=%s",
-            (payload["user_id"],)
-        )
+        cur.execute("SELECT song_name,artist_name,youtube_url,youtube_video_id FROM users WHERE id=%s",
+                    (payload["user_id"],))
         row = cur.fetchone()
     finally:
         cur.close(); conn.close()
@@ -218,11 +354,9 @@ def save_song(song: SongData, payload: dict = Depends(auth)):
         raise HTTPException(400, "Invalid YouTube URL")
     conn = get_db(); cur = conn.cursor()
     try:
-        cur.execute(
-            """UPDATE users SET song_name=%s,artist_name=%s,youtube_url=%s,
+        cur.execute("""UPDATE users SET song_name=%s,artist_name=%s,youtube_url=%s,
                youtube_video_id=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s""",
-            (song.song_name, song.artist_name, song.youtube_url, vid, payload["user_id"])
-        )
+               (song.song_name, song.artist_name, song.youtube_url, vid, payload["user_id"]))
         conn.commit()
     finally:
         cur.close(); conn.close()
@@ -275,9 +409,64 @@ async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
                 "method": "artist.getTopTags", "artist": artist,
                 "api_key": LASTFM_KEY, "format": "json", "autocorrect": "1",
             })
-            artist_tags = r2.json().get("toptags", {}).get("tag", [])
-            tags += [t["name"].lower() for t in artist_tags[:10]]
+            tags += [t["name"].lower() for t in r2.json().get("toptags", {}).get("tag", [])[:10]]
     return {"tags": tags[:20]}
+
+@app.get("/audio_analysis")
+async def audio_analysis(track: str, artist: str, payload: dict = Depends(auth)):
+    """
+    Returns 60Hz normalized audio feature timeline for GPGPU visualization.
+
+    Pipeline:
+      1. Look up YouTube video ID from user's saved song
+      2. Download audio with yt-dlp (22050Hz mono WAV)
+      3. Run Essentia: RhythmExtractor2013, MelBands(8), SpectralCentroid, Loudness
+      4. Return {beats, loudness, spectral, melbands, bass, tempo} at 60Hz
+
+    Falls back to synthetic sinusoidal data if yt-dlp or Essentia unavailable.
+    Results are cached in memory for the session.
+    """
+    cache_key = f"{track.lower().strip()}|{artist.lower().strip()}"
+
+    # Return cached result immediately
+    if cache_key in _analysis_cache:
+        return _analysis_cache[cache_key]
+
+    # Look up youtube_video_id from DB
+    conn = get_db(); cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT youtube_video_id FROM users WHERE id=%s AND LOWER(song_name)=LOWER(%s)",
+            (payload["user_id"], track)
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close(); conn.close()
+
+    youtube_id = row["youtube_video_id"] if row else None
+
+    # ── Try full Essentia pipeline ──
+    if youtube_id and ESSENTIA_AVAILABLE and NUMPY_AVAILABLE:
+        with tempfile.TemporaryDirectory() as tmp:
+            wav_path = os.path.join(tmp, "audio.wav")
+            downloaded = await asyncio.get_event_loop().run_in_executor(
+                None, _download_audio, youtube_id, wav_path
+            )
+            if downloaded:
+                try:
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, _analyze_with_essentia, wav_path
+                    )
+                    _analysis_cache[cache_key] = result
+                    return result
+                except Exception as e:
+                    print(f"[analysis] Essentia failed: {e}")
+
+    # ── Fallback: synthetic 60Hz data ──
+    print(f"[analysis] Using synthetic fallback for '{track}' by '{artist}'")
+    result = _fallback_analysis(duration_estimate=240.0)
+    _analysis_cache[cache_key] = result
+    return result
 
 @app.get("/user/profile")
 def profile(payload: dict = Depends(auth)):
@@ -290,57 +479,6 @@ def profile(payload: dict = Depends(auth)):
     if not row:
         raise HTTPException(404, "User not found")
     return {**dict(row), "created_at": row["created_at"].isoformat() if row["created_at"] else None}
-
-@app.get("/bpm")
-async def get_bpm(track: str, artist: str, payload: dict = Depends(auth)):
-    if not LASTFM_KEY:
-        raise HTTPException(500, "Last.fm API key not configured")
-
-    tags = []
-    bpm  = None
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(LASTFM_BASE, params={
-            "method": "track.getTopTags", "track": track, "artist": artist,
-            "api_key": LASTFM_KEY, "format": "json", "autocorrect": "1",
-        })
-        raw_tags = r.json().get("toptags", {}).get("tag", [])
-        tags = [t["name"].lower() for t in raw_tags if int(t.get("count", 0)) > 10]
-
-        if len(tags) < 3:
-            r2 = await client.get(LASTFM_BASE, params={
-                "method": "artist.getTopTags", "artist": artist,
-                "api_key": LASTFM_KEY, "format": "json", "autocorrect": "1",
-            })
-            artist_tags = r2.json().get("toptags", {}).get("tag", [])
-            tags += [t["name"].lower() for t in artist_tags[:10]]
-
-        try:
-            mb_url = "https://musicbrainz.org/ws/2/recording"
-            mb_r = await client.get(mb_url, params={
-                "query": f"recording:{track} AND artist:{artist}",
-                "limit": "1", "fmt": "json",
-            }, headers={"User-Agent": "OneSong/1.0 (onesong@example.com)"})
-            recordings = mb_r.json().get("recordings", [])
-            if recordings:
-                recording_id = recordings[0].get("id")
-
-                if recording_id:
-                    ab_url = f"https://acousticbrainz.org/{recording_id}/high-level"
-                    ab_r = await client.get(ab_url)
-                    if ab_r.status_code == 200:
-                        ab_ll = await client.get(
-                            f"https://acousticbrainz.org/{recording_id}/low-level"
-                        )
-                        if ab_ll.status_code == 200:
-                            ll_data = ab_ll.json()
-                            raw_bpm = ll_data.get("rhythm", {}).get("bpm")
-                            if raw_bpm and 40 <= float(raw_bpm) <= 220:
-                                bpm = round(float(raw_bpm))
-        except Exception as e:
-            print(f"[BPM] MusicBrainz/AcousticBrainz lookup failed: {e}")
-
-    return {"tags": tags[:20], "bpm": bpm}
 
 if __name__ == "__main__":
     import uvicorn

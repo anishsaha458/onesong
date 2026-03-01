@@ -1,301 +1,603 @@
-// ==========================================
-// CONFIGURATION & STATE
-// ==========================================
-const canvas = document.getElementById('bg-canvas');
-const gl = canvas.getContext('webgl');
+/**
+ * ambient.js — GPGPU Flow Field Visualizer
+ * Three.js FBO Particle System · 100k particles · Curl Noise Physics
+ * Audio-synced via GradientController and AudioAnalytics timeline
+ */
 
-let time = 0;
+const Ambient = (() => {
 
-// Beat state
-let kickValue = 0;      
-let kickDecay = 0.96; // Smooth ripple decay
+  // ── Config ───────────────────────────────────────────────────
+  const PARTICLE_COUNT = 131072; // 512×256 = 2^17, perfect for FBO
+  const FBO_WIDTH  = 512;
+  const FBO_HEIGHT = 256;
+  const TRAIL_DECAY = 0.965;
 
-// Mouse state
-let mouseX = 0.5, mouseY = 0.5;
-let targetMouseX = 0.5, targetMouseY = 0.5;
+  // ── State ────────────────────────────────────────────────────
+  let renderer, scene, camera;
+  let simMaterial, particleMaterial, trailMaterial;
+  let positionFBO, velocityFBO;          // ping-pong buffers
+  let positionFBO2, velocityFBO2;
+  let trailFBO, trailFBO2;               // persistence trail buffers
+  let particleMesh, quadMesh, trailQuad;
+  let clock;
+  let initialized = false;
 
-// Default uniforms for the fluid appearance
-const config = {
-    speed: 0.2,
-    turb: 1.5,
-    pulse: 1.0,
-    orbs: 3.0,
-    bright: 1.2
-};
+  // Beat state
+  let beatPulse     = 0;
+  let beatTimer     = null;
+  let isPlaying     = false;
+  let lastFrameTime = performance.now();
 
-// Colors: [Base, Highlight, Shadow] (RGB values 0.0 to 1.0)
-let currentPalette = [
-    [0.05, 0.05, 0.1], // Dark blue
-    [0.2, 0.5, 0.9],   // Bright blue
-    [0.01, 0.01, 0.05] // Deep navy
-];
-let targetPalette = [...currentPalette];
+  // Audio features (smoothed)
+  let uLoudness  = 0;
+  let uCentroid  = 0;
+  let uMelbands  = new Float32Array(8);
+  let uBeat      = 0;
 
-// ==========================================
-// PALETTE & MOOD LOGIC
-// ==========================================
-const MOOD_RULES = {
-    "sad": [[0.05, 0.05, 0.15], [0.2, 0.3, 0.6], [0.0, 0.0, 0.05]],
-    "happy": [[0.8, 0.3, 0.1], [1.0, 0.8, 0.2], [0.4, 0.0, 0.1]],
-    "chill": [[0.1, 0.2, 0.15], [0.4, 0.8, 0.6], [0.05, 0.1, 0.05]],
-    "electronic": [[0.1, 0.0, 0.2], [0.9, 0.2, 1.0], [0.0, 0.0, 0.1]]
-};
+  // Palette
+  let paletteTop    = new THREE.Color(0.2, 0.5, 0.9);
+  let paletteBottom = new THREE.Color(0.05, 0.05, 0.12);
+  let targetTop     = new THREE.Color(0.2, 0.5, 0.9);
+  let targetBottom  = new THREE.Color(0.05, 0.05, 0.12);
 
-// Fallback: Generates a unique 3-color palette from a text string (like song title)
-function hashPalette(str) {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
-    const hue = Math.abs(hash % 360) / 360;
-    
-    // Quick helper to convert HSL to RGB for WebGL
-    const hsl2rgb = (h, s, l) => {
-        let r, g, b;
-        if (s === 0) r = g = b = l; else {
-            const hue2rgb = (p, q, t) => {
-                if(t < 0) t += 1; if(t > 1) t -= 1;
-                if(t < 1/6) return p + (q - p) * 6 * t;
-                if(t < 1/2) return q;
-                if(t < 2/3) return p + (q - p) * (2/3 - t) * 6;
-                return p;
-            };
-            const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-            const p = 2 * l - q;
-            r = hue2rgb(p, q, h + 1/3);
-            g = hue2rgb(p, q, h);
-            b = hue2rgb(p, q, h - 1/3);
-        }
-        return [r, g, b];
-    };
+  // ── GLSL Shaders ─────────────────────────────────────────────
 
-    return [
-        hsl2rgb(hue, 0.8, 0.15), // Base
-        hsl2rgb((hue + 0.1) % 1.0, 0.9, 0.6), // Highlight
-        hsl2rgb((hue - 0.1 + 1.0) % 1.0, 1.0, 0.05) // Shadow
-    ];
-}
+  const SIMPLEX_GLSL = `
+    // Classic 3D Simplex Noise by Stefan Gustavson
+    vec3 mod289(vec3 x){return x-floor(x*(1./289.))*289.;}
+    vec4 mod289(vec4 x){return x-floor(x*(1./289.))*289.;}
+    vec4 permute(vec4 x){return mod289(((x*34.)+1.)*x);}
+    vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-.85373472095314*r;}
 
-// Smoothly transition current colors to target colors
-function lerpPalette() {
-    for (let i = 0; i < 3; i++) {
-        for (let j = 0; j < 3; j++) {
-            currentPalette[i][j] += (targetPalette[i][j] - currentPalette[i][j]) * 0.02;
-        }
+    float snoise(vec3 v){
+      const vec2 C=vec2(1./6.,1./3.);
+      const vec4 D=vec4(0.,.5,1.,2.);
+      vec3 i=floor(v+dot(v,C.yyy));
+      vec3 x0=v-i+dot(i,C.xxx);
+      vec3 g=step(x0.yzx,x0.xyz);
+      vec3 l=1.-g;
+      vec3 i1=min(g.xyz,l.zxy);
+      vec3 i2=max(g.xyz,l.zxy);
+      vec3 x1=x0-i1+C.xxx;
+      vec3 x2=x0-i2+C.yyy;
+      vec3 x3=x0-D.yyy;
+      i=mod289(i);
+      vec4 p=permute(permute(permute(
+        i.z+vec4(0.,i1.z,i2.z,1.))+
+        i.y+vec4(0.,i1.y,i2.y,1.))+
+        i.x+vec4(0.,i1.x,i2.x,1.));
+      float n_=.142857142857;
+      vec3 ns=n_*D.wyz-D.xzx;
+      vec4 j=p-49.*floor(p*ns.z*ns.z);
+      vec4 x_=floor(j*ns.z);
+      vec4 y_=floor(j-7.*x_);
+      vec4 x=x_*ns.x+ns.yyyy;
+      vec4 y=y_*ns.x+ns.yyyy;
+      vec4 h=1.-abs(x)-abs(y);
+      vec4 b0=vec4(x.xy,y.xy);
+      vec4 b1=vec4(x.zw,y.zw);
+      vec4 s0=floor(b0)*2.+1.;
+      vec4 s1=floor(b1)*2.+1.;
+      vec4 sh=-step(h,vec4(0.));
+      vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy;
+      vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+      vec3 p0=vec3(a0.xy,h.x);
+      vec3 p1=vec3(a0.zw,h.y);
+      vec3 p2=vec3(a1.xy,h.z);
+      vec3 p3=vec3(a1.zw,h.w);
+      vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+      p0*=norm.x;p1*=norm.y;p2*=norm.z;p3*=norm.w;
+      vec4 m=max(.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.);
+      m=m*m;
+      return 42.*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
     }
-}
 
-// Simulate fetching a new song
-function loadSongVisuals(songTitle, tags) {
-    let found = false;
-    for (let tag of tags) {
-        if (MOOD_RULES[tag]) {
-            targetPalette = MOOD_RULES[tag];
-            found = true;
-            break;
-        }
+    // Curl noise — divergence-free 3D vector field
+    vec3 curlNoise(vec3 p){
+      const float e=1e-4;
+      vec3 dx=vec3(e,0.,0.);
+      vec3 dy=vec3(0.,e,0.);
+      vec3 dz=vec3(0.,0.,e);
+      float x=snoise(p+dy)-snoise(p-dy)-snoise(p+dz)+snoise(p-dz);
+      float y=snoise(p+dz)-snoise(p-dz)-snoise(p+dx)+snoise(p-dx);
+      float z=snoise(p+dx)-snoise(p-dx)-snoise(p+dy)+snoise(p-dy);
+      return normalize(vec3(x,y,z))/(2.*e);
     }
-    if (!found) targetPalette = hashPalette(songTitle);
-}
+  `;
 
-// ==========================================
-// SHADERS
-// ==========================================
-const VERT = `
-    attribute vec2 position;
-    void main() {
-        gl_Position = vec4(position, 0.0, 1.0);
-    }
-`;
+  // Simulation shader — updates particle positions via curl noise
+  const SIM_VERT = `
+    varying vec2 vUv;
+    void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}
+  `;
 
-const FRAG = `
+  const SIM_FRAG = `
     precision highp float;
-    uniform float u_time;
-    uniform vec2  u_res;
-    uniform vec3  u_c0, u_c1, u_c2;
-    uniform float u_speed, u_turb, u_pulse, u_orbs, u_bright;
-    uniform float u_kick;
-    uniform vec2  u_mouse;
+    uniform sampler2D uPosition;
+    uniform sampler2D uVelocity;
+    uniform float uTime;
+    uniform float uDeltaTime;
+    uniform float uLoudness;
+    uniform float uCentroid;
+    uniform float uBeat;
+    uniform float uMelBass;
+    uniform float uMelMid;
+    varying vec2 vUv;
 
-    vec3 hash3(vec2 p) {
-      vec3 q=vec3(dot(p,vec2(127.1,311.7)),dot(p,vec2(269.5,183.3)),dot(p,vec2(419.2,371.9)));
-      return fract(sin(q)*43758.5453);
-    }
-    float noise(vec2 p) {
-      vec2 i=floor(p),f=fract(p); f=f*f*(3.0-2.0*f);
-      float a=dot(hash3(i),vec3(1,0,0)), b=dot(hash3(i+vec2(1,0)),vec3(1,0,0));
-      float c=dot(hash3(i+vec2(0,1)),vec3(1,0,0)), d=dot(hash3(i+vec2(1,1)),vec3(1,0,0));
-      return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
-    }
-    float fbm(vec2 p) {
-      float v=0.0,a=0.5;
-      for(int i=0;i<5;i++){v+=a*noise(p);p=p*2.1+vec2(1.7,9.2);a*=0.5;}
-      return v;
-    }
+    ${SIMPLEX_GLSL}
 
-    void main() {
-      vec2 uv=gl_FragCoord.xy/u_res; uv.x*=u_res.x/u_res.y;
-      vec2 center = vec2(0.5*u_res.x/u_res.y, 0.5);
-      vec2 toCenter = normalize(uv - center);
-      float distToCenter = length(uv - center);
+    void main(){
+      vec3 pos = texture2D(uPosition, vUv).xyz;
+      vec3 vel = texture2D(uVelocity, vUv).xyz;
 
-      // --- SMOOTH RIPPLE MATH ---
-      float rippleRadius = (1.0 - u_kick) * 1.5;
-      float ring = smoothstep(rippleRadius - 0.3, rippleRadius, distToCenter) - 
-                   smoothstep(rippleRadius, rippleRadius + 0.1, distToCenter);
-      float rippleIntensity = ring * u_kick;
-      
-      uv += toCenter * rippleIntensity * 0.04;
+      // Noise frequency driven by spectral centroid (brighter = more chaotic)
+      float noiseFreq = 0.8 + uCentroid * 2.5;
+      // Flow speed driven by loudness
+      float flowSpeed = 0.3 + uLoudness * 1.8 + uMelBass * 0.8;
 
-      // --- MOUSE INTERACTION MATH ---
-      vec2 mouseUv = vec2(u_mouse.x * u_res.x/u_res.y, u_mouse.y);
-      vec2 toMouse = uv - mouseUv;
-      float distToMouse = length(toMouse);
-      
-      float mouseInfluence = smoothstep(0.4, 0.0, distToMouse); 
-      uv += normalize(toMouse) * mouseInfluence * 0.08;
+      vec3 noisePos = pos * noiseFreq + vec3(uTime * 0.12, uTime * 0.09, uTime * 0.07);
+      vec3 curl = curlNoise(noisePos) * flowSpeed;
 
-      // --- FLUID GENERATION ---
-      float t=u_time*u_speed;
-      vec2 q=vec2(fbm(uv+t*0.4), fbm(uv+vec2(5.2,1.3)));
-      vec2 r=vec2(fbm(uv+u_turb*q+vec2(1.7,9.2)+t*0.15),
-                  fbm(uv+u_turb*q+vec2(8.3,2.8)+t*0.12));
-      float f=fbm(uv+u_turb*r+t*0.1);
+      // Beat shockwave — radial burst from origin
+      float dist = length(pos);
+      vec3 beatForce = normalize(pos + 0.001) * uBeat * 2.5 * exp(-dist * 1.5);
 
-      float orbs=0.0;
-      for(float i=0.0;i<6.0;i++){
-        if(i>=u_orbs) break;
-        float fi=i/max(u_orbs-1.0,1.0);
-        float angle=fi*6.2832+t*(0.3+fi*0.2);
-        
-        float radius=(0.25+fi*0.18)*(1.0 + rippleIntensity*0.15); 
-        vec2 oc=vec2(0.5*u_res.x/u_res.y+cos(angle)*radius, 0.5+sin(angle)*radius*0.7);
-        float dist=length(uv-oc);
-        float pulse=1.0+0.12*sin(t*u_pulse*6.2832+fi*2.094);
-        orbs+=(0.06*pulse)/(dist+0.001);
+      // Bass mid warps vertical axis
+      curl.y += uMelMid * snoise(pos * 1.5 + vec3(0., uTime * 0.2, 0.)) * 0.4;
+
+      // Integrate velocity
+      vec3 acc = (curl + beatForce - vel * 0.6);
+      vel += acc * uDeltaTime * 3.0;
+      vel *= 0.985; // drag
+
+      // Boundary repulsion — keep in unit sphere
+      if(dist > 1.2){
+        vel += -normalize(pos) * (dist - 1.2) * 0.8;
       }
 
-      vec3 col=mix(u_c0,u_c1,clamp(f*f*f*2.5+orbs*0.3,0.0,1.0));
-      col=mix(col,u_c2,clamp(length(q)*0.5+orbs*0.15,0.0,1.0));
+      pos += vel * uDeltaTime;
 
-      // Add a soft, colorful glow to the ripple wave
-      col += u_c1 * rippleIntensity * 0.5;
-      col *= u_bright;
+      // Respawn dead particles at random surface
+      float rand = fract(sin(dot(vUv, vec2(127.1, 311.7))) * 43758.5);
+      float rand2 = fract(sin(dot(vUv, vec2(269.5, 183.3))) * 43758.5);
+      if(length(pos) > 1.6 || length(vel) < 0.0001){
+        float theta = rand * 6.2832;
+        float phi = acos(2. * rand2 - 1.);
+        float r = 0.5 + rand * 0.3;
+        pos = vec3(sin(phi)*cos(theta)*r, sin(phi)*sin(theta)*r, cos(phi)*r);
+        vel = vec3(0.);
+      }
 
-      // Static vignette
-      vec2 vig=uv-vec2(0.5*u_res.x/u_res.y,0.5);
-      col*=1.0-dot(vig,vig)*0.6;
-
-      gl_FragColor=vec4(clamp(col,0.0,1.0),1.0);
+      gl_FragColor = vec4(pos, 1.0);
     }
-`;
+  `;
 
-// ==========================================
-// WEBGL SETUP & RENDER LOOP
-// ==========================================
-function compileShader(type, source) {
-    const shader = gl.createShader(type);
-    gl.shaderSource(shader, source);
-    gl.compileShader(shader);
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-        console.error("Shader error:", gl.getShaderInfoLog(shader));
-        gl.deleteShader(shader);
-        return null;
+  // Velocity pass (separate for stability)
+  const VEL_FRAG = SIM_FRAG; // combined in position pass for simplicity
+
+  // Particle vertex shader — size from bass melband
+  const PARTICLE_VERT = `
+    uniform sampler2D uPosition;
+    uniform float uMelBass;
+    uniform float uLoudness;
+    uniform float uBeat;
+    uniform vec3 uColorTop;
+    uniform vec3 uColorBottom;
+    varying vec3 vColor;
+    varying float vAlpha;
+
+    void main(){
+      // Each particle reads its own position from the FBO texture
+      vec2 uv = position.xy; // position.xy stores the UV lookup
+      vec3 pos = texture2D(uPosition, uv).xyz;
+
+      // Project
+      vec4 mvPos = modelViewMatrix * vec4(pos, 1.0);
+      gl_Position = projectionMatrix * mvPos;
+
+      // Size from bass energy + beat pulse
+      float bassPulse = uMelBass * 3.0 + uBeat * 2.0;
+      gl_PointSize = (1.5 + bassPulse * 1.5) * (300.0 / -mvPos.z);
+
+      // Color: lerp by vertical position and centroid
+      float t = pos.y * 0.5 + 0.5;
+      vColor = mix(uColorBottom, uColorTop, t);
+      // Brightness boost on beat
+      vColor += vec3(0.1) * uBeat;
+
+      // Alpha from velocity magnitude (fast = brighter)
+      vAlpha = clamp(0.4 + uLoudness * 0.6, 0.1, 1.0);
     }
-    return shader;
-}
+  `;
 
-const vertexShader = compileShader(gl.VERTEX_SHADER, VERT);
-const fragmentShader = compileShader(gl.FRAGMENT_SHADER, FRAG);
-const program = gl.createProgram();
-gl.attachShader(program, vertexShader);
-gl.attachShader(program, fragmentShader);
-gl.linkProgram(program);
-gl.useProgram(program);
+  const PARTICLE_FRAG = `
+    precision highp float;
+    varying vec3 vColor;
+    varying float vAlpha;
 
-const vertices = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
-const buffer = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+    void main(){
+      // Soft circle with bloom-ready glow
+      vec2 d = gl_PointCoord - 0.5;
+      float dist = length(d);
+      if(dist > 0.5) discard;
 
-const positionLocation = gl.getAttribLocation(program, "position");
-gl.enableVertexAttribArray(positionLocation);
-gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+      // Distance-based alpha falloff
+      float alpha = (1.0 - dist * 2.0);
+      alpha = alpha * alpha * vAlpha;
 
-const locs = {
-    time: gl.getUniformLocation(program, "u_time"),
-    res: gl.getUniformLocation(program, "u_res"),
-    c0: gl.getUniformLocation(program, "u_c0"),
-    c1: gl.getUniformLocation(program, "u_c1"),
-    c2: gl.getUniformLocation(program, "u_c2"),
-    speed: gl.getUniformLocation(program, "u_speed"),
-    turb: gl.getUniformLocation(program, "u_turb"),
-    pulse: gl.getUniformLocation(program, "u_pulse"),
-    orbs: gl.getUniformLocation(program, "u_orbs"),
-    bright: gl.getUniformLocation(program, "u_bright"),
-    kick: gl.getUniformLocation(program, "u_kick"),
-    mouse: gl.getUniformLocation(program, "u_mouse")
-};
+      // Glow: brighter core
+      vec3 col = vColor + vColor * (1.0 - dist * 2.0) * 0.8;
 
-function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-    gl.viewport(0, 0, canvas.width, canvas.height);
-}
-window.addEventListener('resize', resize);
-resize();
-
-// ==========================================
-// INTERACTION EVENTS
-// ==========================================
-window.addEventListener('mousemove', (e) => {
-    targetMouseX = e.clientX / window.innerWidth;
-    targetMouseY = 1.0 - (e.clientY / window.innerHeight); 
-});
-
-window.addEventListener('keydown', (e) => {
-    if (e.code === 'Space') {
-        kickValue = 1.0; 
-        
-        // Bonus: Randomly change the palette to a new hashed string on beat
-        // loadSongVisuals(Math.random().toString(), []); 
+      gl_FragColor = vec4(col, alpha);
     }
-});
+  `;
 
-// ==========================================
-// MAIN RENDER LOOP
-// ==========================================
-function render() {
-    time += 0.01;
-    
-    // Process beat decay
-    kickValue *= kickDecay; 
-    if (kickValue < 0.001) kickValue = 0;
+  // Trail / persistence pass — accumulates frames for inky trails
+  const TRAIL_VERT = `
+    varying vec2 vUv;
+    void main(){vUv=uv;gl_Position=vec4(position.xy,0.,1.);}
+  `;
 
-    // Process mouse smoothing
-    mouseX += (targetMouseX - mouseX) * 0.05;
-    mouseY += (targetMouseY - mouseY) * 0.05;
+  const TRAIL_FRAG = `
+    precision highp float;
+    uniform sampler2D uParticles; // current frame
+    uniform sampler2D uTrail;     // previous trail
+    uniform float uDecay;
+    varying vec2 vUv;
 
-    // Process color transitions
-    lerpPalette(); 
+    void main(){
+      vec4 current = texture2D(uParticles, vUv);
+      vec4 prev    = texture2D(uTrail, vUv);
+      // Feedback: decay old trail, add new particles
+      vec4 trail = prev * uDecay + current;
+      gl_FragColor = clamp(trail, 0., 1.);
+    }
+  `;
 
-    // Send data to WebGL
-    gl.uniform1f(locs.time, time);
-    gl.uniform2f(locs.res, canvas.width, canvas.height);
-    gl.uniform3fv(locs.c0, currentPalette[0]);
-    gl.uniform3fv(locs.c1, currentPalette[1]);
-    gl.uniform3fv(locs.c2, currentPalette[2]);
-    
-    gl.uniform1f(locs.speed, config.speed);
-    gl.uniform1f(locs.turb, config.turb);
-    gl.uniform1f(locs.pulse, config.pulse);
-    gl.uniform1f(locs.orbs, config.orbs);
-    gl.uniform1f(locs.bright, config.bright);
-    
-    gl.uniform1f(locs.kick, kickValue);
-    gl.uniform2f(locs.mouse, mouseX, mouseY);
+  // Final composite — tonemap and vignette
+  const FINAL_FRAG = `
+    precision highp float;
+    uniform sampler2D uTrail;
+    uniform vec2 uRes;
+    uniform float uBrightness;
+    varying vec2 vUv;
 
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    requestAnimationFrame(render);
-}
+    void main(){
+      vec4 col = texture2D(uTrail, vUv);
 
-// Start the loop
-render();
+      // Filmic tonemapping
+      vec3 c = col.rgb;
+      c = c * (2.51 * c + 0.03) / (c * (2.43 * c + 0.59) + 0.14);
+
+      // Vignette
+      vec2 uv = vUv - 0.5;
+      float vig = 1.0 - dot(uv, uv) * 1.8;
+      c *= clamp(vig, 0., 1.);
+
+      // Chromatic aberration hint on edges
+      float aberr = length(uv) * 0.003;
+      float rr = texture2D(uTrail, vUv + vec2(aberr, 0.)).r;
+      float bb = texture2D(uTrail, vUv - vec2(aberr, 0.)).b;
+      c.r = mix(c.r, rr, 0.3);
+      c.b = mix(c.b, bb, 0.3);
+
+      c *= uBrightness;
+      gl_FragColor = vec4(clamp(c, 0., 1.), 1.0);
+    }
+  `;
+
+  // ── Internal helpers ─────────────────────────────────────────
+
+  function createFBO(w, h, type = THREE.FloatType) {
+    return new THREE.WebGLRenderTarget(w, h, {
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      format: THREE.RGBAFormat,
+      type,
+      depthBuffer: false,
+      stencilBuffer: false,
+    });
+  }
+
+  function createParticleUVs() {
+    // Each particle stores its own UV coords so it can sample the FBO
+    const uvs = new Float32Array(PARTICLE_COUNT * 3);
+    let i = 0;
+    for (let y = 0; y < FBO_HEIGHT; y++) {
+      for (let x = 0; x < FBO_WIDTH; x++) {
+        uvs[i++] = (x + 0.5) / FBO_WIDTH;
+        uvs[i++] = (y + 0.5) / FBO_HEIGHT;
+        uvs[i++] = 0;
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(uvs, 3));
+    return geo;
+  }
+
+  function initPositions() {
+    // Random sphere distribution
+    const data = new Float32Array(FBO_WIDTH * FBO_HEIGHT * 4);
+    for (let i = 0; i < FBO_WIDTH * FBO_HEIGHT; i++) {
+      const theta = Math.random() * Math.PI * 2;
+      const phi   = Math.acos(2 * Math.random() - 1);
+      const r     = 0.3 + Math.random() * 0.5;
+      data[i * 4 + 0] = Math.sin(phi) * Math.cos(theta) * r;
+      data[i * 4 + 1] = Math.sin(phi) * Math.sin(theta) * r;
+      data[i * 4 + 2] = Math.cos(phi) * r;
+      data[i * 4 + 3] = 1;
+    }
+    const tex = new THREE.DataTexture(data, FBO_WIDTH, FBO_HEIGHT, THREE.RGBAFormat, THREE.FloatType);
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  function createQuad(mat) {
+    const geo = new THREE.PlaneGeometry(2, 2);
+    return new THREE.Mesh(geo, mat);
+  }
+
+  // ── Public API ───────────────────────────────────────────────
+
+  function init() {
+    const canvas = document.getElementById('ambient-canvas');
+    if (!canvas) return;
+
+    // Renderer
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.autoClear = false;
+
+    // Check for required extensions
+    const gl = renderer.getContext();
+    if (!gl.getExtension('OES_texture_float')) {
+      console.warn('[Ambient] OES_texture_float not supported — falling back');
+      return;
+    }
+
+    clock = new THREE.Clock();
+
+    // Camera — orthographic for fullscreen quad passes
+    camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+    // ── FBO Setup ──
+    positionFBO  = createFBO(FBO_WIDTH, FBO_HEIGHT);
+    positionFBO2 = createFBO(FBO_WIDTH, FBO_HEIGHT);
+    trailFBO     = createFBO(window.innerWidth, window.innerHeight, THREE.HalfFloatType);
+    trailFBO2    = createFBO(window.innerWidth, window.innerHeight, THREE.HalfFloatType);
+
+    // Particle render target (not FBO, just temp)
+    const particleRT = createFBO(window.innerWidth, window.innerHeight, THREE.HalfFloatType);
+
+    // ── Simulation shader ──
+    simMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        uPosition:   { value: initPositions() },
+        uTime:       { value: 0 },
+        uDeltaTime:  { value: 0.016 },
+        uLoudness:   { value: 0 },
+        uCentroid:   { value: 0 },
+        uBeat:       { value: 0 },
+        uMelBass:    { value: 0 },
+        uMelMid:     { value: 0 },
+      },
+      vertexShader: SIM_VERT,
+      fragmentShader: SIM_FRAG,
+    });
+    quadMesh = createQuad(simMaterial);
+    scene = new THREE.Scene();
+    scene.add(quadMesh);
+
+    // ── Particle render ──
+    particleMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        uPosition:    { value: null },
+        uMelBass:     { value: 0 },
+        uLoudness:    { value: 0 },
+        uBeat:        { value: 0 },
+        uColorTop:    { value: new THREE.Vector3(0.2, 0.5, 0.9) },
+        uColorBottom: { value: new THREE.Vector3(0.05, 0.05, 0.12) },
+      },
+      vertexShader:   PARTICLE_VERT,
+      fragmentShader: PARTICLE_FRAG,
+      transparent:    true,
+      blending:       THREE.AdditiveBlending,
+      depthWrite:     false,
+    });
+
+    const particleGeo = createParticleUVs();
+    const particleScene = new THREE.Scene();
+    particleScene.add(new THREE.Points(particleGeo, particleMaterial));
+
+    // ── Trail / persistence shader ──
+    trailMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        uParticles: { value: null },
+        uTrail:     { value: null },
+        uDecay:     { value: TRAIL_DECAY },
+      },
+      vertexShader:   TRAIL_VERT,
+      fragmentShader: TRAIL_FRAG,
+    });
+    trailQuad = createQuad(trailMaterial);
+    const trailScene = new THREE.Scene();
+    trailScene.add(trailQuad);
+
+    // ── Final composite shader ──
+    const finalMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        uTrail:      { value: null },
+        uRes:        { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
+        uBrightness: { value: 1.0 },
+      },
+      vertexShader:   TRAIL_VERT,
+      fragmentShader: FINAL_FRAG,
+    });
+    const finalQuad = createQuad(finalMaterial);
+    const finalScene = new THREE.Scene();
+    finalScene.add(finalQuad);
+
+    // ── Particle render target for this frame ──
+    const particleCamera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    particleCamera.position.z = 2.2;
+
+    // Resize
+    window.addEventListener('resize', () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      trailFBO.setSize(window.innerWidth, window.innerHeight);
+      trailFBO2.setSize(window.innerWidth, window.innerHeight);
+      particleRT.setSize(window.innerWidth, window.innerHeight);
+      particleCamera.aspect = window.innerWidth / window.innerHeight;
+      particleCamera.updateProjectionMatrix();
+      finalMaterial.uniforms.uRes.value.set(window.innerWidth, window.innerHeight);
+    });
+
+    initialized = true;
+
+    // ── Render Loop ──
+    function renderLoop() {
+      requestAnimationFrame(renderLoop);
+      const now = performance.now();
+      const dt  = Math.min((now - lastFrameTime) / 1000, 0.05);
+      lastFrameTime = now;
+      const elapsed = clock.getElapsedTime();
+
+      // Lerp audio features toward GradientController values (smooth)
+      if (window.GradientController) {
+        const gfx = GradientController.gfx;
+        GradientController.frame(dt);
+
+        uLoudness  += (gfx.intensity - 1.0 - uLoudness)    * dt * 6;
+        beatPulse   = gfx.pulse;
+        uCentroid  += (gfx.topColor[0] * 0.5 - uCentroid)  * dt * 5;
+
+        // Update palette
+        paletteTop.fromArray(gfx.topColor);
+        paletteBottom.fromArray(gfx.bottomColor);
+      }
+
+      // Lerp palette
+      targetTop.lerp(paletteTop, dt * 3);
+      targetBottom.lerp(paletteBottom, dt * 3);
+
+      // ── PASS 1: Simulate positions ──
+      simMaterial.uniforms.uTime.value       = elapsed;
+      simMaterial.uniforms.uDeltaTime.value  = dt;
+      simMaterial.uniforms.uLoudness.value   = Math.max(0, uLoudness);
+      simMaterial.uniforms.uCentroid.value   = uCentroid;
+      simMaterial.uniforms.uBeat.value       = beatPulse;
+      simMaterial.uniforms.uMelBass.value    = uMelbands[0];
+      simMaterial.uniforms.uMelMid.value     = uMelbands[3];
+
+      quadMesh.material = simMaterial;
+      renderer.setRenderTarget(positionFBO2);
+      renderer.render(scene, camera);
+
+      // Swap position FBOs
+      [positionFBO, positionFBO2] = [positionFBO2, positionFBO];
+      simMaterial.uniforms.uPosition.value = positionFBO.texture;
+
+      // ── PASS 2: Render particles to temp buffer ──
+      particleMaterial.uniforms.uPosition.value    = positionFBO.texture;
+      particleMaterial.uniforms.uMelBass.value      = uMelbands[0];
+      particleMaterial.uniforms.uLoudness.value     = Math.max(0, uLoudness);
+      particleMaterial.uniforms.uBeat.value         = beatPulse;
+      particleMaterial.uniforms.uColorTop.value.fromArray(targetTop.toArray());
+      particleMaterial.uniforms.uColorBottom.value.fromArray(targetBottom.toArray());
+
+      renderer.setRenderTarget(particleRT);
+      renderer.clear();
+      renderer.render(particleScene, particleCamera);
+
+      // ── PASS 3: Trail / persistence feedback ──
+      trailMaterial.uniforms.uParticles.value = particleRT.texture;
+      trailMaterial.uniforms.uTrail.value     = trailFBO2.texture;
+      trailMaterial.uniforms.uDecay.value     = TRAIL_DECAY - uLoudness * 0.03;
+      trailQuad.material = trailMaterial;
+
+      renderer.setRenderTarget(trailFBO);
+      renderer.render(trailScene, camera);
+
+      // Swap trail FBOs
+      [trailFBO, trailFBO2] = [trailFBO2, trailFBO];
+
+      // ── PASS 4: Final composite to screen ──
+      finalMaterial.uniforms.uTrail.value      = trailFBO.texture;
+      finalMaterial.uniforms.uBrightness.value = 0.85 + Math.max(0, uLoudness) * 0.4;
+      finalQuad.material = finalMaterial;
+
+      renderer.setRenderTarget(null);
+      renderer.render(finalScene, camera);
+    }
+
+    renderLoop();
+  }
+
+  function setSong(songName, artistName, token) {
+    reset();
+    // Fetch mood data to set palette
+    if (!token) return;
+    fetch(`https://onesong.onrender.com/mood?track=${encodeURIComponent(songName)}&artist=${encodeURIComponent(artistName)}`, {
+      headers: { 'Authorization': `Bearer ${token}` }
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.tags && window.GradientController) {
+        const tags = data.tags;
+        // Map tags to palettes
+        const PALETTES = {
+          'sad':        { top: [0.2, 0.3, 0.6], bot: [0.0, 0.0, 0.05] },
+          'happy':      { top: [1.0, 0.8, 0.2], bot: [0.4, 0.0, 0.1] },
+          'electronic': { top: [0.9, 0.2, 1.0], bot: [0.0, 0.0, 0.1] },
+          'chill':      { top: [0.4, 0.8, 0.6], bot: [0.05, 0.1, 0.05] },
+          'rock':       { top: [0.9, 0.3, 0.1], bot: [0.1, 0.0, 0.0] },
+          'pop':        { top: [1.0, 0.5, 0.7], bot: [0.2, 0.0, 0.2] },
+          'jazz':       { top: [0.8, 0.6, 0.2], bot: [0.1, 0.05, 0.0] },
+          'classical':  { top: [0.9, 0.9, 0.8], bot: [0.1, 0.1, 0.15] },
+        };
+        for (const tag of tags) {
+          const p = PALETTES[tag];
+          if (p) {
+            GradientController.setBasePalette(p.top, p.bot);
+            break;
+          }
+        }
+        // Hash fallback
+        if (!tags.some(t => PALETTES[t])) {
+          const hash = [...songName].reduce((a, c) => a * 31 + c.charCodeAt(0), 0);
+          const hue  = Math.abs(hash % 360) / 360;
+          const h2r  = (h, s, l) => {
+            const q = l < 0.5 ? l*(1+s) : l+s-l*s, p = 2*l-q;
+            const hue2rgb = (p,q,t) => { t=((t%1)+1)%1; if(t<1/6)return p+(q-p)*6*t; if(t<0.5)return q; if(t<2/3)return p+(q-p)*(2/3-t)*6; return p; };
+            return [hue2rgb(p,q,h+1/3), hue2rgb(p,q,h), hue2rgb(p,q,h-1/3)];
+          };
+          GradientController.setBasePalette(h2r(hue,0.9,0.6), h2r((hue+0.5)%1,0.8,0.08));
+        }
+      }
+    })
+    .catch(() => {});
+  }
+
+  function startBeat() { isPlaying = true; if (window.GradientController) GradientController.updatePlayhead(0, true); }
+  function stopBeat()  { isPlaying = false; if (window.GradientController) GradientController.updatePlayhead(0, false); }
+
+  function syncBeat() {
+    if (window.GradientController) GradientController.triggerBeat();
+    uMelbands[0] = Math.min(1, uMelbands[0] + 0.5);
+    setTimeout(() => { uMelbands[0] *= 0.3; }, 150);
+  }
+
+  function reset() {
+    uLoudness = 0; uCentroid = 0; uMelbands.fill(0); beatPulse = 0;
+    if (window.GradientController) GradientController.reset();
+    // Clear trail FBOs
+    if (trailFBO && renderer) {
+      renderer.setRenderTarget(trailFBO);  renderer.clear();
+      renderer.setRenderTarget(trailFBO2); renderer.clear();
+      renderer.setRenderTarget(null);
+    }
+  }
+
+  return { init, setSong, startBeat, stopBeat, syncBeat, reset };
+})();
