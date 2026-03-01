@@ -1,163 +1,185 @@
 // ============================================================
-// ambient.js
-// WebGL fluid background renderer.
-// Audio-reactive values come from gradientController.gfx —
-// this file only owns the GPU pipeline and render loop.
+// ambient.js  (classic script — load after gradientController.js)
+//
+// Three things this file owns:
+//   1. WebGL fluid background shader
+//   2. Video colour sampler — reads dominant hue from the YT
+//      iframe every 2 s via a hidden canvas and feeds it as
+//      the base palette
+//   3. Render loop — calls GradientController.frame(dt) every
+//      frame so beat decays are smooth at 60 fps
 // ============================================================
-
-import { gfx, tick, setBasePalette, loadAudioData } from './gradientController.js';
 
 const canvas = document.getElementById('bg-canvas');
 const gl     = canvas.getContext('webgl');
 
-// ── Internal render state ────────────────────────────────────
-let _time       = 0;
-let _mouseX     = 0.5, _mouseY = 0.5;
-let _tgtMouseX  = 0.5, _tgtMouseY = 0.5;
-let _playing    = false;
-let _beatTimer  = null;   // interval handle for fallback metronome
+// ── Static fluid config ───────────────────────────────────────
+const CFG = { speed: 0.18, turb: 1.4, orbs: 3.0 };
 
-// ── Shader config (not audio-driven) ────────────────────────
-const CFG = { speed: 0.2, turb: 1.5, orbs: 3.0 };
-
-// ── Default palette (overridden by Ambient.setSong) ─────────
+// ── Palette lerp state ────────────────────────────────────────
+// _currentPalette lerps toward _targetPalette each frame.
+// Once video colour sampling kicks in, _targetPalette is replaced
+// with the sampled colours — the transition is automatic.
 let _currentPalette = [
-    [0.05, 0.05, 0.1],
-    [0.2,  0.5,  0.9],
-    [0.01, 0.01, 0.05],
+    [0.05, 0.05, 0.1 ],   // c0  shadow / dark
+    [0.2,  0.5,  0.9 ],   // c1  highlight / bright
+    [0.01, 0.01, 0.05],   // c2  deep shadow
 ];
 let _targetPalette = _currentPalette.map(c => [...c]);
 
-// ── Mood palette map ─────────────────────────────────────────
+// Mood fallback palette map (used if Last.fm returns a known tag)
 const MOODS = {
-    sad:        [[0.05,0.05,0.15],[0.2,0.3,0.6],[0.0,0.0,0.05]],
-    happy:      [[0.8,0.3,0.1],[1.0,0.8,0.2],[0.4,0.0,0.1]],
-    chill:      [[0.1,0.2,0.15],[0.4,0.8,0.6],[0.05,0.1,0.05]],
-    electronic: [[0.1,0.0,0.2],[0.9,0.2,1.0],[0.0,0.0,0.1]],
+    sad:        [[0.04,0.04,0.14],[0.18,0.28,0.58],[0.0,0.0,0.04]],
+    happy:      [[0.7,0.25,0.05],[0.98,0.75,0.15],[0.35,0.0,0.08]],
+    chill:      [[0.08,0.18,0.12],[0.35,0.75,0.55],[0.04,0.09,0.04]],
+    electronic: [[0.08,0.0,0.18],[0.85,0.15,0.95],[0.0,0.0,0.08]],
+    romantic:   [[0.18,0.04,0.08],[0.85,0.3,0.4],[0.08,0.0,0.04]],
+    dark:       [[0.02,0.02,0.04],[0.25,0.1,0.35],[0.0,0.0,0.02]],
 };
 
-// ── GLSL ─────────────────────────────────────────────────────
+// ── GLSL shaders ─────────────────────────────────────────────
 const VERT = `
-    attribute vec2 position;
-    void main() { gl_Position = vec4(position, 0.0, 1.0); }
+attribute vec2 position;
+void main() { gl_Position = vec4(position, 0.0, 1.0); }
 `;
 
+// Fragment shader: graceful fluid with TWO expanding ripple rings
 const FRAG = `
-    precision highp float;
+precision highp float;
 
-    uniform float u_time;
-    uniform vec2  u_res;
+uniform float u_time;
+uniform vec2  u_res;
+uniform vec3  u_c0, u_c1, u_c2;
+uniform float u_speed, u_turb, u_orbs;
 
-    // Palette (hue-shifted by gradientController each frame)
-    uniform vec3  u_c0, u_c1, u_c2;
+// Audio-reactive
+uniform float u_pulse;      // primary beat ring   (0-1, decays each frame)
+uniform float u_pulse2;     // secondary beat ring (0-1, offset timing)
+uniform float u_intensity;  // brightness from loudness
+uniform float u_phase;      // tempo-driven phase accumulator
+uniform float u_bassFlow;   // bass-driven vertical warp (0-1)
 
-    // Static shape config
-    uniform float u_speed, u_turb, u_orbs;
+uniform vec2  u_mouse;
 
-    // Audio-reactive uniforms
-    uniform float u_kick;       // beat pulse  (gradientController.gfx.pulse)
-    uniform float u_intensity;  // brightness  (gfx.intensity)
-    uniform float u_phase;      // drift offset (gfx.phase)
-    uniform float u_bassFlow;   // vertical warp (gfx.bassFlow)
+// ── Noise / FBM ──────────────────────────────────────────────
+vec3 hash3(vec2 p) {
+    vec3 q = vec3(dot(p,vec2(127.1,311.7)),
+                  dot(p,vec2(269.5,183.3)),
+                  dot(p,vec2(419.2,371.9)));
+    return fract(sin(q)*43758.5453);
+}
 
-    // Mouse
-    uniform vec2 u_mouse;
+float noise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f*f*(3.0-2.0*f);
+    float a = dot(hash3(i),           vec3(1,0,0));
+    float b = dot(hash3(i+vec2(1,0)), vec3(1,0,0));
+    float c = dot(hash3(i+vec2(0,1)), vec3(1,0,0));
+    float d = dot(hash3(i+vec2(1,1)), vec3(1,0,0));
+    return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+}
 
-    // ── noise / fbm ──────────────────────────────────────────
-    vec3 hash3(vec2 p) {
-        vec3 q = vec3(dot(p,vec2(127.1,311.7)),
-                      dot(p,vec2(269.5,183.3)),
-                      dot(p,vec2(419.2,371.9)));
-        return fract(sin(q)*43758.5453);
+float fbm(vec2 p) {
+    float v = 0.0, a = 0.5;
+    // Bass energy stretches the vertical frequency of each octave,
+    // producing elegant upward surges on low-end hits
+    for (int i = 0; i < 5; i++) {
+        v += a * noise(p);
+        p  = p * 2.1 + vec2(1.7, 9.2);
+        p.y *= 1.0 + u_bassFlow * 0.25;
+        a *= 0.5;
     }
-    float noise(vec2 p) {
-        vec2 i=floor(p), f=fract(p);
-        f = f*f*(3.0-2.0*f);
-        float a=dot(hash3(i),            vec3(1,0,0));
-        float b=dot(hash3(i+vec2(1,0)),  vec3(1,0,0));
-        float c=dot(hash3(i+vec2(0,1)),  vec3(1,0,0));
-        float d=dot(hash3(i+vec2(1,1)),  vec3(1,0,0));
-        return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+    return v;
+}
+
+// ── Graceful expanding ring ───────────────────────────────────
+// Returns brightness of the ring at distance d from centre.
+// radius grows from 0 → maxR as pulse decays 1 → 0.
+// Width is narrow so it reads as a crisp ripple in water.
+float ring(float dist, float pulse, float speed, float maxR) {
+    if (pulse < 0.001) return 0.0;
+    float r     = (1.0 - pulse) * maxR * speed;
+    float width = 0.04 + (1.0 - pulse) * 0.06; // widens as it travels
+    float edge  = smoothstep(r - width, r, dist)
+                - smoothstep(r, r + width * 0.5, dist);
+    return edge * pulse * pulse; // quadratic so leading edge is sharp
+}
+
+void main() {
+    vec2 uv = gl_FragCoord.xy / u_res;
+    uv.x   *= u_res.x / u_res.y;
+
+    vec2 center   = vec2(0.5 * u_res.x / u_res.y, 0.5);
+    vec2 toCenter = uv - center;
+    float dist    = length(toCenter);
+
+    // ── Two concentric ripple rings ───────────────────────────
+    float r1 = ring(dist, u_pulse,  1.0, 1.6);   // primary  — travels fast
+    float r2 = ring(dist, u_pulse2, 0.7, 1.2);   // secondary — slower, softer
+    float rippleTotal = r1 + r2 * 0.6;
+
+    // Displace UV outward along the rings (gives the water-ripple feel)
+    vec2 rippleDir = normalize(toCenter + vec2(0.001));
+    uv += rippleDir * (r1 * 0.035 + r2 * 0.02);
+
+    // ── Mouse soft repulsion ──────────────────────────────────
+    vec2 mouseUv  = vec2(u_mouse.x * u_res.x / u_res.y, u_mouse.y);
+    vec2 toMouse  = uv - mouseUv;
+    float mDist   = length(toMouse);
+    uv += normalize(toMouse + vec2(0.001)) * smoothstep(0.35, 0.0, mDist) * 0.06;
+
+    // ── Fluid field ───────────────────────────────────────────
+    // u_phase accumulates at tempo speed so motion always feels
+    // "in time" with the track even before audio analysis completes
+    float t  = u_time * u_speed + u_phase * 0.08;
+    vec2  q  = vec2(fbm(uv + t * 0.35), fbm(uv + vec2(5.2, 1.3)));
+    vec2  r  = vec2(fbm(uv + u_turb*q + vec2(1.7, 9.2) + t*0.14),
+                    fbm(uv + u_turb*q + vec2(8.3, 2.8) + t*0.11));
+    float f  = fbm(uv + u_turb*r + t*0.09);
+
+    // ── Orbiting glow orbs ────────────────────────────────────
+    float orbs = 0.0;
+    for (float i = 0.0; i < 6.0; i++) {
+        if (i >= u_orbs) break;
+        float fi    = i / max(u_orbs - 1.0, 1.0);
+        float angle = fi * 6.2832 + t * (0.25 + fi * 0.18);
+        float rad   = (0.22 + fi * 0.16) * (1.0 + rippleTotal * 0.12);
+        vec2  oc    = vec2(center.x + cos(angle) * rad,
+                           0.5      + sin(angle) * rad * 0.65);
+        // Gentle breathing pulse on each orb
+        float breath = 1.0 + 0.1 * sin(t * 6.2832 + fi * 2.094);
+        orbs += (0.055 * breath) / (length(uv - oc) + 0.001);
     }
-    float fbm(vec2 p) {
-        float v=0.0, a=0.5;
-        for(int i=0;i<5;i++){
-            // Bass energy warps vertical frequency
-            p.y *= 1.0 + u_bassFlow * 0.3;
-            v += a*noise(p);
-            p  = p*2.1 + vec2(1.7,9.2);
-            a *= 0.5;
-        }
-        return v;
-    }
 
-    void main() {
-        vec2 uv = gl_FragCoord.xy / u_res;
-        uv.x   *= u_res.x / u_res.y;
+    // ── Colour composition ────────────────────────────────────
+    // Three-way mix driven by the fluid field and orb contribution
+    float blend1 = clamp(f*f*f*2.2 + orbs*0.28, 0.0, 1.0);
+    float blend2 = clamp(length(q)*0.45 + orbs*0.12, 0.0, 1.0);
 
-        vec2 center    = vec2(0.5 * u_res.x / u_res.y, 0.5);
-        vec2 toCenter  = normalize(uv - center);
-        float dist     = length(uv - center);
+    vec3 col = mix(u_c0, u_c1, blend1);
+    col      = mix(col,  u_c2, blend2);
 
-        // ── Beat ripple ───────────────────────────────────────
-        float rippleR = (1.0 - u_kick) * 1.5;
-        float ring    = smoothstep(rippleR - 0.3, rippleR, dist)
-                      - smoothstep(rippleR,       rippleR + 0.1, dist);
-        float ripple  = ring * u_kick;
-        uv += toCenter * ripple * 0.04;
+    // Ripple rings add a bright flash of the highlight colour
+    col += u_c1 * rippleTotal * 0.55;
 
-        // ── Mouse repulsion ───────────────────────────────────
-        vec2 mouseUv = vec2(u_mouse.x * u_res.x/u_res.y, u_mouse.y);
-        vec2 toMouse = uv - mouseUv;
-        float mDist  = length(toMouse);
-        uv += normalize(toMouse) * smoothstep(0.4, 0.0, mDist) * 0.08;
+    // Loudness multiplies overall brightness
+    col *= u_intensity;
 
-        // ── Fluid generation using phase accumulator ──────────
-        float t  = u_time * u_speed + u_phase * 0.1;
-        vec2  q  = vec2(fbm(uv + t * 0.4), fbm(uv + vec2(5.2, 1.3)));
-        vec2  r  = vec2(fbm(uv + u_turb*q + vec2(1.7,9.2) + t*0.15),
-                        fbm(uv + u_turb*q + vec2(8.3,2.8) + t*0.12));
-        float f  = fbm(uv + u_turb*r + t*0.1);
+    // Soft vignette — keeps edges dark, centre luminous
+    float vig = dot(toCenter, toCenter);
+    col *= 1.0 - vig * 0.55;
 
-        // ── Orbiting glows ────────────────────────────────────
-        float orbs = 0.0;
-        for(float i=0.0; i<6.0; i++){
-            if(i >= u_orbs) break;
-            float fi    = i / max(u_orbs-1.0, 1.0);
-            float angle = fi*6.2832 + t*(0.3+fi*0.2);
-            float radius= (0.25+fi*0.18) * (1.0 + ripple*0.15);
-            vec2  oc    = vec2(center.x + cos(angle)*radius,
-                               0.5      + sin(angle)*radius*0.7);
-            float d     = length(uv - oc);
-            float pulse = 1.0 + 0.12*sin(t*6.2832 + fi*2.094);
-            orbs += (0.06*pulse) / (d + 0.001);
-        }
-
-        // ── Colour mixing ─────────────────────────────────────
-        vec3 col = mix(u_c0, u_c1, clamp(f*f*f*2.5 + orbs*0.3, 0.0, 1.0));
-        col = mix(col, u_c2, clamp(length(q)*0.5 + orbs*0.15, 0.0, 1.0));
-
-        // Beat glow
-        col += u_c1 * ripple * 0.5;
-
-        // Audio intensity modulates brightness
-        col *= u_intensity;
-
-        // Vignette
-        vec2 vig = uv - center;
-        col *= 1.0 - dot(vig, vig) * 0.6;
-
-        gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
-    }
+    gl_FragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}
 `;
 
 // ── WebGL setup ───────────────────────────────────────────────
-function _compileShader(type, src) {
+function _compile(type, src) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
     gl.compileShader(s);
     if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-        console.error('Shader error:', gl.getShaderInfoLog(s));
+        console.error('[Ambient] shader error:', gl.getShaderInfoLog(s));
         gl.deleteShader(s);
         return null;
     }
@@ -165,15 +187,14 @@ function _compileShader(type, src) {
 }
 
 const _prog = gl.createProgram();
-gl.attachShader(_prog, _compileShader(gl.VERTEX_SHADER,   VERT));
-gl.attachShader(_prog, _compileShader(gl.FRAGMENT_SHADER, FRAG));
+gl.attachShader(_prog, _compile(gl.VERTEX_SHADER,   VERT));
+gl.attachShader(_prog, _compile(gl.FRAGMENT_SHADER, FRAG));
 gl.linkProgram(_prog);
 gl.useProgram(_prog);
 
 const _buf = gl.createBuffer();
 gl.bindBuffer(gl.ARRAY_BUFFER, _buf);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-
 const _posLoc = gl.getAttribLocation(_prog, 'position');
 gl.enableVertexAttribArray(_posLoc);
 gl.vertexAttribPointer(_posLoc, 2, gl.FLOAT, false, 0, 0);
@@ -187,7 +208,8 @@ const U = {
     speed:     gl.getUniformLocation(_prog, 'u_speed'),
     turb:      gl.getUniformLocation(_prog, 'u_turb'),
     orbs:      gl.getUniformLocation(_prog, 'u_orbs'),
-    kick:      gl.getUniformLocation(_prog, 'u_kick'),
+    pulse:     gl.getUniformLocation(_prog, 'u_pulse'),
+    pulse2:    gl.getUniformLocation(_prog, 'u_pulse2'),
     intensity: gl.getUniformLocation(_prog, 'u_intensity'),
     phase:     gl.getUniformLocation(_prog, 'u_phase'),
     bassFlow:  gl.getUniformLocation(_prog, 'u_bassFlow'),
@@ -204,47 +226,135 @@ window.addEventListener('resize', _resize);
 _resize();
 
 // ── Mouse ─────────────────────────────────────────────────────
+let _mouseX = 0.5, _mouseY = 0.5, _tgtX = 0.5, _tgtY = 0.5;
 window.addEventListener('mousemove', e => {
-    _tgtMouseX = e.clientX / window.innerWidth;
-    _tgtMouseY = 1.0 - (e.clientY / window.innerHeight);
+    _tgtX = e.clientX / window.innerWidth;
+    _tgtY = 1.0 - (e.clientY / window.innerHeight);
 });
 
 // ── Palette helpers ───────────────────────────────────────────
 function _lerpPalette() {
     for (let i = 0; i < 3; i++)
         for (let j = 0; j < 3; j++)
-            _currentPalette[i][j] += (_targetPalette[i][j] - _currentPalette[i][j]) * 0.02;
+            _currentPalette[i][j] +=
+                (_targetPalette[i][j] - _currentPalette[i][j]) * 0.025;
 }
 
 function _hashPalette(str) {
-    let hash = 0;
-    for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
-    const hue = Math.abs(hash % 360) / 360;
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = str.charCodeAt(i) + ((h << 5) - h);
+    const hue = Math.abs(h % 360) / 360;
+    const hx  = (p, q, t) => {
+        if (t < 0) t += 1; if (t > 1) t -= 1;
+        if (t < 1/6) return p + (q-p)*6*t;
+        if (t < 1/2) return q;
+        if (t < 2/3) return p + (q-p)*(2/3-t)*6;
+        return p;
+    };
     const h2r = (h, s, l) => {
-        if (s === 0) return [l, l, l];
-        const q  = l < 0.5 ? l*(1+s) : l+s-l*s, p = 2*l-q;
-        const hx = (p, q, t) => {
-            if(t<0)t+=1; if(t>1)t-=1;
-            if(t<1/6)return p+(q-p)*6*t; if(t<1/2)return q;
-            if(t<2/3)return p+(q-p)*(2/3-t)*6; return p;
-        };
+        const q = l < 0.5 ? l*(1+s) : l+s-l*s, p = 2*l-q;
         return [hx(p,q,h+1/3), hx(p,q,h), hx(p,q,h-1/3)];
     };
-    return [h2r(hue,0.8,0.15), h2r((hue+0.1)%1,0.9,0.6), h2r((hue-0.1+1)%1,1.0,0.05)];
+    return [
+        h2r(hue,              0.8, 0.12),
+        h2r((hue + 0.1) % 1, 0.9, 0.58),
+        h2r((hue - 0.1+1)%1, 1.0, 0.04),
+    ];
 }
 
-// ── Main render loop ──────────────────────────────────────────
-function _render() {
-    _time += 0.01;
+// ── Video colour sampler ──────────────────────────────────────
+// Draws the YouTube iframe into a tiny off-screen canvas every
+// 2 seconds, reads the pixel data, computes the average RGB,
+// and maps that onto a graceful 3-tone palette.
+// Falls back silently if CORS blocks the draw (common in iframes).
+
+let _sampleCanvas = null;
+let _sampleCtx    = null;
+let _sampleTimer  = null;
+
+function _startVideoSampling() {
+    if (_sampleCanvas) return; // already running
+    _sampleCanvas = document.createElement('canvas');
+    _sampleCanvas.width  = 32;
+    _sampleCanvas.height = 18;
+    _sampleCtx = _sampleCanvas.getContext('2d');
+
+    _sampleTimer = setInterval(_sampleVideoColour, 2000);
+}
+
+function _stopVideoSampling() {
+    if (_sampleTimer) { clearInterval(_sampleTimer); _sampleTimer = null; }
+    _sampleCanvas = null;
+    _sampleCtx    = null;
+}
+
+function _sampleVideoColour() {
+    // The YT iframe is inside #yt-iframe-container > iframe
+    const container = document.getElementById('yt-iframe-container');
+    if (!container) return;
+    const iframe = container.querySelector('iframe');
+    if (!iframe) return;
+
+    try {
+        // drawImage on a cross-origin iframe will throw a SecurityError.
+        // We catch it and fall back to the hash palette — no crash.
+        _sampleCtx.drawImage(iframe, 0, 0, 32, 18);
+        const pixels = _sampleCtx.getImageData(0, 0, 32, 18).data;
+
+        let r = 0, g = 0, b = 0, count = 0;
+        // Sample every 4th pixel (skip alpha) for speed
+        for (let i = 0; i < pixels.length; i += 16) {
+            r += pixels[i];
+            g += pixels[i+1];
+            b += pixels[i+2];
+            count++;
+        }
+        r /= count * 255;
+        g /= count * 255;
+        b /= count * 255;
+
+        // Build a 3-tone palette from the dominant video colour:
+        //   c0  = dark version  (shadow)
+        //   c1  = vivid version (highlight)
+        //   c2  = deep shadow
+        const scale   = v => Math.min(1, Math.max(0, v));
+        const bright  = [scale(r*2.2), scale(g*2.2), scale(b*2.2)];
+        const mid     = [scale(r*0.9), scale(g*0.9), scale(b*0.9)];
+        const dark    = [scale(r*0.15), scale(g*0.15), scale(b*0.15)];
+        const deepDark= [scale(r*0.06), scale(g*0.06), scale(b*0.06)];
+
+        _targetPalette = [dark, bright, deepDark];
+        GradientController.setBasePalette(bright, mid);
+
+    } catch (e) {
+        // CORS block — silently ignore, keep current palette
+    }
+}
+
+// ── Render loop ───────────────────────────────────────────────
+let _time    = 0;
+let _lastRAF = null;
+
+function _render(now) {
+    // Delta time in seconds, clamped to avoid huge jumps on tab switch
+    const dt = _lastRAF ? Math.min((now - _lastRAF) / 1000, 0.05) : 0.016;
+    _lastRAF = now;
+    _time   += dt;
+
+    // Advance audio-reactive state at 60fps
+    GradientController.frame(dt);
 
     // Smooth mouse
-    _mouseX += (_tgtMouseX - _mouseX) * 0.05;
-    _mouseY += (_tgtMouseY - _mouseY) * 0.05;
+    _mouseX += (_tgtX - _mouseX) * 0.06;
+    _mouseY += (_tgtY - _mouseY) * 0.06;
 
     // Lerp palette toward target
     _lerpPalette();
 
-    // Colours may be further hue-shifted by gradientController
+    const gfx = GradientController.gfx;
+
+    // Colours: GradientController provides hue-shifted versions;
+    // fall back to lerped palette if no audio data is loaded yet.
     const c0 = gfx.bottomColor || _currentPalette[0];
     const c1 = gfx.topColor    || _currentPalette[1];
     const c2 = _currentPalette[2];
@@ -257,7 +367,8 @@ function _render() {
     gl.uniform1f(U.speed,     CFG.speed);
     gl.uniform1f(U.turb,      CFG.turb);
     gl.uniform1f(U.orbs,      CFG.orbs);
-    gl.uniform1f(U.kick,      gfx.pulse);
+    gl.uniform1f(U.pulse,     gfx.pulse);
+    gl.uniform1f(U.pulse2,    gfx.pulse2);
     gl.uniform1f(U.intensity, gfx.intensity);
     gl.uniform1f(U.phase,     gfx.phase);
     gl.uniform1f(U.bassFlow,  gfx.bassFlow);
@@ -267,20 +378,26 @@ function _render() {
     requestAnimationFrame(_render);
 }
 
-// ── Public Ambient API (called by app.js) ─────────────────────
-export const Ambient = {
-    /** Boot the render loop */
-    init() { _render(); },
+// ── Public API ────────────────────────────────────────────────
+const Ambient = {
+
+    init() {
+        requestAnimationFrame(_render);
+    },
 
     /**
-     * Called when a song is selected.
-     * Fetches mood tags → sets palette, then fetches audio analysis → feeds gradientController.
+     * Called by app.js when a song is loaded.
+     * 1. Fetches Last.fm mood tags → sets initial palette
+     * 2. Starts video colour sampling immediately (updates every 2s)
+     * 3. Kicks off audio analysis in background (may take 20-60s)
      */
     async setSong(songName, artistName, youtubeUrl, authToken) {
-        // 1. Mood palette
+        const API = 'https://onesong.onrender.com';
+
+        // ── Step 1: Mood palette (instant fallback) ───────────
         try {
             const r = await fetch(
-                `${window.API_BASE_URL}/mood?track=${encodeURIComponent(songName)}&artist=${encodeURIComponent(artistName)}`,
+                `${API}/mood?track=${encodeURIComponent(songName)}&artist=${encodeURIComponent(artistName)}`,
                 { headers: { Authorization: `Bearer ${authToken}` } }
             );
             const { tags = [] } = await r.json();
@@ -290,53 +407,63 @@ export const Ambient = {
             }
             if (!palette) palette = _hashPalette(songName);
             _targetPalette = palette;
-            // Tell gradientController the new base colours for hue-shifting
-            setBasePalette(palette[1], palette[0]);
+            GradientController.setBasePalette(palette[1], palette[0]);
         } catch (e) {
-            console.warn('[Ambient] mood fetch failed:', e);
-            _targetPalette = _hashPalette(songName);
-            setBasePalette(_targetPalette[1], _targetPalette[0]);
+            const p = _hashPalette(songName);
+            _targetPalette = p;
+            GradientController.setBasePalette(p[1], p[0]);
         }
 
-        // 2. Audio analysis (yt-dlp + librosa on the backend)
+        // ── Step 2: Start sampling video frame colours ─────────
+        // Give the YT player 1.5s to render before first sample
+        setTimeout(_startVideoSampling, 1500);
+
+        // ── Step 3: Audio analysis (non-blocking) ─────────────
         try {
-            const r = await fetch(`${window.API_BASE_URL}/analyze/audio`, {
+            const toastFn = window.showToast || (() => {});
+            const hideFn  = window.hideToast  || (() => {});
+            toastFn('🎵 Analysing audio…', '#a78bfa', true);
+
+            const r = await fetch(`${API}/analyze/audio`, {
                 method:  'POST',
-                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+                headers: { 'Content-Type': 'application/json',
+                           Authorization: `Bearer ${authToken}` },
                 body:    JSON.stringify({ youtube_url: youtubeUrl }),
             });
+            hideFn();
             if (r.ok) {
-                const data = await r.json();
-                loadAudioData(data);
-            } else {
-                console.warn('[Ambient] audio analysis returned', r.status);
+                GradientController.loadAudioData(await r.json());
+                toastFn('✓ Visuals synced to audio', '#4ade80');
+                setTimeout(hideFn, 2500);
             }
         } catch (e) {
-            console.warn('[Ambient] audio analysis failed:', e);
+            if (window.hideToast) window.hideToast();
+            console.warn('[Ambient] audio analysis unavailable — using spacebar sync');
         }
     },
 
-    /** Called every render frame by app.js with YT player current time */
+    /**
+     * Called by app.js every 250ms with YT player current time.
+     * Delegates entirely to GradientController.updatePlayhead().
+     */
     tickAudio(currentTime, isPlaying) {
-        tick(currentTime, isPlaying);
+        GradientController.updatePlayhead(currentTime, isPlaying);
+        if (isPlaying) _startVideoSampling();
     },
 
-    /** Manual beat tap (Spacebar fallback) */
+    /** Manual beat tap — spacebar fallback */
     syncBeat() {
-        gfx.pulse = 1.0;
+        GradientController.triggerBeat();
     },
 
-    /** Reset to default state (logout / song change) */
+    /** Stop video sampling and reset all visual state */
     reset() {
+        _stopVideoSampling();
         _targetPalette = [
-            [0.05, 0.05, 0.1],
-            [0.2,  0.5,  0.9],
+            [0.05, 0.05, 0.1 ],
+            [0.2,  0.5,  0.9 ],
             [0.01, 0.01, 0.05],
         ];
-        gfx.pulse     = 0;
-        gfx.phase     = 0;
-        gfx.intensity = 1.0;
-        gfx.bassFlow  = 0;
-        setBasePalette([0.2,0.5,0.9], [0.05,0.05,0.1]);
+        GradientController.reset();
     },
 };

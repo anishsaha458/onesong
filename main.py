@@ -1,19 +1,24 @@
 """
-main.py — OneSong API
-Adds /analyze/audio: downloads audio via yt-dlp, runs librosa analysis,
-caches results in memory (keyed by video ID) and on disk, returns
-tempo, beats, loudness, spectral and bass timelines to the frontend.
+main.py — OneSong API v4.1
+Key fix: /analyze/audio runs yt-dlp + librosa in a thread pool
+executor so the async event loop is never blocked — login, signup,
+and all other routes stay responsive during long audio analysis jobs.
+
+Also: audio file is loaded once and all four analysis passes share it.
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from typing import Optional
-import jwt, bcrypt, os, re, httpx, json, tempfile, shutil
+import asyncio, concurrent.futures, jwt, bcrypt, os, re, httpx
+import json, tempfile, shutil
 from datetime import datetime, timedelta
 from pathlib import Path
+from functools import partial
 
+# ── Optional heavy deps (graceful degradation) ───────────────
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -34,9 +39,9 @@ try:
 except ImportError:
     YTDLP_AVAILABLE = False
 
+# ── App & CORS ────────────────────────────────────────────────
 app = FastAPI()
 
-# ── CORS ──────────────────────────────────────────────────────
 CORS_HEADERS = {
     "Access-Control-Allow-Origin":  "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -61,10 +66,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 LASTFM_KEY   = os.getenv("LASTFM_API_KEY")
 LASTFM_BASE  = "https://ws.audioscrobbler.com/2.0/"
 
-# Audio analysis cache: video_id → analysis dict (in-memory + disk)
+# Thread pool for CPU-bound audio analysis (separate from async I/O)
+# max_workers=2 keeps memory usage bounded on a small Render instance
+_AUDIO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+# In-memory + disk cache keyed by YouTube video ID
 CACHE_DIR = Path(tempfile.gettempdir()) / "onesong_audio_cache"
 CACHE_DIR.mkdir(exist_ok=True)
-_analysis_cache: dict[str, dict] = {}
+_mem_cache: dict[str, dict] = {}
 
 security = HTTPBearer()
 
@@ -86,7 +95,7 @@ class SongData(BaseModel):
 class AudioRequest(BaseModel):
     youtube_url: str
 
-# ── Helpers ───────────────────────────────────────────────────
+# ── DB / auth helpers ─────────────────────────────────────────
 def extract_youtube_id(url: str) -> Optional[str]:
     for pattern in [
         r'(?:v=|\/)([0-9A-Za-z_-]{11})',
@@ -111,7 +120,8 @@ def get_db():
 
 def make_token(user_id: int, email: str) -> str:
     return jwt.encode(
-        {"user_id": user_id, "email": email, "exp": datetime.utcnow() + timedelta(days=7)},
+        {"user_id": user_id, "email": email,
+         "exp": datetime.utcnow() + timedelta(days=7)},
         JWT_SECRET, algorithm="HS256"
     )
 
@@ -123,117 +133,126 @@ def auth(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     except jwt.InvalidTokenError:
         raise HTTPException(401, "Invalid token")
 
-# ── Audio analysis helpers ────────────────────────────────────
-
-def download_audio(youtube_url: str, output_dir: str) -> str:
-    """
-    Uses yt-dlp to download the best audio stream as a 22050 Hz mono WAV.
-    Returns the path to the downloaded file.
-    """
-    if not YTDLP_AVAILABLE:
-        raise RuntimeError("yt-dlp not installed — add it to requirements.txt")
-
-    output_template = os.path.join(output_dir, "audio.%(ext)s")
-    ydl_opts = {
-        "format":           "bestaudio/best",
-        "outtmpl":          output_template,
-        "quiet":            True,
-        "no_warnings":      True,
-        "postprocessors": [{
-            "key":            "FFmpegExtractAudio",
-            "preferredcodec": "wav",
-        }],
-        # Limit to 8 minutes to avoid very large files
-        "match_filter": yt_dlp.utils.match_filter_func("duration < 480"),
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([youtube_url])
-
-    wav_path = os.path.join(output_dir, "audio.wav")
-    if not os.path.exists(wav_path):
-        # Fallback: find any audio file
-        for f in os.listdir(output_dir):
-            if f.startswith("audio."):
-                return os.path.join(output_dir, f)
-        raise RuntimeError("yt-dlp: no audio file produced")
-    return wav_path
-
-
-def analyze_beats(audio_path: str) -> tuple[float, list[dict]]:
-    """Returns (tempo_bpm, [{"t": seconds}, ...])"""
-    y, sr = librosa.load(audio_path, sr=22050, mono=True)
-    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
-    return float(tempo), [{"t": float(t)} for t in beat_times]
-
-
-def analyze_loudness(audio_path: str) -> list[dict]:
-    """Returns [{"t": seconds, "v": 0-1}, ...]  (RMS energy, normalised)"""
-    y, sr = librosa.load(audio_path, sr=22050, mono=True)
-    rms   = librosa.feature.rms(y=y)[0]
-    times = librosa.frames_to_time(range(len(rms)), sr=sr)
-    peak  = float(np.max(rms)) or 1.0
-    return [{"t": float(times[i]), "v": float(rms[i] / peak)} for i in range(len(rms))]
-
-
-def analyze_spectral(audio_path: str) -> list[dict]:
-    """Returns [{"t": seconds, "c": 0-1}, ...]  (spectral centroid, normalised)"""
-    y, sr     = librosa.load(audio_path, sr=22050, mono=True)
-    centroid  = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-    times     = librosa.frames_to_time(range(len(centroid)), sr=sr)
-    peak      = float(np.max(centroid)) or 1.0
-    return [{"t": float(times[i]), "c": float(centroid[i] / peak)} for i in range(len(centroid))]
-
-
-def analyze_bass(audio_path: str) -> list[dict]:
-    """Returns [{"t": seconds, "b": 0-1}, ...]  (sub-150 Hz energy, normalised)"""
-    y, sr   = librosa.load(audio_path, sr=22050, mono=True)
-    S       = np.abs(librosa.stft(y))
-    freqs   = librosa.fft_frequencies(sr=sr)
-    bass    = S[freqs < 150].mean(axis=0)
-    times   = librosa.frames_to_time(range(len(bass)), sr=sr)
-    peak    = float(np.max(bass)) or 1.0
-    return [{"t": float(times[i]), "b": float(bass[i] / peak)} for i in range(len(bass))]
-
-
-def run_full_analysis(audio_path: str, video_id: str) -> dict:
-    tempo, beats = analyze_beats(audio_path)
-    return {
-        "video_id": video_id,
-        "tempo":    tempo,
-        "beats":    beats,
-        "loudness": analyze_loudness(audio_path),
-        "spectral": analyze_spectral(audio_path),
-        "bass":     analyze_bass(audio_path),
-    }
-
-
+# ── Cache helpers ─────────────────────────────────────────────
 def _cache_path(video_id: str) -> Path:
     return CACHE_DIR / f"{video_id}.json"
 
-
-def load_from_cache(video_id: str) -> Optional[dict]:
-    # 1. In-memory
-    if video_id in _analysis_cache:
-        return _analysis_cache[video_id]
-    # 2. Disk
+def _load_cache(video_id: str) -> Optional[dict]:
+    if video_id in _mem_cache:
+        return _mem_cache[video_id]
     p = _cache_path(video_id)
     if p.exists():
         try:
             data = json.loads(p.read_text())
-            _analysis_cache[video_id] = data
+            _mem_cache[video_id] = data
             return data
         except Exception:
             pass
     return None
 
-
-def save_to_cache(video_id: str, data: dict):
-    _analysis_cache[video_id] = data
+def _save_cache(video_id: str, data: dict):
+    _mem_cache[video_id] = data
     try:
         _cache_path(video_id).write_text(json.dumps(data))
     except Exception as e:
         print(f"[cache] write failed: {e}")
+
+# ── Audio analysis (runs in thread pool, NOT on event loop) ───
+#
+# All four analysis functions share a single librosa.load() call.
+# This is the synchronous work that must NOT run on the async loop.
+
+def _download_audio(youtube_url: str, output_dir: str) -> str:
+    """yt-dlp → WAV file. Raises RuntimeError on failure."""
+    output_tpl = os.path.join(output_dir, "audio.%(ext)s")
+    ydl_opts = {
+        "format":      "bestaudio/best",
+        "outtmpl":     output_tpl,
+        "quiet":       True,
+        "no_warnings": True,
+        "postprocessors": [{
+            "key":            "FFmpegExtractAudio",
+            "preferredcodec": "wav",
+        }],
+        # Skip anything longer than 8 minutes to keep analysis fast
+        "match_filter": yt_dlp.utils.match_filter_func("duration < 480"),
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([youtube_url])
+
+    wav = os.path.join(output_dir, "audio.wav")
+    if os.path.exists(wav):
+        return wav
+    # Fallback: any file yt-dlp produced
+    for f in os.listdir(output_dir):
+        if f.startswith("audio."):
+            return os.path.join(output_dir, f)
+    raise RuntimeError("yt-dlp produced no audio file")
+
+
+def _run_analysis(youtube_url: str, video_id: str) -> dict:
+    """
+    Synchronous full pipeline:
+      1. yt-dlp downloads audio to a temp dir
+      2. librosa loads it ONCE
+      3. All four feature extractions run on the shared audio array
+      4. Temp dir is cleaned up
+      5. Returns the complete result dict
+
+    This runs in _AUDIO_EXECUTOR, never on the asyncio event loop.
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="onesong_")
+    try:
+        print(f"[audio] downloading {video_id}…")
+        audio_path = _download_audio(youtube_url, tmp_dir)
+
+        print(f"[audio] loading into librosa…")
+        # Load ONCE — share y and sr across all analysis passes
+        y, sr = librosa.load(audio_path, sr=22050, mono=True)
+
+        # ── Beats & tempo ─────────────────────────────────────
+        tempo_arr, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+        tempo = float(tempo_arr)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        beats = [{"t": float(t)} for t in beat_times]
+
+        # ── RMS loudness ──────────────────────────────────────
+        rms   = librosa.feature.rms(y=y)[0]
+        t_rms = librosa.frames_to_time(range(len(rms)), sr=sr)
+        peak_rms = float(np.max(rms)) or 1.0
+        loudness = [{"t": float(t_rms[i]), "v": float(rms[i] / peak_rms)}
+                    for i in range(len(rms))]
+
+        # ── Spectral centroid ─────────────────────────────────
+        centroid  = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        t_spec    = librosa.frames_to_time(range(len(centroid)), sr=sr)
+        peak_spec = float(np.max(centroid)) or 1.0
+        spectral  = [{"t": float(t_spec[i]), "c": float(centroid[i] / peak_spec)}
+                     for i in range(len(centroid))]
+
+        # ── Bass energy (< 150 Hz) ────────────────────────────
+        S         = np.abs(librosa.stft(y))
+        freqs     = librosa.fft_frequencies(sr=sr)
+        bass_arr  = S[freqs < 150].mean(axis=0)
+        t_bass    = librosa.frames_to_time(range(len(bass_arr)), sr=sr)
+        peak_bass = float(np.max(bass_arr)) or 1.0
+        bass      = [{"t": float(t_bass[i]), "b": float(bass_arr[i] / peak_bass)}
+                     for i in range(len(bass_arr))]
+
+        result = {
+            "video_id": video_id,
+            "tempo":    tempo,
+            "beats":    beats,
+            "loudness": loudness,
+            "spectral": spectral,
+            "bass":     bass,
+        }
+        print(f"[audio] done — tempo={tempo:.1f} bpm, {len(beats)} beats")
+        return result
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 # ── Startup ───────────────────────────────────────────────────
 @app.on_event("startup")
@@ -259,12 +278,13 @@ async def startup():
         cur.close(); conn.close()
         print("[startup] DB ready ✓")
     except Exception as e:
-        print(f"[startup] DB init skipped: {e}")
+        print(f"[startup] DB init skipped (will retry on first request): {e}")
+
 
 # ── Routes ────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "OneSong API", "version": "4.0.0"}
+    return {"status": "ok", "message": "OneSong API", "version": "4.1.0"}
 
 @app.get("/health")
 def health():
@@ -274,15 +294,16 @@ def health():
     except Exception:
         pass
     return {
-        "status":          "healthy" if db_ok else "degraded",
-        "database":        "healthy" if db_ok else "unavailable",
-        "psycopg2":        PSYCOPG2_AVAILABLE,
-        "librosa":         LIBROSA_AVAILABLE,
-        "yt_dlp":          YTDLP_AVAILABLE,
+        "status":           "healthy" if db_ok else "degraded",
+        "database":         "healthy" if db_ok else "unavailable",
+        "psycopg2":         PSYCOPG2_AVAILABLE,
+        "librosa":          LIBROSA_AVAILABLE,
+        "yt_dlp":           YTDLP_AVAILABLE,
         "database_url_set": bool(DATABASE_URL),
-        "timestamp":       datetime.utcnow().isoformat(),
+        "timestamp":        datetime.utcnow().isoformat(),
     }
 
+# ── Auth ──────────────────────────────────────────────────────
 @app.post("/auth/signup")
 def signup(user: UserSignup):
     conn = get_db(); cur = conn.cursor()
@@ -295,7 +316,8 @@ def signup(user: UserSignup):
             "INSERT INTO users (email, username, password_hash) VALUES (%s,%s,%s) RETURNING id",
             (user.email, user.username, pw_hash)
         )
-        uid = cur.fetchone()["id"]; conn.commit()
+        uid = cur.fetchone()["id"]
+        conn.commit()
     finally:
         cur.close(); conn.close()
     return {"token": make_token(uid, user.email),
@@ -305,7 +327,10 @@ def signup(user: UserSignup):
 def login(user: UserLogin):
     conn = get_db(); cur = conn.cursor()
     try:
-        cur.execute("SELECT id,email,username,password_hash FROM users WHERE email=%s", (user.email,))
+        cur.execute(
+            "SELECT id,email,username,password_hash FROM users WHERE email=%s",
+            (user.email,)
+        )
         row = cur.fetchone()
     finally:
         cur.close(); conn.close()
@@ -318,6 +343,7 @@ def login(user: UserLogin):
 def verify(payload: dict = Depends(auth)):
     return {"valid": True, "user_id": payload["user_id"], "email": payload["email"]}
 
+# ── Song ──────────────────────────────────────────────────────
 @app.get("/user/song")
 def get_song(payload: dict = Depends(auth)):
     conn = get_db(); cur = conn.cursor()
@@ -341,7 +367,8 @@ def save_song(song: SongData, payload: dict = Depends(auth)):
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute(
-            "UPDATE users SET song_name=%s,artist_name=%s,youtube_url=%s,youtube_video_id=%s,updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+            """UPDATE users SET song_name=%s, artist_name=%s, youtube_url=%s,
+               youtube_video_id=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s""",
             (song.song_name, song.artist_name, song.youtube_url, vid, payload["user_id"])
         )
         conn.commit()
@@ -349,22 +376,17 @@ def save_song(song: SongData, payload: dict = Depends(auth)):
         cur.close(); conn.close()
     return {"message": "Saved!", "song": {**song.dict(), "youtube_video_id": vid}}
 
-# ── /analyze/audio — the new core endpoint ────────────────────
+# ── Audio analysis — non-blocking ─────────────────────────────
 @app.post("/analyze/audio")
 async def analyze_audio(req: AudioRequest, payload: dict = Depends(auth)):
     """
-    Downloads the YouTube audio stream via yt-dlp, runs librosa analysis,
-    caches the result, and returns the full feature timeline.
+    Downloads audio via yt-dlp and extracts beat/loudness/spectral/bass
+    timelines using librosa.
 
-    Response shape:
-    {
-        "video_id": str,
-        "tempo":    float,
-        "beats":    [{"t": float}],
-        "loudness": [{"t": float, "v": float}],
-        "spectral": [{"t": float, "c": float}],
-        "bass":     [{"t": float, "b": float}]
-    }
+    The heavy work runs in a ThreadPoolExecutor so the async event loop
+    (and therefore login, signup, and all other routes) is NEVER blocked.
+
+    Returns cached results instantly on repeat requests for the same video.
     """
     if not LIBROSA_AVAILABLE:
         raise HTTPException(503, "librosa not installed — add to requirements.txt")
@@ -375,59 +397,56 @@ async def analyze_audio(req: AudioRequest, payload: dict = Depends(auth)):
     if not video_id:
         raise HTTPException(400, "Invalid YouTube URL")
 
-    # Serve from cache if available
-    cached = load_from_cache(video_id)
+    # Serve from cache — no processing needed
+    cached = _load_cache(video_id)
     if cached:
-        print(f"[analyze] cache hit: {video_id}")
+        print(f"[audio] cache hit: {video_id}")
         return cached
 
-    # Download + analyse in a temp directory (cleaned up after)
-    tmp_dir = tempfile.mkdtemp(prefix="onesong_")
+    # Run blocking analysis in thread pool.
+    # asyncio.get_event_loop().run_in_executor returns a coroutine that
+    # yields control back to the event loop while the thread runs.
+    loop = asyncio.get_event_loop()
     try:
-        print(f"[analyze] downloading audio for {video_id}…")
-        audio_path = download_audio(req.youtube_url, tmp_dir)
-
-        print(f"[analyze] running librosa on {audio_path}…")
-        result = run_full_analysis(audio_path, video_id)
-
-        save_to_cache(video_id, result)
-        print(f"[analyze] done: tempo={result['tempo']:.1f} bpm, beats={len(result['beats'])}")
-        return result
-
+        result = await loop.run_in_executor(
+            _AUDIO_EXECUTOR,
+            partial(_run_analysis, req.youtube_url, video_id)
+        )
     except Exception as e:
-        print(f"[analyze] error: {e}")
+        print(f"[audio] analysis failed: {e}")
         raise HTTPException(500, f"Audio analysis failed: {e}")
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-# ── Existing Last.fm routes ───────────────────────────────────
+    _save_cache(video_id, result)
+    return result
+
+# ── Last.fm ───────────────────────────────────────────────────
 @app.get("/recommendations")
 async def recommendations(track: str, artist: str, payload: dict = Depends(auth)):
     if not LASTFM_KEY:
         raise HTTPException(500, "Last.fm API key not configured")
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(LASTFM_BASE, params={
-            "method":"track.getSimilar","track":track,"artist":artist,
-            "api_key":LASTFM_KEY,"format":"json","limit":"5","autocorrect":"1",
+            "method": "track.getSimilar", "track": track, "artist": artist,
+            "api_key": LASTFM_KEY, "format": "json", "limit": "5", "autocorrect": "1",
         })
-        raw = r.json().get("similartracks",{}).get("track",[])
+        raw = r.json().get("similartracks", {}).get("track", [])
         if not raw:
             s = await client.get(LASTFM_BASE, params={
-                "method":"track.search","track":track,
-                "api_key":LASTFM_KEY,"format":"json","limit":"1",
+                "method": "track.search", "track": track,
+                "api_key": LASTFM_KEY, "format": "json", "limit": "1",
             })
-            hits = s.json().get("results",{}).get("trackmatches",{}).get("track",[])
+            hits = s.json().get("results", {}).get("trackmatches", {}).get("track", [])
             if hits:
-                found = hits[0] if isinstance(hits,list) else hits
+                found = hits[0] if isinstance(hits, list) else hits
                 r2 = await client.get(LASTFM_BASE, params={
-                    "method":"track.getSimilar","track":found["name"],
-                    "artist":found["artist"],"api_key":LASTFM_KEY,
-                    "format":"json","limit":"5","autocorrect":"1",
+                    "method": "track.getSimilar", "track": found["name"],
+                    "artist": found["artist"], "api_key": LASTFM_KEY,
+                    "format": "json", "limit": "5", "autocorrect": "1",
                 })
-                raw = r2.json().get("similartracks",{}).get("track",[])
-    return {"tracks":[
-        {"name":t["name"],"artist":t["artist"]["name"],
-         "match":round(float(t.get("match",0))*100),"url":t.get("url","")}
+                raw = r2.json().get("similartracks", {}).get("track", [])
+    return {"tracks": [
+        {"name": t["name"], "artist": t["artist"]["name"],
+         "match": round(float(t.get("match", 0)) * 100), "url": t.get("url", "")}
         for t in raw[:3]
     ]}
 
@@ -438,30 +457,35 @@ async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
     tags = []
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(LASTFM_BASE, params={
-            "method":"track.getTopTags","track":track,"artist":artist,
-            "api_key":LASTFM_KEY,"format":"json","autocorrect":"1",
+            "method": "track.getTopTags", "track": track, "artist": artist,
+            "api_key": LASTFM_KEY, "format": "json", "autocorrect": "1",
         })
-        raw = r.json().get("toptags",{}).get("tag",[])
-        tags = [t["name"].lower() for t in raw if int(t.get("count",0)) > 10]
+        raw = r.json().get("toptags", {}).get("tag", [])
+        tags = [t["name"].lower() for t in raw if int(t.get("count", 0)) > 10]
         if len(tags) < 3:
             r2 = await client.get(LASTFM_BASE, params={
-                "method":"artist.getTopTags","artist":artist,
-                "api_key":LASTFM_KEY,"format":"json","autocorrect":"1",
+                "method": "artist.getTopTags", "artist": artist,
+                "api_key": LASTFM_KEY, "format": "json", "autocorrect": "1",
             })
-            tags += [t["name"].lower() for t in r2.json().get("toptags",{}).get("tag",[])[:10]]
+            tags += [t["name"].lower() for t in
+                     r2.json().get("toptags", {}).get("tag", [])[:10]]
     return {"tags": tags[:20]}
 
 @app.get("/user/profile")
 def profile(payload: dict = Depends(auth)):
     conn = get_db(); cur = conn.cursor()
     try:
-        cur.execute("SELECT id,email,username,created_at FROM users WHERE id=%s", (payload["user_id"],))
+        cur.execute(
+            "SELECT id,email,username,created_at FROM users WHERE id=%s",
+            (payload["user_id"],)
+        )
         row = cur.fetchone()
     finally:
         cur.close(); conn.close()
     if not row:
         raise HTTPException(404, "User not found")
-    return {**dict(row), "created_at": row["created_at"].isoformat() if row["created_at"] else None}
+    return {**dict(row),
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None}
 
 if __name__ == "__main__":
     import uvicorn

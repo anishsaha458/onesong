@@ -10,7 +10,6 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <!-- WebGL ambient background -->
     <canvas id="bg-canvas"></canvas>
 
     <div id="loading" class="loading hidden">
@@ -29,15 +28,15 @@
             <div id="login-form" class="auth-form">
                 <h2>Welcome back</h2>
                 <input type="email"    id="login-email"    placeholder="Email address" required>
-                <input type="password" id="login-password" placeholder="Password"       required>
+                <input type="password" id="login-password" placeholder="Password"      required>
                 <button onclick="login()">Sign In</button>
                 <p class="toggle-auth">New here? <a href="#" onclick="showSignup()">Create account</a></p>
             </div>
 
             <div id="signup-form" class="auth-form hidden">
                 <h2>Join OneSong</h2>
-                <input type="text"     id="signup-username" placeholder="Username"             required>
-                <input type="email"    id="signup-email"    placeholder="Email address"         required>
+                <input type="text"     id="signup-username" placeholder="Username"              required>
+                <input type="email"    id="signup-email"    placeholder="Email address"          required>
                 <input type="password" id="signup-password" placeholder="Password (min 6 chars)" required>
                 <button onclick="signup()">Create Account</button>
                 <p class="toggle-auth"><a href="#" onclick="showLogin()">Sign in</a></p>
@@ -82,7 +81,6 @@
                 Tap <strong>Spacebar</strong> to the beat to align the visuals
             </p>
 
-            <!-- Recommendations -->
             <div id="recommendations-section" class="recommendations-section hidden">
                 <div class="rec-header">
                     <span class="rec-badge">✦ AI</span>
@@ -116,9 +114,9 @@
                 <p class="subtitle">close to who you are</p>
             </div>
             <div class="song-form">
-                <input type="text" id="input-song-name"    placeholder="song name">
-                <input type="text" id="input-artist-name"  placeholder="artist">
-                <input type="text" id="input-youtube-url"  placeholder="YouTube URL (paste from browser)">
+                <input type="text" id="input-song-name"   placeholder="song name">
+                <input type="text" id="input-artist-name" placeholder="artist">
+                <input type="text" id="input-youtube-url" placeholder="YouTube URL (paste from browser)">
                 <p class="hint">find your song on youtube and paste the URL here</p>
                 <div id="song-form-error" class="error-message hidden"></div>
                 <button onclick="saveSong()">Save My Song</button>
@@ -126,12 +124,16 @@
             <button onclick="cancelSongSelection()" class="btn btn-secondary" id="cancel-btn">Cancel</button>
         </div>
 
-    </div><!-- /app-container -->
+    </div>
 
     <!--
-        app.js is an ES module; it imports ambient.js which imports gradientController.js.
-        The YouTube IFrame API script is injected dynamically by app.js when a song loads.
+        Load order matters:
+        1. gradientController.js — defines GradientController global
+        2. ambient.js            — defines Ambient global, reads GradientController
+        3. app.js                — app logic, calls Ambient + all onclick handlers
     -->
-    <script type="module" src="app.js"></script>
+    <script src="gradientController.js"></script>
+    <script src="ambient.js"></script>
+    <script src="app.js"></script>
 </body>
 </html>
