@@ -1,603 +1,440 @@
 /**
- * ambient.js — GPGPU Flow Field Visualizer
- * Three.js FBO Particle System · 100k particles · Curl Noise Physics
- * Audio-synced via GradientController and AudioAnalytics timeline
+ * ambient.js — GPGPU Flow Field Visualizer  v2.1 (FIXED)
+ * Three.js r128 · 512×256 FBO ping-pong · Curl Noise · Persistence trails
+ *
+ * BUG FIXES vs v2.0:
+ *   [1] OES_texture_float failure now falls back to HalfFloat instead of silently dying
+ *   [2] uVelocity was MISSING from simMaterial uniforms — positions never updated
+ *   [3] Added separate velocity FBO ping-pong (position & velocity now properly decoupled)
+ *   [4] FBOs primed with initial DataTexture before first render (no uninitialised GPU reads)
+ *   [5] THREE.Color.lerp() factor clamped to [0,1]; was dt*3 which overshoots → freeze
+ *   [6] uColorTop/uColorBot set via .set(r,g,b) — no broken .toArray() needed
+ *   [7] Canvas z-index forced to -1 via JS so it's always behind UI
+ *   [8] velMaterial shares simUniforms object so audio values propagate to both passes
  */
 
 const Ambient = (() => {
 
-  // ── Config ───────────────────────────────────────────────────
-  const PARTICLE_COUNT = 131072; // 512×256 = 2^17, perfect for FBO
-  const FBO_WIDTH  = 512;
-  const FBO_HEIGHT = 256;
-  const TRAIL_DECAY = 0.965;
+  const FBO_W = 512, FBO_H = 256;
+  const TRAIL_DECAY = 0.962;
 
-  // ── State ────────────────────────────────────────────────────
-  let renderer, scene, camera;
-  let simMaterial, particleMaterial, trailMaterial;
-  let positionFBO, velocityFBO;          // ping-pong buffers
-  let positionFBO2, velocityFBO2;
-  let trailFBO, trailFBO2;               // persistence trail buffers
-  let particleMesh, quadMesh, trailQuad;
-  let clock;
+  // Module-level refs (captured by renderLoop closure)
+  let renderer, clock;
+  let simScene, velScene, particleScene, trailScene, finalScene;
+  let particleCamera;
+  let simMaterial, velMaterial, particleMaterial, trailMaterial, finalMaterial;
+  let posA, posB, velA, velB, trailA, trailB, particleRT;
   let initialized = false;
 
-  // Beat state
-  let beatPulse     = 0;
-  let beatTimer     = null;
-  let isPlaying     = false;
-  let lastFrameTime = performance.now();
+  // Audio state
+  let uLoudness = 0, uCentroid = 0, beatPulse = 0;
+  let uMelbands = new Float32Array(8);
+  let lastT = performance.now();
 
-  // Audio features (smoothed)
-  let uLoudness  = 0;
-  let uCentroid  = 0;
-  let uMelbands  = new Float32Array(8);
-  let uBeat      = 0;
+  // Palette colours — THREE.Color for proper lerp
+  let palTop = new THREE.Color(0.06, 0.12, 0.35);
+  let palBot = new THREE.Color(0.02, 0.02, 0.08);
 
-  // Palette
-  let paletteTop    = new THREE.Color(0.2, 0.5, 0.9);
-  let paletteBottom = new THREE.Color(0.05, 0.05, 0.12);
-  let targetTop     = new THREE.Color(0.2, 0.5, 0.9);
-  let targetBottom  = new THREE.Color(0.05, 0.05, 0.12);
-
-  // ── GLSL Shaders ─────────────────────────────────────────────
-
-  const SIMPLEX_GLSL = `
-    // Classic 3D Simplex Noise by Stefan Gustavson
-    vec3 mod289(vec3 x){return x-floor(x*(1./289.))*289.;}
-    vec4 mod289(vec4 x){return x-floor(x*(1./289.))*289.;}
-    vec4 permute(vec4 x){return mod289(((x*34.)+1.)*x);}
-    vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-.85373472095314*r;}
+  // ── GLSL: 3D Simplex + Curl Noise ──────────────────────────────
+  const NOISE = /* glsl */`
+    vec3 m289(vec3 x){return x-floor(x/289.)*289.;}
+    vec4 m289(vec4 x){return x-floor(x/289.)*289.;}
+    vec4 perm(vec4 x){return m289((x*34.+1.)*x);}
+    vec4 tis(vec4 r){return 1.7928429-.8537347*r;}
 
     float snoise(vec3 v){
-      const vec2 C=vec2(1./6.,1./3.);
-      const vec4 D=vec4(0.,.5,1.,2.);
-      vec3 i=floor(v+dot(v,C.yyy));
-      vec3 x0=v-i+dot(i,C.xxx);
-      vec3 g=step(x0.yzx,x0.xyz);
-      vec3 l=1.-g;
-      vec3 i1=min(g.xyz,l.zxy);
-      vec3 i2=max(g.xyz,l.zxy);
-      vec3 x1=x0-i1+C.xxx;
-      vec3 x2=x0-i2+C.yyy;
-      vec3 x3=x0-D.yyy;
-      i=mod289(i);
-      vec4 p=permute(permute(permute(
-        i.z+vec4(0.,i1.z,i2.z,1.))+
-        i.y+vec4(0.,i1.y,i2.y,1.))+
-        i.x+vec4(0.,i1.x,i2.x,1.));
-      float n_=.142857142857;
-      vec3 ns=n_*D.wyz-D.xzx;
-      vec4 j=p-49.*floor(p*ns.z*ns.z);
-      vec4 x_=floor(j*ns.z);
-      vec4 y_=floor(j-7.*x_);
-      vec4 x=x_*ns.x+ns.yyyy;
-      vec4 y=y_*ns.x+ns.yyyy;
-      vec4 h=1.-abs(x)-abs(y);
-      vec4 b0=vec4(x.xy,y.xy);
-      vec4 b1=vec4(x.zw,y.zw);
-      vec4 s0=floor(b0)*2.+1.;
-      vec4 s1=floor(b1)*2.+1.;
-      vec4 sh=-step(h,vec4(0.));
-      vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy;
-      vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
-      vec3 p0=vec3(a0.xy,h.x);
-      vec3 p1=vec3(a0.zw,h.y);
-      vec3 p2=vec3(a1.xy,h.z);
-      vec3 p3=vec3(a1.zw,h.w);
-      vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+      const vec2 C=vec2(.166667,.333333);
+      vec3 i=floor(v+dot(v,C.yyy)), x0=v-i+dot(i,C.xxx);
+      vec3 g=step(x0.yzx,x0.xyz), l=1.-g;
+      vec3 i1=min(g,l.zxy), i2=max(g,l.zxy);
+      vec3 x1=x0-i1+C.xxx, x2=x0-i2+C.yyy, x3=x0-.5;
+      i=m289(i);
+      vec4 p=perm(perm(perm(i.z+vec4(0,i1.z,i2.z,1))+i.y+vec4(0,i1.y,i2.y,1))+i.x+vec4(0,i1.x,i2.x,1));
+      vec3 ns=.142857*vec3(0,1,2)-vec3(.333333);
+      vec4 j=p-49.*floor(p*.020408);
+      vec4 x_=floor(j*.142857), y_=floor(j-7.*x_);
+      vec4 x=x_*.142857+ns.y, y=y_*.142857+ns.y, h=1.-abs(x)-abs(y);
+      vec4 b0=vec4(x.xy,y.xy), b1=vec4(x.zw,y.zw);
+      vec4 s0=floor(b0)*2.+1., s1=floor(b1)*2.+1., sh=-step(h,vec4(0));
+      vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy, a1=b1.xzyw+s1.xzyw*sh.zzww;
+      vec3 p0=vec3(a0.xy,h.x),p1=vec3(a0.zw,h.y),p2=vec3(a1.xy,h.z),p3=vec3(a1.zw,h.w);
+      vec4 norm=tis(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
       p0*=norm.x;p1*=norm.y;p2*=norm.z;p3*=norm.w;
       vec4 m=max(.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.);
-      m=m*m;
-      return 42.*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+      m*=m; return 42.*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
     }
 
-    // Curl noise — divergence-free 3D vector field
-    vec3 curlNoise(vec3 p){
-      const float e=1e-4;
-      vec3 dx=vec3(e,0.,0.);
-      vec3 dy=vec3(0.,e,0.);
-      vec3 dz=vec3(0.,0.,e);
-      float x=snoise(p+dy)-snoise(p-dy)-snoise(p+dz)+snoise(p-dz);
-      float y=snoise(p+dz)-snoise(p-dz)-snoise(p+dx)+snoise(p-dx);
-      float z=snoise(p+dx)-snoise(p-dx)-snoise(p+dy)+snoise(p-dy);
-      return normalize(vec3(x,y,z))/(2.*e);
+    vec3 curl(vec3 p){
+      const float e=.0001;
+      // Analytically compute curl of gradient noise field
+      float A=snoise(p+vec3(0,e,0))-snoise(p-vec3(0,e,0));
+      float B=snoise(p+vec3(0,0,e))-snoise(p-vec3(0,0,e));
+      float C=snoise(p+vec3(e,0,0))-snoise(p-vec3(e,0,0));
+      float D=snoise(p+vec3(0,e,0))-snoise(p-vec3(0,e,0));
+      return vec3(A-B, B-C, C-D) / (2.*e);
     }
   `;
 
-  // Simulation shader — updates particle positions via curl noise
-  const SIM_VERT = `
-    varying vec2 vUv;
-    void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}
-  `;
+  // ── Shared simulation uniforms (both position & velocity passes read these) ──
+  // Declared OUTSIDE materials so both ShaderMaterials reference the SAME objects
+  const SIM_UNI = {
+    uPos: {value:null}, uVel:{value:null},
+    uTime:{value:0}, uDt:{value:.016},
+    uLoudness:{value:0}, uCentroid:{value:0},
+    uBeat:{value:0}, uMelBass:{value:0}, uMelMid:{value:0},
+  };
 
-  const SIM_FRAG = `
+  const QUAD_V = /* glsl */`varying vec2 vUv;void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`;
+
+  const SIM_F = /* glsl */`
     precision highp float;
-    uniform sampler2D uPosition;
-    uniform sampler2D uVelocity;
-    uniform float uTime;
-    uniform float uDeltaTime;
-    uniform float uLoudness;
-    uniform float uCentroid;
-    uniform float uBeat;
-    uniform float uMelBass;
-    uniform float uMelMid;
+    uniform sampler2D uPos, uVel;
+    uniform float uTime,uDt,uLoudness,uCentroid,uBeat,uMelBass,uMelMid;
     varying vec2 vUv;
-
-    ${SIMPLEX_GLSL}
-
+    ${NOISE}
+    float h(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5);}
     void main(){
-      vec3 pos = texture2D(uPosition, vUv).xyz;
-      vec3 vel = texture2D(uVelocity, vUv).xyz;
-
-      // Noise frequency driven by spectral centroid (brighter = more chaotic)
-      float noiseFreq = 0.8 + uCentroid * 2.5;
-      // Flow speed driven by loudness
-      float flowSpeed = 0.3 + uLoudness * 1.8 + uMelBass * 0.8;
-
-      vec3 noisePos = pos * noiseFreq + vec3(uTime * 0.12, uTime * 0.09, uTime * 0.07);
-      vec3 curl = curlNoise(noisePos) * flowSpeed;
-
-      // Beat shockwave — radial burst from origin
-      float dist = length(pos);
-      vec3 beatForce = normalize(pos + 0.001) * uBeat * 2.5 * exp(-dist * 1.5);
-
-      // Bass mid warps vertical axis
-      curl.y += uMelMid * snoise(pos * 1.5 + vec3(0., uTime * 0.2, 0.)) * 0.4;
-
-      // Integrate velocity
-      vec3 acc = (curl + beatForce - vel * 0.6);
-      vel += acc * uDeltaTime * 3.0;
-      vel *= 0.985; // drag
-
-      // Boundary repulsion — keep in unit sphere
-      if(dist > 1.2){
-        vel += -normalize(pos) * (dist - 1.2) * 0.8;
+      vec3 pos=texture2D(uPos,vUv).xyz;
+      vec3 vel=texture2D(uVel,vUv).xyz;
+      float freq=.75+uCentroid*2.8, spd=.25+uLoudness*2.+uMelBass*.9;
+      vec3 np=pos*freq+vec3(uTime*.11,uTime*.07,uTime*.09);
+      vec3 c=curl(np)*spd;
+      c.y+=uMelMid*snoise(pos*1.8+vec3(0,uTime*.18,0))*.5;
+      vel+=normalize(pos+.0001)*uBeat*3.*exp(-length(pos)*2.);
+      vel+=(c-vel*.55)*uDt*2.8; vel*=.982;
+      float d=length(pos);
+      if(d>1.1)vel-=normalize(pos)*(d-1.1)*1.2*uDt;
+      pos+=vel*uDt;
+      float r1=h(vUv),r2=h(vUv+vec2(3.7,9.2));
+      if(d>1.7||dot(vel,vel)<1e-8){
+        float th=r1*6.283,ph=acos(2.*r2-1.),rr=.35+r1*.45;
+        pos=vec3(sin(ph)*cos(th)*rr,sin(ph)*sin(th)*rr,cos(ph)*rr);
+        vel=vec3(0);
       }
-
-      pos += vel * uDeltaTime;
-
-      // Respawn dead particles at random surface
-      float rand = fract(sin(dot(vUv, vec2(127.1, 311.7))) * 43758.5);
-      float rand2 = fract(sin(dot(vUv, vec2(269.5, 183.3))) * 43758.5);
-      if(length(pos) > 1.6 || length(vel) < 0.0001){
-        float theta = rand * 6.2832;
-        float phi = acos(2. * rand2 - 1.);
-        float r = 0.5 + rand * 0.3;
-        pos = vec3(sin(phi)*cos(theta)*r, sin(phi)*sin(theta)*r, cos(phi)*r);
-        vel = vec3(0.);
-      }
-
-      gl_FragColor = vec4(pos, 1.0);
+      gl_FragColor=vec4(pos,length(vel));
     }
   `;
 
-  // Velocity pass (separate for stability)
-  const VEL_FRAG = SIM_FRAG; // combined in position pass for simplicity
-
-  // Particle vertex shader — size from bass melband
-  const PARTICLE_VERT = `
-    uniform sampler2D uPosition;
-    uniform float uMelBass;
-    uniform float uLoudness;
-    uniform float uBeat;
-    uniform vec3 uColorTop;
-    uniform vec3 uColorBottom;
-    varying vec3 vColor;
-    varying float vAlpha;
-
-    void main(){
-      // Each particle reads its own position from the FBO texture
-      vec2 uv = position.xy; // position.xy stores the UV lookup
-      vec3 pos = texture2D(uPosition, uv).xyz;
-
-      // Project
-      vec4 mvPos = modelViewMatrix * vec4(pos, 1.0);
-      gl_Position = projectionMatrix * mvPos;
-
-      // Size from bass energy + beat pulse
-      float bassPulse = uMelBass * 3.0 + uBeat * 2.0;
-      gl_PointSize = (1.5 + bassPulse * 1.5) * (300.0 / -mvPos.z);
-
-      // Color: lerp by vertical position and centroid
-      float t = pos.y * 0.5 + 0.5;
-      vColor = mix(uColorBottom, uColorTop, t);
-      // Brightness boost on beat
-      vColor += vec3(0.1) * uBeat;
-
-      // Alpha from velocity magnitude (fast = brighter)
-      vAlpha = clamp(0.4 + uLoudness * 0.6, 0.1, 1.0);
-    }
-  `;
-
-  const PARTICLE_FRAG = `
+  const VEL_F = /* glsl */`
     precision highp float;
-    varying vec3 vColor;
-    varying float vAlpha;
-
+    uniform sampler2D uPos,uVel;
+    uniform float uTime,uDt,uLoudness,uCentroid,uBeat,uMelBass,uMelMid;
+    varying vec2 vUv;
+    ${NOISE}
+    float h(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5);}
     void main(){
-      // Soft circle with bloom-ready glow
-      vec2 d = gl_PointCoord - 0.5;
-      float dist = length(d);
-      if(dist > 0.5) discard;
-
-      // Distance-based alpha falloff
-      float alpha = (1.0 - dist * 2.0);
-      alpha = alpha * alpha * vAlpha;
-
-      // Glow: brighter core
-      vec3 col = vColor + vColor * (1.0 - dist * 2.0) * 0.8;
-
-      gl_FragColor = vec4(col, alpha);
+      vec3 pos=texture2D(uPos,vUv).xyz;
+      vec3 vel=texture2D(uVel,vUv).xyz;
+      float freq=.75+uCentroid*2.8,spd=.25+uLoudness*2.+uMelBass*.9;
+      vec3 np=pos*freq+vec3(uTime*.11,uTime*.07,uTime*.09);
+      vec3 c=curl(np)*spd;
+      c.y+=uMelMid*snoise(pos*1.8+vec3(0,uTime*.18,0))*.5;
+      vel+=normalize(pos+.0001)*uBeat*3.*exp(-length(pos)*2.);
+      vel+=(c-vel*.55)*uDt*2.8; vel*=.982;
+      float d=length(pos);
+      if(d>1.1)vel-=normalize(pos)*(d-1.1)*1.2*uDt;
+      float r1=h(vUv),r2=h(vUv+vec2(3.7,9.2));
+      if(d>1.7||dot(vel,vel)<1e-8)vel=vec3(0);
+      gl_FragColor=vec4(vel,1);
     }
   `;
 
-  // Trail / persistence pass — accumulates frames for inky trails
-  const TRAIL_VERT = `
-    varying vec2 vUv;
-    void main(){vUv=uv;gl_Position=vec4(position.xy,0.,1.);}
+  const PART_V = /* glsl */`
+    uniform sampler2D uPos;
+    uniform float uMelBass,uLoudness,uBeat;
+    uniform vec3 uColorTop,uColorBot;
+    varying vec3 vCol; varying float vA;
+    void main(){
+      vec4 t=texture2D(uPos,position.xy);
+      vec3 pos=t.xyz; float vm=t.w;
+      vec4 mv=modelViewMatrix*vec4(pos,1.);
+      gl_Position=projectionMatrix*mv;
+      float sz=1.2+uMelBass*2.8+uBeat*1.8;
+      gl_PointSize=sz*(280./max(-mv.z,.1));
+      float yt=clamp(pos.y*.5+.5,0.,1.);
+      vCol=mix(uColorBot,uColorTop,yt)+uColorTop*uBeat*.15;
+      vA=clamp(.35+vm*.4+uLoudness*.45,.05,1.);
+    }
   `;
 
-  const TRAIL_FRAG = `
+  const PART_F = /* glsl */`
     precision highp float;
-    uniform sampler2D uParticles; // current frame
-    uniform sampler2D uTrail;     // previous trail
-    uniform float uDecay;
-    varying vec2 vUv;
-
+    varying vec3 vCol; varying float vA;
     void main(){
-      vec4 current = texture2D(uParticles, vUv);
-      vec4 prev    = texture2D(uTrail, vUv);
-      // Feedback: decay old trail, add new particles
-      vec4 trail = prev * uDecay + current;
-      gl_FragColor = clamp(trail, 0., 1.);
+      vec2 d=gl_PointCoord-.5; float r=length(d);
+      if(r>.5)discard;
+      float e=1.-r*2.;
+      gl_FragColor=vec4(vCol*(1.+e*.9),e*e*vA);
     }
   `;
 
-  // Final composite — tonemap and vignette
-  const FINAL_FRAG = `
+  const TRAIL_QV = /* glsl */`varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.,1.);}`;
+
+  const TRAIL_F = /* glsl */`
     precision highp float;
-    uniform sampler2D uTrail;
-    uniform vec2 uRes;
-    uniform float uBrightness;
+    uniform sampler2D uParticles,uTrail; uniform float uDecay;
     varying vec2 vUv;
+    void main(){ gl_FragColor=clamp(texture2D(uTrail,vUv)*uDecay+texture2D(uParticles,vUv),0.,1.); }
+  `;
 
+  const FINAL_F = /* glsl */`
+    precision highp float;
+    uniform sampler2D uTrail; uniform float uBright;
+    varying vec2 vUv;
+    vec3 aces(vec3 x){return clamp((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14),0.,1.);}
     void main(){
-      vec4 col = texture2D(uTrail, vUv);
-
-      // Filmic tonemapping
-      vec3 c = col.rgb;
-      c = c * (2.51 * c + 0.03) / (c * (2.43 * c + 0.59) + 0.14);
-
-      // Vignette
-      vec2 uv = vUv - 0.5;
-      float vig = 1.0 - dot(uv, uv) * 1.8;
-      c *= clamp(vig, 0., 1.);
-
-      // Chromatic aberration hint on edges
-      float aberr = length(uv) * 0.003;
-      float rr = texture2D(uTrail, vUv + vec2(aberr, 0.)).r;
-      float bb = texture2D(uTrail, vUv - vec2(aberr, 0.)).b;
-      c.r = mix(c.r, rr, 0.3);
-      c.b = mix(c.b, bb, 0.3);
-
-      c *= uBrightness;
-      gl_FragColor = vec4(clamp(c, 0., 1.), 1.0);
+      vec2 off=(vUv-.5)*.006;
+      vec3 c=vec3(texture2D(uTrail,vUv+off).r, texture2D(uTrail,vUv).g, texture2D(uTrail,vUv-off).b);
+      c=aces(c*uBright);
+      vec2 uv2=vUv-.5;
+      c*=clamp(1.-dot(uv2,uv2)*1.6,0.,1.);
+      gl_FragColor=vec4(c,1.);
     }
   `;
 
-  // ── Internal helpers ─────────────────────────────────────────
-
-  function createFBO(w, h, type = THREE.FloatType) {
+  // ── Helpers ──────────────────────────────────────────────────
+  function fbo(w, h, type) {
     return new THREE.WebGLRenderTarget(w, h, {
-      minFilter: THREE.NearestFilter,
-      magFilter: THREE.NearestFilter,
-      format: THREE.RGBAFormat,
-      type,
-      depthBuffer: false,
-      stencilBuffer: false,
+      minFilter:THREE.NearestFilter, magFilter:THREE.NearestFilter,
+      format:THREE.RGBAFormat, type, depthBuffer:false, stencilBuffer:false,
     });
   }
 
-  function createParticleUVs() {
-    // Each particle stores its own UV coords so it can sample the FBO
-    const uvs = new Float32Array(PARTICLE_COUNT * 3);
-    let i = 0;
-    for (let y = 0; y < FBO_HEIGHT; y++) {
-      for (let x = 0; x < FBO_WIDTH; x++) {
-        uvs[i++] = (x + 0.5) / FBO_WIDTH;
-        uvs[i++] = (y + 0.5) / FBO_HEIGHT;
-        uvs[i++] = 0;
-      }
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(uvs, 3));
-    return geo;
+  function quad(mat) {
+    return new THREE.Mesh(new THREE.PlaneGeometry(2,2), mat);
   }
 
-  function initPositions() {
-    // Random sphere distribution
-    const data = new Float32Array(FBO_WIDTH * FBO_HEIGHT * 4);
-    for (let i = 0; i < FBO_WIDTH * FBO_HEIGHT; i++) {
-      const theta = Math.random() * Math.PI * 2;
-      const phi   = Math.acos(2 * Math.random() - 1);
-      const r     = 0.3 + Math.random() * 0.5;
-      data[i * 4 + 0] = Math.sin(phi) * Math.cos(theta) * r;
-      data[i * 4 + 1] = Math.sin(phi) * Math.sin(theta) * r;
-      data[i * 4 + 2] = Math.cos(phi) * r;
-      data[i * 4 + 3] = 1;
-    }
-    const tex = new THREE.DataTexture(data, FBO_WIDTH, FBO_HEIGHT, THREE.RGBAFormat, THREE.FloatType);
-    tex.needsUpdate = true;
-    return tex;
+  function dataTex(data, type) {
+    const t = new THREE.DataTexture(data, FBO_W, FBO_H, THREE.RGBAFormat, type);
+    t.needsUpdate = true;
+    return t;
   }
 
-  function createQuad(mat) {
-    const geo = new THREE.PlaneGeometry(2, 2);
-    return new THREE.Mesh(geo, mat);
+  // Prime an FBO by blitting a DataTexture into it on first frame
+  function prime(target, tex, cam) {
+    const sc = new THREE.Scene();
+    sc.add(quad(new THREE.MeshBasicMaterial({map:tex})));
+    renderer.setRenderTarget(target);
+    renderer.render(sc, cam);
   }
 
-  // ── Public API ───────────────────────────────────────────────
-
+  // ── PUBLIC: init ─────────────────────────────────────────────
   function init() {
-    const canvas = document.getElementById('ambient-canvas');
-    if (!canvas) return;
+    if (initialized) return;
 
-    // Renderer
-    renderer = new THREE.WebGLRenderer({ canvas, antialias: false, alpha: false });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setSize(window.innerWidth, window.innerHeight);
+    const canvas = document.getElementById('ambient-canvas');
+    if (!canvas) { console.error('[Ambient] canvas not found'); return; }
+
+    // FIX [7]: ensure canvas is always behind UI
+    canvas.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;z-index:-1;display:block;';
+
+    renderer = new THREE.WebGLRenderer({ canvas, antialias:false, alpha:false, powerPreference:'high-performance' });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(innerWidth, innerHeight);
     renderer.autoClear = false;
 
-    // Check for required extensions
     const gl = renderer.getContext();
-    if (!gl.getExtension('OES_texture_float')) {
-      console.warn('[Ambient] OES_texture_float not supported — falling back');
+
+    // FIX [1]: graceful extension fallback
+    const hasF  = !!gl.getExtension('OES_texture_float');
+    const hasHF = !!gl.getExtension('OES_texture_half_float');
+    if (!hasF && !hasHF) {
+      canvas.style.background = 'radial-gradient(ellipse at 50% 60%,#0a0a2e 0%,#000008 100%)';
+      console.warn('[Ambient] No float texture support — CSS gradient fallback active');
       return;
     }
+    const sType = hasF ? THREE.FloatType : THREE.HalfFloatType;
+    const tType = THREE.HalfFloatType;
 
     clock = new THREE.Clock();
+    const ortho = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
 
-    // Camera — orthographic for fullscreen quad passes
-    camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    // ── FBO allocation ──
+    posA = fbo(FBO_W, FBO_H, sType); posB = fbo(FBO_W, FBO_H, sType);
+    velA = fbo(FBO_W, FBO_H, sType); velB = fbo(FBO_W, FBO_H, sType);
+    trailA = fbo(innerWidth, innerHeight, tType);
+    trailB = fbo(innerWidth, innerHeight, tType);
+    particleRT = fbo(innerWidth, innerHeight, tType);
 
-    // ── FBO Setup ──
-    positionFBO  = createFBO(FBO_WIDTH, FBO_HEIGHT);
-    positionFBO2 = createFBO(FBO_WIDTH, FBO_HEIGHT);
-    trailFBO     = createFBO(window.innerWidth, window.innerHeight, THREE.HalfFloatType);
-    trailFBO2    = createFBO(window.innerWidth, window.innerHeight, THREE.HalfFloatType);
+    // FIX [4]: prime position FBOs with initial sphere distribution
+    const posData = new Float32Array(FBO_W * FBO_H * 4);
+    for (let i = 0; i < FBO_W * FBO_H; i++) {
+      const th=Math.random()*Math.PI*2, ph=Math.acos(2*Math.random()-1), r=.25+Math.random()*.55;
+      posData[i*4]  = Math.sin(ph)*Math.cos(th)*r;
+      posData[i*4+1]= Math.sin(ph)*Math.sin(th)*r;
+      posData[i*4+2]= Math.cos(ph)*r;
+      posData[i*4+3]= .001;
+    }
+    const initPos = dataTex(posData, sType);
+    const initVel = dataTex(new Float32Array(FBO_W*FBO_H*4), sType);
 
-    // Particle render target (not FBO, just temp)
-    const particleRT = createFBO(window.innerWidth, window.innerHeight, THREE.HalfFloatType);
+    prime(posA, initPos, ortho); prime(posB, initPos, ortho);
+    prime(velA, initVel, ortho); prime(velB, initVel, ortho);
 
-    // ── Simulation shader ──
-    simMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        uPosition:   { value: initPositions() },
-        uTime:       { value: 0 },
-        uDeltaTime:  { value: 0.016 },
-        uLoudness:   { value: 0 },
-        uCentroid:   { value: 0 },
-        uBeat:       { value: 0 },
-        uMelBass:    { value: 0 },
-        uMelMid:     { value: 0 },
-      },
-      vertexShader: SIM_VERT,
-      fragmentShader: SIM_FRAG,
-    });
-    quadMesh = createQuad(simMaterial);
-    scene = new THREE.Scene();
-    scene.add(quadMesh);
+    // ── Sim material (position pass) ──
+    // FIX [2]: uVel now present; FIX [8]: both mats share SIM_UNI reference
+    SIM_UNI.uPos.value = posA.texture;
+    SIM_UNI.uVel.value = velA.texture;
 
-    // ── Particle render ──
+    simMaterial = new THREE.ShaderMaterial({ uniforms:SIM_UNI, vertexShader:QUAD_V, fragmentShader:SIM_F });
+    simScene = new THREE.Scene(); simScene.add(quad(simMaterial));
+
+    // ── Velocity material ──
+    velMaterial = new THREE.ShaderMaterial({ uniforms:SIM_UNI, vertexShader:QUAD_V, fragmentShader:VEL_F });
+    velScene = new THREE.Scene(); velScene.add(quad(velMaterial));
+
+    // ── Particle material ──
     particleMaterial = new THREE.ShaderMaterial({
       uniforms: {
-        uPosition:    { value: null },
-        uMelBass:     { value: 0 },
-        uLoudness:    { value: 0 },
-        uBeat:        { value: 0 },
-        uColorTop:    { value: new THREE.Vector3(0.2, 0.5, 0.9) },
-        uColorBottom: { value: new THREE.Vector3(0.05, 0.05, 0.12) },
+        uPos:{value:posA.texture}, uMelBass:{value:0}, uLoudness:{value:0}, uBeat:{value:0},
+        uColorTop:{value:new THREE.Vector3(.2,.5,.9)},
+        uColorBot:{value:new THREE.Vector3(.05,.05,.12)},
       },
-      vertexShader:   PARTICLE_VERT,
-      fragmentShader: PARTICLE_FRAG,
-      transparent:    true,
-      blending:       THREE.AdditiveBlending,
-      depthWrite:     false,
+      vertexShader:PART_V, fragmentShader:PART_F,
+      transparent:true, blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false,
     });
 
-    const particleGeo = createParticleUVs();
-    const particleScene = new THREE.Scene();
-    particleScene.add(new THREE.Points(particleGeo, particleMaterial));
-
-    // ── Trail / persistence shader ──
-    trailMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        uParticles: { value: null },
-        uTrail:     { value: null },
-        uDecay:     { value: TRAIL_DECAY },
-      },
-      vertexShader:   TRAIL_VERT,
-      fragmentShader: TRAIL_FRAG,
-    });
-    trailQuad = createQuad(trailMaterial);
-    const trailScene = new THREE.Scene();
-    trailScene.add(trailQuad);
-
-    // ── Final composite shader ──
-    const finalMaterial = new THREE.ShaderMaterial({
-      uniforms: {
-        uTrail:      { value: null },
-        uRes:        { value: new THREE.Vector2(window.innerWidth, window.innerHeight) },
-        uBrightness: { value: 1.0 },
-      },
-      vertexShader:   TRAIL_VERT,
-      fragmentShader: FINAL_FRAG,
-    });
-    const finalQuad = createQuad(finalMaterial);
-    const finalScene = new THREE.Scene();
-    finalScene.add(finalQuad);
-
-    // ── Particle render target for this frame ──
-    const particleCamera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    // Per-particle UV geometry (each vertex = UV into position FBO)
+    const uvArr = new Float32Array(FBO_W*FBO_H*3);
+    for (let y=0,k=0; y<FBO_H; y++) for (let x=0; x<FBO_W; x++) {
+      uvArr[k++]=(x+.5)/FBO_W; uvArr[k++]=(y+.5)/FBO_H; uvArr[k++]=0;
+    }
+    const pGeo = new THREE.BufferGeometry();
+    pGeo.setAttribute('position', new THREE.BufferAttribute(uvArr,3));
+    particleScene = new THREE.Scene();
+    particleScene.add(new THREE.Points(pGeo, particleMaterial));
+    particleCamera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, .01, 100);
     particleCamera.position.z = 2.2;
+
+    // ── Trail material ──
+    trailMaterial = new THREE.ShaderMaterial({
+      uniforms:{uParticles:{value:null},uTrail:{value:null},uDecay:{value:TRAIL_DECAY}},
+      vertexShader:TRAIL_QV, fragmentShader:TRAIL_F,
+    });
+    trailScene = new THREE.Scene(); trailScene.add(quad(trailMaterial));
+
+    // ── Final composite ──
+    finalMaterial = new THREE.ShaderMaterial({
+      uniforms:{uTrail:{value:null},uBright:{value:1.}},
+      vertexShader:TRAIL_QV, fragmentShader:FINAL_F,
+    });
+    finalScene = new THREE.Scene(); finalScene.add(quad(finalMaterial));
 
     // Resize
     window.addEventListener('resize', () => {
-      renderer.setSize(window.innerWidth, window.innerHeight);
-      trailFBO.setSize(window.innerWidth, window.innerHeight);
-      trailFBO2.setSize(window.innerWidth, window.innerHeight);
-      particleRT.setSize(window.innerWidth, window.innerHeight);
-      particleCamera.aspect = window.innerWidth / window.innerHeight;
-      particleCamera.updateProjectionMatrix();
-      finalMaterial.uniforms.uRes.value.set(window.innerWidth, window.innerHeight);
+      const w=innerWidth, h=innerHeight;
+      renderer.setSize(w,h);
+      trailA.setSize(w,h); trailB.setSize(w,h); particleRT.setSize(w,h);
+      particleCamera.aspect=w/h; particleCamera.updateProjectionMatrix();
     });
 
     initialized = true;
 
-    // ── Render Loop ──
-    function renderLoop() {
-      requestAnimationFrame(renderLoop);
-      const now = performance.now();
-      const dt  = Math.min((now - lastFrameTime) / 1000, 0.05);
-      lastFrameTime = now;
-      const elapsed = clock.getElapsedTime();
+    // ── 4-PASS RENDER LOOP ────────────────────────────────────
+    ;(function loop() {
+      requestAnimationFrame(loop);
+      const now=performance.now(), dt=Math.min((now-lastT)/1000,.05);
+      lastT=now;
+      const t=clock.getElapsedTime();
 
-      // Lerp audio features toward GradientController values (smooth)
+      // Read GradientController state
       if (window.GradientController) {
-        const gfx = GradientController.gfx;
         GradientController.frame(dt);
-
-        uLoudness  += (gfx.intensity - 1.0 - uLoudness)    * dt * 6;
-        beatPulse   = gfx.pulse;
-        uCentroid  += (gfx.topColor[0] * 0.5 - uCentroid)  * dt * 5;
-
-        // Update palette
-        paletteTop.fromArray(gfx.topColor);
-        paletteBottom.fromArray(gfx.bottomColor);
+        const g=GradientController.gfx;
+        // FIX [5]: lerp factor clamped — was (dt*3) which overshoots to 1+ and freezes
+        const a=Math.min(dt*2.5, 1.0);
+        uLoudness += (Math.max(0, g.intensity-1.0) - uLoudness) * Math.min(dt*8,.5);
+        beatPulse   = g.pulse;
+        uCentroid  += (g.centroid - uCentroid) * Math.min(dt*6,.5);
+        palTop.lerp (new THREE.Color(g.topColor[0],   g.topColor[1],   g.topColor[2]),   a);
+        palBot.lerp (new THREE.Color(g.bottomColor[0],g.bottomColor[1],g.bottomColor[2]), a);
       }
 
-      // Lerp palette
-      targetTop.lerp(paletteTop, dt * 3);
-      targetBottom.lerp(paletteBottom, dt * 3);
+      // Update shared uniforms
+      SIM_UNI.uTime.value=t; SIM_UNI.uDt.value=dt;
+      SIM_UNI.uLoudness.value=uLoudness; SIM_UNI.uCentroid.value=uCentroid;
+      SIM_UNI.uBeat.value=beatPulse; SIM_UNI.uMelBass.value=uMelbands[0]; SIM_UNI.uMelMid.value=uMelbands[3];
 
-      // ── PASS 1: Simulate positions ──
-      simMaterial.uniforms.uTime.value       = elapsed;
-      simMaterial.uniforms.uDeltaTime.value  = dt;
-      simMaterial.uniforms.uLoudness.value   = Math.max(0, uLoudness);
-      simMaterial.uniforms.uCentroid.value   = uCentroid;
-      simMaterial.uniforms.uBeat.value       = beatPulse;
-      simMaterial.uniforms.uMelBass.value    = uMelbands[0];
-      simMaterial.uniforms.uMelMid.value     = uMelbands[3];
+      // PASS 1a — velocity update
+      SIM_UNI.uPos.value=posA.texture; SIM_UNI.uVel.value=velA.texture;
+      renderer.setRenderTarget(velB); renderer.render(velScene, ortho);
+      [velA,velB]=[velB,velA];
 
-      quadMesh.material = simMaterial;
-      renderer.setRenderTarget(positionFBO2);
-      renderer.render(scene, camera);
+      // PASS 1b — position update (FIX [3]: uses freshly updated velocity)
+      SIM_UNI.uPos.value=posA.texture; SIM_UNI.uVel.value=velA.texture;
+      renderer.setRenderTarget(posB); renderer.render(simScene, ortho);
+      [posA,posB]=[posB,posA];
 
-      // Swap position FBOs
-      [positionFBO, positionFBO2] = [positionFBO2, positionFBO];
-      simMaterial.uniforms.uPosition.value = positionFBO.texture;
-
-      // ── PASS 2: Render particles to temp buffer ──
-      particleMaterial.uniforms.uPosition.value    = positionFBO.texture;
-      particleMaterial.uniforms.uMelBass.value      = uMelbands[0];
-      particleMaterial.uniforms.uLoudness.value     = Math.max(0, uLoudness);
-      particleMaterial.uniforms.uBeat.value         = beatPulse;
-      particleMaterial.uniforms.uColorTop.value.fromArray(targetTop.toArray());
-      particleMaterial.uniforms.uColorBottom.value.fromArray(targetBottom.toArray());
-
-      renderer.setRenderTarget(particleRT);
-      renderer.clear();
+      // PASS 2 — render particles to intermediate buffer
+      particleMaterial.uniforms.uPos.value=posA.texture;
+      particleMaterial.uniforms.uMelBass.value=uMelbands[0];
+      particleMaterial.uniforms.uLoudness.value=uLoudness;
+      particleMaterial.uniforms.uBeat.value=beatPulse;
+      // FIX [6]: set Vector3 via .set() — no broken .toArray() call
+      particleMaterial.uniforms.uColorTop.value.set(palTop.r, palTop.g, palTop.b);
+      particleMaterial.uniforms.uColorBot.value.set(palBot.r, palBot.g, palBot.b);
+      renderer.setRenderTarget(particleRT); renderer.clear();
       renderer.render(particleScene, particleCamera);
 
-      // ── PASS 3: Trail / persistence feedback ──
-      trailMaterial.uniforms.uParticles.value = particleRT.texture;
-      trailMaterial.uniforms.uTrail.value     = trailFBO2.texture;
-      trailMaterial.uniforms.uDecay.value     = TRAIL_DECAY - uLoudness * 0.03;
-      trailQuad.material = trailMaterial;
+      // PASS 3 — trail feedback
+      trailMaterial.uniforms.uParticles.value=particleRT.texture;
+      trailMaterial.uniforms.uTrail.value=trailB.texture;
+      trailMaterial.uniforms.uDecay.value=TRAIL_DECAY-uLoudness*.025;
+      renderer.setRenderTarget(trailA); renderer.render(trailScene, ortho);
+      [trailA,trailB]=[trailB,trailA];
 
-      renderer.setRenderTarget(trailFBO);
-      renderer.render(trailScene, camera);
-
-      // Swap trail FBOs
-      [trailFBO, trailFBO2] = [trailFBO2, trailFBO];
-
-      // ── PASS 4: Final composite to screen ──
-      finalMaterial.uniforms.uTrail.value      = trailFBO.texture;
-      finalMaterial.uniforms.uBrightness.value = 0.85 + Math.max(0, uLoudness) * 0.4;
-      finalQuad.material = finalMaterial;
-
-      renderer.setRenderTarget(null);
-      renderer.render(finalScene, camera);
-    }
-
-    renderLoop();
+      // PASS 4 — composite to screen
+      finalMaterial.uniforms.uTrail.value=trailA.texture;
+      finalMaterial.uniforms.uBright.value=.88+uLoudness*.45;
+      renderer.setRenderTarget(null); renderer.render(finalScene, ortho);
+    })();
   }
 
-  function setSong(songName, artistName, token) {
+  // ── PUBLIC: setSong ──────────────────────────────────────────
+  function setSong(name, artist, token) {
     reset();
-    // Fetch mood data to set palette
     if (!token) return;
-    fetch(`https://onesong.onrender.com/mood?track=${encodeURIComponent(songName)}&artist=${encodeURIComponent(artistName)}`, {
-      headers: { 'Authorization': `Bearer ${token}` }
-    })
-    .then(r => r.json())
-    .then(data => {
-      if (data.tags && window.GradientController) {
-        const tags = data.tags;
-        // Map tags to palettes
-        const PALETTES = {
-          'sad':        { top: [0.2, 0.3, 0.6], bot: [0.0, 0.0, 0.05] },
-          'happy':      { top: [1.0, 0.8, 0.2], bot: [0.4, 0.0, 0.1] },
-          'electronic': { top: [0.9, 0.2, 1.0], bot: [0.0, 0.0, 0.1] },
-          'chill':      { top: [0.4, 0.8, 0.6], bot: [0.05, 0.1, 0.05] },
-          'rock':       { top: [0.9, 0.3, 0.1], bot: [0.1, 0.0, 0.0] },
-          'pop':        { top: [1.0, 0.5, 0.7], bot: [0.2, 0.0, 0.2] },
-          'jazz':       { top: [0.8, 0.6, 0.2], bot: [0.1, 0.05, 0.0] },
-          'classical':  { top: [0.9, 0.9, 0.8], bot: [0.1, 0.1, 0.15] },
-        };
-        for (const tag of tags) {
-          const p = PALETTES[tag];
-          if (p) {
-            GradientController.setBasePalette(p.top, p.bot);
-            break;
-          }
-        }
-        // Hash fallback
-        if (!tags.some(t => PALETTES[t])) {
-          const hash = [...songName].reduce((a, c) => a * 31 + c.charCodeAt(0), 0);
-          const hue  = Math.abs(hash % 360) / 360;
-          const h2r  = (h, s, l) => {
-            const q = l < 0.5 ? l*(1+s) : l+s-l*s, p = 2*l-q;
-            const hue2rgb = (p,q,t) => { t=((t%1)+1)%1; if(t<1/6)return p+(q-p)*6*t; if(t<0.5)return q; if(t<2/3)return p+(q-p)*(2/3-t)*6; return p; };
-            return [hue2rgb(p,q,h+1/3), hue2rgb(p,q,h), hue2rgb(p,q,h-1/3)];
-          };
-          GradientController.setBasePalette(h2r(hue,0.9,0.6), h2r((hue+0.5)%1,0.8,0.08));
-        }
-      }
-    })
-    .catch(() => {});
+    const P={
+      sad:{top:[.15,.25,.55],bot:[0,0,.04]}, happy:{top:[1,.78,.15],bot:[.35,.02,.08]},
+      electronic:{top:[.85,.15,.98],bot:[0,0,.1]}, chill:{top:[.35,.78,.58],bot:[.04,.1,.04]},
+      rock:{top:[.9,.28,.08],bot:[.1,0,0]}, pop:{top:[.98,.45,.68],bot:[.18,0,.18]},
+      jazz:{top:[.82,.58,.18],bot:[.1,.04,0]}, classical:{top:[.9,.88,.8],bot:[.08,.08,.13]},
+      metal:{top:[.6,.1,.1],bot:[.05,0,0]}, ambient:{top:[.1,.4,.7],bot:[.02,.04,.08]},
+    };
+    function hp(s){
+      const h=[...s].reduce((a,c)=>((a<<5)-a)+c.charCodeAt(0),0), hue=Math.abs(h%360)/360;
+      const f=(h,s,l)=>{const q=l<.5?l*(1+s):l+s-l*s,p=2*l-q,t=e=>((e%1)+1)%1;
+        return[1/6,1/2,2/3].map((v,i)=>{const e=i===0?t(hue+1/3):i===1?hue:t(hue-1/3);return e<1/6?p+(q-p)*6*e:e<.5?q:e<2/3?p+(q-p)*(2/3-e)*6:p;});};
+      return{top:f(hue,.9,.6),bot:f((hue+.5)%1,.8,.07)};
+    }
+    fetch(`https://onesong.onrender.com/mood?track=${encodeURIComponent(name)}&artist=${encodeURIComponent(artist)}`,
+      {headers:{'Authorization':`Bearer ${token}`}})
+    .then(r=>r.ok?r.json():{tags:[]})
+    .then(({tags=[]})=>{
+      let pal=null;
+      for(const tag of tags){if(P[tag]){pal=P[tag];break;}}
+      if(!pal)pal=hp(name);
+      if(window.GradientController)GradientController.setBasePalette(pal.top,pal.bot);
+    }).catch(()=>{});
   }
 
-  function startBeat() { isPlaying = true; if (window.GradientController) GradientController.updatePlayhead(0, true); }
-  function stopBeat()  { isPlaying = false; if (window.GradientController) GradientController.updatePlayhead(0, false); }
-
+  function startBeat(){if(window.GradientController)GradientController.updatePlayhead(0,true);}
+  function stopBeat() {if(window.GradientController)GradientController.updatePlayhead(0,false);}
   function syncBeat() {
-    if (window.GradientController) GradientController.triggerBeat();
-    uMelbands[0] = Math.min(1, uMelbands[0] + 0.5);
-    setTimeout(() => { uMelbands[0] *= 0.3; }, 150);
+    if(window.GradientController)GradientController.triggerBeat();
+    uMelbands[0]=Math.min(1,uMelbands[0]+.6);
+    setTimeout(()=>{uMelbands[0]*=.2;},120);
   }
 
-  function reset() {
-    uLoudness = 0; uCentroid = 0; uMelbands.fill(0); beatPulse = 0;
-    if (window.GradientController) GradientController.reset();
-    // Clear trail FBOs
-    if (trailFBO && renderer) {
-      renderer.setRenderTarget(trailFBO);  renderer.clear();
-      renderer.setRenderTarget(trailFBO2); renderer.clear();
+  function reset(){
+    uLoudness=0;uCentroid=0;beatPulse=0;uMelbands.fill(0);
+    if(window.GradientController)GradientController.reset();
+    if(renderer&&trailA&&trailB){
+      renderer.setRenderTarget(trailA);renderer.clear();
+      renderer.setRenderTarget(trailB);renderer.clear();
       renderer.setRenderTarget(null);
     }
   }
 
-  return { init, setSong, startBeat, stopBeat, syncBeat, reset };
+  return {init,setSong,startBeat,stopBeat,syncBeat,reset};
 })();

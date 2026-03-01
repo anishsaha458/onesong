@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OneSong — Your Signature Track</title>
+  <title>OneSong</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
@@ -11,7 +11,10 @@
 </head>
 <body>
 
-  <!-- GPGPU canvas — Three.js renders here -->
+  <!--
+    GPGPU canvas — Three.js renders here.
+    z-index: -1 set by ambient.js at init time to guarantee it's always behind UI.
+  -->
   <canvas id="ambient-canvas"></canvas>
 
   <!-- Global loading overlay -->
@@ -19,136 +22,98 @@
     <div class="spinner"></div>
   </div>
 
-  <!-- ── AUTH ──────────────────────────────────────── -->
-  <div id="auth-container" class="container">
+  <!-- ── AUTH ──────────────────────────────────────────────────── -->
+  <div id="auth-container" class="page-layer">
     <div class="auth-box">
       <div class="auth-logo">
-        <span class="logo-note">♪</span>
+        <span class="logo-glyph">♪</span>
         <h1>OneSong</h1>
       </div>
-      <p class="subtitle">The one song that defines you</p>
+      <p class="tagline">The one song that defines you</p>
 
+      <!-- Login -->
       <div id="login-form" class="auth-form">
         <h2>Welcome back</h2>
-        <input type="email" id="login-email" placeholder="Email address" autocomplete="email" required>
-        <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required>
+        <input type="email"    id="login-email"    placeholder="Email"    autocomplete="email" required>
+        <input type="password" id="login-password"  placeholder="Password" autocomplete="current-password" required>
         <button onclick="login()">Sign In</button>
-        <p class="toggle-auth">New here? <a href="#" onclick="showSignup()">Create account</a></p>
+        <p class="auth-switch">New here? <a href="#" onclick="showSignup()">Create account</a></p>
       </div>
 
+      <!-- Sign up -->
       <div id="signup-form" class="auth-form hidden">
         <h2>Join OneSong</h2>
-        <input type="text" id="signup-username" placeholder="Username" autocomplete="username" required>
-        <input type="email" id="signup-email" placeholder="Email address" autocomplete="email" required>
-        <input type="password" id="signup-password" placeholder="Password (min 6 chars)" autocomplete="new-password" required>
+        <input type="text"     id="signup-username" placeholder="Username"           autocomplete="username"     required>
+        <input type="email"    id="signup-email"    placeholder="Email"              autocomplete="email"        required>
+        <input type="password" id="signup-password"  placeholder="Password (min 6)"  autocomplete="new-password" required>
         <button onclick="signup()">Create Account</button>
-        <p class="toggle-auth">Already have an account? <a href="#" onclick="showLogin()">Sign in</a></p>
+        <p class="auth-switch">Already have one? <a href="#" onclick="showLogin()">Sign in</a></p>
       </div>
 
-      <div id="auth-error" class="error-message hidden"></div>
+      <div id="auth-error" class="err hidden"></div>
     </div>
   </div>
 
-  <!-- ── APP ───────────────────────────────────────── -->
-  <div id="app-container" class="container hidden">
+  <!-- ── APP ───────────────────────────────────────────────────── -->
+  <div id="app-container" class="page-layer hidden">
 
-    <div class="header">
-      <div class="header-logo">
-        <span class="logo-note-sm">♪</span>
-        <span class="header-title">OneSong</span>
+    <!-- Minimal top bar -->
+    <header class="topbar">
+      <span class="topbar-logo">♪ OneSong</span>
+      <div class="topbar-right">
+        <span id="username-display" class="topbar-user"></span>
+        <button onclick="logout()" class="btn-ghost">Logout</button>
       </div>
-      <div class="user-info">
-        <span id="username-display"></span>
-        <button onclick="logout()" class="logout-btn">Logout</button>
-      </div>
-    </div>
+    </header>
 
-    <!-- Song display -->
-    <div id="song-display" class="song-display hidden">
-      <div class="welcome-message">
-        <p class="welcome-label">YOUR SIGNATURE TRACK</p>
-        <h2 id="welcome-text">Welcome back!</h2>
-      </div>
-
-      <div class="song-info-card">
-        <div class="song-vinyl">🎵</div>
-        <div class="song-text">
-          <h3 id="song-name"></h3>
-          <p id="song-artist"></p>
-        </div>
+    <!-- Song display: title + artist + YouTube player + spacebar hint -->
+    <main id="song-display" class="song-display hidden">
+      <div class="song-meta">
+        <p class="song-label">YOUR SIGNATURE TRACK</p>
+        <h2 id="song-name" class="song-title"></h2>
+        <p  id="song-artist" class="song-artist"></p>
       </div>
 
-      <!-- YouTube IFrame API renders here -->
-      <div id="youtube-player" class="youtube-player"></div>
+      <!-- YouTube IFrame API mounts here -->
+      <div id="youtube-player" class="yt-wrap"></div>
 
       <p id="sync-hint" class="sync-hint hidden">
-        Tap <strong>Spacebar</strong> to the beat to sync the particle field
+        Tap <kbd>Space</kbd> to the beat to sync the particle field
       </p>
 
-      <!-- Recommendations -->
-      <div id="recommendations-section" class="recommendations-section hidden">
-        <div class="rec-header">
-          <span class="rec-badge">✦ AI</span>
-          <h3>songs you might like</h3>
-          <p class="rec-subtitle">Based on your taste, curated by Last.fm listener patterns</p>
-        </div>
-        <div id="rec-list" class="rec-list"></div>
-      </div>
-
-      <div id="rec-loading" class="rec-loading hidden">
-        <div class="rec-spinner"></div>
-        <p>Finding matches...</p>
-      </div>
-
-      <div id="rec-error" class="rec-error hidden"></div>
-
-      <div class="song-actions">
-        <button onclick="getRecommendations()" class="btn btn-ai" id="rec-btn">
-          ✦ Get Song Recommendations
-        </button>
-        <button onclick="showSongSelection()" class="btn btn-secondary">
-          Change Song
-        </button>
-      </div>
-    </div>
+      <button onclick="showSongSelection()" class="btn-change">Change song</button>
+    </main>
 
     <!-- Song selection form -->
     <div id="song-selection" class="song-selection hidden">
-      <div class="selection-header">
-        <p class="welcome-label">CHOOSE WISELY</p>
+      <div class="sel-header">
+        <p class="song-label">CHOOSE WISELY</p>
         <h2>Your One Song</h2>
-        <p class="subtitle">close to who you are</p>
+        <p class="tagline">the track that is closest to who you are</p>
       </div>
 
       <div class="song-form">
-        <input type="text" id="input-song-name" placeholder="Song name">
+        <input type="text" id="input-song-name"   placeholder="Song name">
         <input type="text" id="input-artist-name" placeholder="Artist">
-        <input type="text" id="input-youtube-url" placeholder="YouTube URL (paste from browser)">
-        <p class="hint">Find your song on YouTube and paste the URL above</p>
-        <div id="song-form-error" class="error-message hidden"></div>
+        <input type="text" id="input-youtube-url" placeholder="YouTube URL">
+        <p class="hint">Paste the URL from your browser's address bar</p>
+        <div id="song-form-error" class="err hidden"></div>
         <button onclick="saveSong()">Save My Song</button>
       </div>
 
-      <button onclick="cancelSongSelection()" class="btn btn-secondary" id="cancel-btn">
-        Cancel
-      </button>
+      <button onclick="cancelSongSelection()" class="btn-ghost" id="cancel-btn">Cancel</button>
     </div>
 
   </div><!-- /#app-container -->
 
   <!--
-    Three.js r128 — GPGPU particle system
-    Must load before ambient.js
+    Load order (critical):
+      1. three.js         — WebGL + FBO infrastructure
+      2. gradientController.js — audio timeline + gfx state bridge
+      3. ambient.js        — GPGPU render loop (reads GradientController.gfx)
+      4. app.js            — auth, YT player, 250ms playhead poller
   -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-
-  <!--
-    Load order:
-      1. three.js          (WebGL math & FBO infrastructure)
-      2. gradientController (audio timeline + gfx state)
-      3. ambient.js         (GPGPU render loop, reads GradientController.gfx)
-      4. app.js             (auth, YT player, polls playhead every 250ms)
-  -->
   <script src="gradientController.js"></script>
   <script src="ambient.js"></script>
   <script src="app.js"></script>
