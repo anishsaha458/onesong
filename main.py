@@ -468,6 +468,77 @@ async def audio_analysis(track: str, artist: str, payload: dict = Depends(auth))
     _analysis_cache[cache_key] = result
     return result
 
+@app.get("/stream")
+async def stream_audio(request: Request, youtube_id: str, token: str = None):
+    """
+    Headless audio streaming endpoint.
+    Pipes yt-dlp audio directly to the <audio> element as a streaming response.
+    Replaces YouTube IFrame API — the browser <audio> element is the only player.
+
+    Usage: GET /stream?youtube_id=dQw4w9WgXcQ&token=<jwt>
+
+    Requires valid JWT (passed as query param since <audio src> can't set headers).
+    Falls back to a 302 redirect to YouTube's /watch page if yt-dlp is unavailable.
+    """
+    from fastapi.responses import StreamingResponse
+    import shutil
+
+    # Validate token from query param (can't set Authorization header on <audio> src)
+    if not token:
+        raise HTTPException(401, "Token required")
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+    except Exception:
+        raise HTTPException(401, "Invalid token")
+
+    if not shutil.which("yt-dlp"):
+        # yt-dlp not installed — redirect to YouTube as last resort
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(f"https://www.youtube.com/watch?v={youtube_id}")
+
+    if not re.match(r'^[a-zA-Z0-9_\-]{11}$', youtube_id):
+        raise HTTPException(400, "Invalid youtube_id")
+
+    # yt-dlp pipe: best audio, opus/webm preferred (widely supported), stream to client
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--format", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio",
+        "--output", "-",          # pipe to stdout
+        "--quiet",
+        "--no-warnings",
+        f"https://www.youtube.com/watch?v={youtube_id}",
+    ]
+
+    async def audio_generator():
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)  # 64 KB chunks
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
+    return StreamingResponse(
+        audio_generator(),
+        media_type="audio/webm",   # matches bestaudio[ext=webm] preference
+        headers={
+            "Cache-Control": "no-cache",
+            "Accept-Ranges": "none",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @app.get("/user/profile")
 def profile(payload: dict = Depends(auth)):
     conn = get_db(); cur = conn.cursor()

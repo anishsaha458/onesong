@@ -1,13 +1,15 @@
 // ============================================================
-// gradientController.js  v2.0 — GPGPU Edition
+// gradientController.js  v2.1 — GPGPU Edition
 // Audio feature store + per-frame visual state.
 //
 // DESIGN:
-//   app.js polls ytPlayer.getCurrentTime() every 250ms and calls
-//   GradientController.updatePlayhead(t, isPlaying).
+//   app.js polls audioEl.currentTime every 250ms (via AudioContext
+//   master clock) and calls GradientController.updatePlayhead(t, isPlaying).
 //   ambient.js calls GradientController.frame(dt) every render
 //   frame (~60fps) to advance smooth decays.
 //   JSON timeline is interpolated between frames for 120Hz+ support.
+//   Real-time PCM fallback via Ambient.setAudioFeatures() feeds the
+//   GPGPU engine directly when 60Hz JSON is unavailable.
 // ============================================================
 
 const GradientController = (() => {

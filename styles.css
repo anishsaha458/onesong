@@ -1,414 +1,587 @@
-/* ── Reset ───────────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────
+   OneSong — Zen Mode Styles
+   Canvas = z-index: -1 (GPGPU field is THE background)
+   All UI containers = semi-transparent glass (particles show through)
+   body background = pure #000 (fallback only — canvas covers it)
+   ───────────────────────────────────────────────────────────── */
+
+/* ── Reset ────────────────────────────────────────────────── */
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
+/* ── Design tokens ────────────────────────────────────────── */
 :root {
-  /* The GPGPU field IS the background — keep all UI surfaces transparent */
-  --glass:       rgba(6, 6, 12, 0.55);
-  --glass-hover: rgba(10, 10, 20, 0.70);
-  --border:      rgba(255, 255, 255, 0.07);
-  --border-hi:   rgba(200, 169, 110, 0.30);
-  --accent:      #c8a96e;
-  --accent2:     #e8c98e;
-  --text:        #eeeae4;
-  --text2:       #7a7870;
-  --text3:       #3e3c39;
-  --error:       #e57373;
-  --ai:          #a78bfa;
-  --bg-fallback: #030306;   /* shown only if WebGL fails entirely */
+  /* Palette — dark enough for particle contrast, transparent enough to see field */
+  --c-bg:        #000000;
+  --c-glass:     rgba(5, 5, 12, 0.52);          /* ← was 0.75 — too opaque, blocked field */
+  --c-glass-hi:  rgba(10, 10, 22, 0.68);
+  --c-border:    rgba(255, 255, 255, 0.065);
+  --c-border-hi: rgba(200, 169, 110, 0.28);
+  --c-accent:    #c8a96e;
+  --c-accent2:   #e8c98e;
+  --c-text:      #ede8e0;
+  --c-text2:     #7a7670;
+  --c-text3:     #3a3835;
+  --c-error:     #e07070;
+
+  --blur:  28px;
+  --r-sm:  10px;
+  --r-md:  16px;
+  --r-lg:  22px;
+  --r-xl:  28px;
+  --font-display: 'Playfair Display', Georgia, serif;
+  --font-mono:    'DM Mono', 'Courier New', monospace;
 }
 
-body {
-  font-family: 'DM Sans', sans-serif;
-  /* Transparent — GPGPU field is the real background */
-  background: var(--bg-fallback);
+/* ── Body — BLACK background so canvas renders over it cleanly ── */
+html, body {
+  width: 100%;
   min-height: 100vh;
-  color: var(--text);
+  background: var(--c-bg);  /* #000 — canvas sits on top at z-index:-1 */
+  color: var(--c-text);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 300;
+  letter-spacing: 0.01em;
   overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* ── GPGPU Canvas ────────────────────────────────────────────── */
-/* z-index forced to -1 by ambient.js; duplicated here as safety */
+/* ── GPGPU CANVAS ─────────────────────────────────────────── */
+/* z-index: -1 ensures canvas is always behind every UI layer.
+   ambient.js also enforces this in JS; CSS is a belt-and-braces safety. */
 #ambient-canvas {
   position: fixed !important;
   inset: 0 !important;
   width: 100vw !important;
   height: 100vh !important;
-  z-index: -1 !important;
-  display: block;
-  pointer-events: none;
+  z-index: -1 !important;    /* ← THE critical line */
+  display: block !important;
+  pointer-events: none !important;
 }
 
-/* ── Page layers (auth + app sit on top of canvas) ───────────── */
-.page-layer {
-  position: relative;
-  z-index: 1;
-  min-height: 100vh;
+/* ── Loading veil ─────────────────────────────────────────── */
+.veil {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 24px 16px;
+  gap: 16px;
+  background: rgba(0, 0, 0, 0.80);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
-
-.hidden { display: none !important; }
-
-/* ── Loading overlay ─────────────────────────────────────────── */
-#loading {
-  position: fixed;
-  inset: 0;
-  /* Translucent so particles still shimmer through */
-  background: rgba(0, 0, 0, 0.70);
-  backdrop-filter: blur(6px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 9999;
-}
-
-.spinner {
+.veil-ring {
   width: 36px;
   height: 36px;
-  border: 2px solid rgba(200, 169, 110, 0.15);
-  border-top-color: var(--accent);
+  border: 2px solid rgba(200, 169, 110, 0.12);
+  border-top-color: var(--c-accent);
   border-radius: 50%;
-  animation: spin 0.9s linear infinite;
+  animation: spin 0.85s linear infinite;
 }
-
+.veil p { color: var(--c-text2); font-size: 12px; letter-spacing: 0.08em; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ── Auth box ────────────────────────────────────────────────── */
-.auth-box {
+/* ── Utility ──────────────────────────────────────────────── */
+.hidden { display: none !important; }
+
+/* ── Layers (auth + app live above canvas) ────────────────── */
+.layer {
+  position: relative;
+  z-index: 1;             /* above canvas (z-index:-1), below veil (z-index:9998) */
+  min-height: 100vh;
   width: 100%;
-  max-width: 420px;
-  /* KEY: semi-transparent so particles glow behind it */
-  background: var(--glass);
-  border: 1px solid var(--border);
-  border-radius: 24px;
-  padding: 48px 40px;
-  backdrop-filter: blur(28px);
-  -webkit-backdrop-filter: blur(28px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px 40px;
+}
+
+/* ── Glass card base ──────────────────────────────────────── */
+.glass-card {
+  /* TRANSPARENT so particles show through the card surface */
+  background:          var(--c-glass);
+  border:              1px solid var(--c-border);
+  border-radius:       var(--r-xl);
+  backdrop-filter:     blur(var(--blur));
+  -webkit-backdrop-filter: blur(var(--blur));
   box-shadow:
-    0 0 0 1px rgba(200, 169, 110, 0.04),
-    0 40px 80px rgba(0, 0, 0, 0.55),
-    inset 0 1px 0 rgba(255,255,255,0.05);
-  animation: riseIn 0.6s cubic-bezier(.16,1,.3,1);
+    0 0 0 1px rgba(200, 169, 110, 0.03),
+    0 30px 70px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  animation: riseIn 0.55s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
-
 @keyframes riseIn {
-  from { opacity:0; transform: translateY(20px) scale(.98); }
-  to   { opacity:1; transform: translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(18px) scale(0.985); }
+  to   { opacity: 1; transform: translateY(0)    scale(1);     }
 }
 
-.auth-logo {
+/* ─────────────────────────────────────────────────────────────
+   AUTH CARD
+   ───────────────────────────────────────────────────────────── */
+.auth-card {
+  width: 100%;
+  max-width: 410px;
+  padding: 44px 38px 40px;
+}
+
+.brand {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 10px;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
-.logo-glyph { color: var(--accent); font-size: 2em; }
-.auth-logo h1 {
-  font-family: 'Playfair Display', serif;
-  font-size: 2.4em;
+.brand-mark {
+  color: var(--c-accent);
+  font-size: 1.55em;
+  line-height: 1;
+}
+.brand-name {
+  font-family: var(--font-display);
+  font-size: 2.3em;
   font-weight: 400;
-  letter-spacing: -0.03em;
-  color: var(--text);
+  letter-spacing: -0.02em;
+  color: var(--c-text);
 }
 
-.tagline {
+.sub-text {
   text-align: center;
-  color: var(--text3);
-  font-size: 0.85em;
-  letter-spacing: 0.04em;
-  margin-bottom: 36px;
+  color: var(--c-text3);
+  font-size: 0.82em;
+  letter-spacing: 0.05em;
+  margin-bottom: 34px;
 }
 
 .auth-form h2 {
-  font-family: 'Playfair Display', serif;
+  font-family: var(--font-display);
   font-weight: 400;
-  font-size: 1.35em;
-  color: var(--text2);
+  font-size: 1.25em;
+  color: var(--c-text2);
   text-align: center;
-  margin-bottom: 24px;
+  margin-bottom: 18px;
 }
 
-/* ── Inputs (auth + song form) ───────────────────────────────── */
-.auth-form input,
-.song-form  input {
+/* ── Inputs ───────────────────────────────────────────────── */
+.auth-card  input,
+.sel-card   input,
+.song-selection input {
   display: block;
   width: 100%;
-  padding: 13px 16px;
-  margin-bottom: 10px;
-  background: rgba(12, 12, 22, 0.80);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  font-size: 14px;
-  font-family: 'DM Sans', sans-serif;
-  color: var(--text);
+  padding: 12px 15px;
+  margin-bottom: 9px;
+  background: rgba(10, 10, 18, 0.75);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-sm);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  font-weight: 300;
+  color: var(--c-text);
   outline: none;
-  transition: border-color .2s, box-shadow .2s;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.auth-card  input::placeholder,
+.sel-card   input::placeholder,
+.song-selection input::placeholder { color: var(--c-text3); }
+
+.auth-card  input:focus,
+.sel-card   input:focus,
+.song-selection input:focus {
+  border-color: rgba(200, 169, 110, 0.40);
+  box-shadow: 0 0 0 3px rgba(200, 169, 110, 0.06);
 }
 
-.auth-form input::placeholder,
-.song-form  input::placeholder { color: var(--text3); }
-
-.auth-form input:focus,
-.song-form  input:focus {
-  border-color: rgba(200, 169, 110, 0.45);
-  box-shadow: 0 0 0 3px rgba(200, 169, 110, 0.08);
-}
-
-/* ── Primary buttons ─────────────────────────────────────────── */
-.auth-form button,
-.song-form  button {
+/* ── Primary button ───────────────────────────────────────── */
+.btn-primary {
   display: block;
   width: 100%;
-  padding: 13px;
   margin-top: 6px;
-  background: linear-gradient(135deg, #9a7510 0%, var(--accent) 55%, var(--accent2) 100%);
-  color: #160e00;
+  padding: 12px;
+  background: linear-gradient(135deg, #8a6508 0%, var(--c-accent) 55%, var(--c-accent2) 100%);
+  color: #120d00;
   border: none;
-  border-radius: 10px;
-  font-size: 14px;
-  font-family: 'DM Sans', sans-serif;
-  font-weight: 600;
-  letter-spacing: 0.03em;
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0.06em;
   cursor: pointer;
-  transition: filter .2s, transform .15s, box-shadow .2s;
-  box-shadow: 0 4px 18px rgba(200, 169, 110, 0.25);
+  transition: filter 0.2s, transform 0.15s, box-shadow 0.2s;
+  box-shadow: 0 4px 18px rgba(200, 169, 110, 0.22);
 }
-.auth-form button:hover,
-.song-form  button:hover {
-  filter: brightness(1.12);
+.btn-primary:hover {
+  filter: brightness(1.1);
   transform: translateY(-1px);
-  box-shadow: 0 6px 26px rgba(200, 169, 110, 0.38);
+  box-shadow: 0 6px 24px rgba(200, 169, 110, 0.35);
 }
+.btn-primary:active { transform: translateY(0); filter: brightness(0.95); }
+
+/* ── Ghost small button ───────────────────────────────────── */
+.btn-ghost-sm {
+  padding: 5px 12px;
+  background: transparent;
+  color: var(--c-text2);
+  border: 1px solid var(--c-border);
+  border-radius: 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s;
+}
+.btn-ghost-sm:hover { border-color: var(--c-border-hi); color: var(--c-accent); }
 
 .auth-switch {
   text-align: center;
-  margin-top: 20px;
-  color: var(--text3);
-  font-size: 0.86em;
+  margin-top: 18px;
+  color: var(--c-text3);
+  font-size: 0.82em;
 }
-.auth-switch a { color: var(--accent); text-decoration: none; font-weight: 500; }
+.auth-switch a { color: var(--c-accent); text-decoration: none; }
 .auth-switch a:hover { text-decoration: underline; }
 
-.err {
-  background: rgba(229,115,115,0.08);
-  color: var(--error);
-  border: 1px solid rgba(229,115,115,0.20);
-  padding: 10px 14px;
+/* ── Error message ────────────────────────────────────────── */
+.err-msg {
+  color: var(--c-error);
+  font-size: 12px;
+  text-align: center;
+  padding: 9px 12px;
+  background: rgba(224, 112, 112, 0.08);
+  border: 1px solid rgba(224, 112, 112, 0.18);
   border-radius: 8px;
   margin-top: 8px;
-  text-align: center;
-  font-size: 13px;
 }
 
-/* ── Top bar ─────────────────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────
+   TOPBAR
+   Fixed nav strip — ultra thin glass ribbon at top
+   ───────────────────────────────────────────────────────────── */
 .topbar {
   position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 10;
+  top: 0; left: 0; right: 0;
+  z-index: 100;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 24px;
-  background: rgba(4, 4, 10, 0.50);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border-bottom: 1px solid var(--border);
+  padding: 12px 22px;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border-bottom: 1px solid var(--c-border);
 }
-.topbar-logo {
-  font-family: 'Playfair Display', serif;
-  font-size: 1.1em;
+.topbar-brand {
+  font-family: var(--font-display);
+  font-size: 1.05em;
   font-weight: 400;
-  color: var(--text);
+  color: var(--c-accent);
   letter-spacing: -0.01em;
 }
-.topbar-right  { display: flex; align-items: center; gap: 14px; }
-.topbar-user   { color: var(--text2); font-size: 0.82em; }
+.topbar-right { display: flex; align-items: center; gap: 12px; }
+.topbar-user  { color: var(--c-text2); font-size: 11px; letter-spacing: 0.04em; }
 
-/* ── Ghost / secondary buttons ───────────────────────────────── */
-.btn-ghost {
-  padding: 6px 14px;
-  background: transparent;
-  color: var(--text2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-family: 'DM Sans', sans-serif;
-  font-size: 12px;
-  cursor: pointer;
-  transition: border-color .2s, color .2s;
+/* ─────────────────────────────────────────────────────────────
+   NOW PLAYING — ZEN VIEW
+   The field IS the visual. UI floats over it.
+   Identity block: bottom-left fixed overlay
+   Transport: bottom-center fixed overlay
+   ───────────────────────────────────────────────────────────── */
+.now-playing {
+  /* This is a full-screen container — children use fixed positioning */
+  position: fixed;
+  inset: 0;
+  pointer-events: none;   /* pass clicks through to canvas controls below */
+  z-index: 10;
 }
-.btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+.now-playing > * { pointer-events: auto; } /* re-enable for interactive children */
 
-/* ── Song display ────────────────────────────────────────────── */
-.song-display {
-  width: 100%;
-  max-width: 580px;
-  padding-top: 72px;   /* clear the fixed topbar */
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  animation: riseIn 0.5s cubic-bezier(.16,1,.3,1);
+/* Song identity — anchored bottom-left */
+.identity-block {
+  position: fixed;
+  bottom: 130px;
+  left: 28px;
+  max-width: 340px;
+  background: var(--c-glass);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+  padding: 18px 22px 16px;
+  backdrop-filter: blur(var(--blur));
+  -webkit-backdrop-filter: blur(var(--blur));
+  box-shadow: 0 16px 48px rgba(0,0,0,0.5);
+  animation: riseIn 0.5s 0.1s cubic-bezier(0.16,1,0.3,1) both;
 }
-
-/* Song meta (title + artist) — minimal glass card */
-.song-meta {
-  background: var(--glass);
-  border: 1px solid var(--border);
-  border-radius: 18px 18px 0 0;
-  padding: 26px 28px 20px;
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-}
-.song-label {
-  font-size: 0.62em;
+.eyebrow {
+  font-size: 0.60em;
   letter-spacing: 0.18em;
-  color: var(--accent);
-  font-weight: 500;
+  color: var(--c-accent);
+  font-weight: 400;
   text-transform: uppercase;
-  margin-bottom: 6px;
+  margin-bottom: 5px;
 }
 .song-title {
-  font-family: 'Playfair Display', serif;
-  font-size: 2em;
-  font-weight: 700;
-  color: var(--text);
-  letter-spacing: -0.025em;
-  line-height: 1.1;
-  margin-bottom: 6px;
+  font-family: var(--font-display);
+  font-size: 1.65em;
+  font-weight: 600;
+  color: var(--c-text);
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  margin-bottom: 4px;
 }
 .song-artist {
-  font-size: 1em;
-  color: var(--accent);
-  font-weight: 400;
-  letter-spacing: 0.01em;
-}
-
-/* YouTube player — seamlessly attached below meta */
-.yt-wrap {
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  background: #000;
-  overflow: hidden;
-  border-radius: 0 0 18px 18px;
-  box-shadow: 0 20px 60px rgba(0,0,0,0.65);
-}
-.yt-wrap iframe {
-  display: block;
-  width: 100%;
-  height: 100%;
-  border: none;
-}
-
-/* Spacebar hint */
-.sync-hint {
-  text-align: center;
-  font-size: 0.76em;
-  color: var(--text3);
-  padding: 10px 0 4px;
+  font-size: 0.88em;
+  color: var(--c-accent);
   letter-spacing: 0.02em;
 }
+
+/* Transport — anchored bottom-center */
+.transport {
+  position: fixed;
+  bottom: 22px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(520px, calc(100vw - 56px));
+  background: var(--c-glass);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+  padding: 14px 18px 12px;
+  backdrop-filter: blur(var(--blur));
+  -webkit-backdrop-filter: blur(var(--blur));
+  box-shadow:
+    0 16px 48px rgba(0,0,0,0.55),
+    0 0 0 1px rgba(200,169,110,0.04);
+  animation: riseIn 0.5s 0.15s cubic-bezier(0.16,1,0.3,1) both;
+}
+
+/* Progress bar — custom styled range input over visual track */
+.progress-wrap {
+  position: relative;
+  height: 20px;
+  margin-bottom: 4px;
+  cursor: pointer;
+}
+.progress-bg {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  transform: translateY(-50%);
+  height: 3px;
+  background: rgba(255,255,255,0.07);
+  border-radius: 2px;
+  overflow: hidden;
+  pointer-events: none;
+}
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--c-accent), var(--c-accent2));
+  border-radius: 2px;
+  transition: width 0.25s linear;
+}
+.seek-input {
+  /* Transparent range input sits on top of visual track for interaction */
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+  margin: 0 !important;
+  padding: 0 !important;
+  background: transparent !important;
+  border: none !important;
+  -webkit-appearance: none;
+  box-shadow: none !important;
+}
+
+.time-row {
+  display: flex;
+  justify-content: space-between;
+  color: var(--c-text3);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  margin-bottom: 10px;
+}
+
+.controls-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+/* Play/Pause button */
+.play-btn {
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(200, 169, 110, 0.12);
+  border: 1px solid rgba(200, 169, 110, 0.22);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.15s;
+  color: var(--c-accent);
+}
+.play-btn:hover  { background: rgba(200,169,110,0.20); transform: scale(1.06); }
+.play-btn:active { transform: scale(0.95); }
+.play-btn svg    { display: block; fill: var(--c-accent); stroke: none; }
+
+/* Volume */
+.vol-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+}
+.vol-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: var(--c-text3);
+  stroke-width: 1.5;
+}
+.vol-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  height: 3px;
+  background: rgba(255,255,255,0.08);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+.vol-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--c-accent);
+  cursor: pointer;
+  box-shadow: 0 0 6px rgba(200,169,110,0.5);
+}
+.vol-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--c-accent);
+  border: none;
+  cursor: pointer;
+}
+
+/* Analysis status badge */
+.analysis-status {
+  text-align: center;
+  font-size: 10px;
+  letter-spacing: 0.07em;
+  color: var(--c-text3);
+  margin-top: 8px;
+  min-height: 14px;
+}
+
+/* Sync hint */
+.sync-hint {
+  text-align: center;
+  font-size: 10px;
+  color: var(--c-text3);
+  letter-spacing: 0.04em;
+  margin-top: 6px;
+}
 .sync-hint kbd {
-  background: rgba(200,169,110,0.12);
-  color: var(--accent);
-  border: 1px solid rgba(200,169,110,0.25);
+  background: rgba(200,169,110,0.10);
+  color: var(--c-accent);
+  border: 1px solid rgba(200,169,110,0.20);
   border-radius: 4px;
-  padding: 1px 7px;
+  padding: 1px 6px;
   font-family: inherit;
   font-size: 0.9em;
 }
 
-/* Change song button */
-.btn-change {
-  align-self: center;
-  margin-top: 14px;
-  padding: 9px 22px;
-  background: rgba(12, 12, 22, 0.60);
-  color: var(--text2);
-  border: 1px solid var(--border);
+/* Change song — PROMINENT, top-right area, glass button */
+.btn-change-song {
+  position: fixed;
+  top: 62px;          /* just below topbar */
+  right: 22px;
+  z-index: 50;
+  padding: 10px 18px;
+  background: var(--c-glass);
+  color: var(--c-text2);
+  border: 1px solid var(--c-border);
   border-radius: 20px;
-  font-family: 'DM Sans', sans-serif;
-  font-size: 12px;
-  letter-spacing: 0.04em;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
   cursor: pointer;
-  transition: border-color .2s, color .2s, background .2s;
-  backdrop-filter: blur(12px);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  transition: border-color 0.2s, color 0.2s, background 0.2s, transform 0.15s;
+  white-space: nowrap;
+  animation: riseIn 0.4s 0.2s cubic-bezier(0.16,1,0.3,1) both;
 }
-.btn-change:hover { border-color: var(--accent); color: var(--accent); background: rgba(20,14,0,.5); }
+.btn-change-song:hover {
+  border-color: var(--c-border-hi);
+  color: var(--c-accent);
+  background: rgba(16,12,2,0.60);
+  transform: translateY(-1px);
+}
 
-/* ── Song selection form ──────────────────────────────────────── */
+/* ─────────────────────────────────────────────────────────────
+   SONG SELECTION OVERLAY
+   Full-screen, centred card
+   ───────────────────────────────────────────────────────────── */
 .song-selection {
-  width: 100%;
-  max-width: 440px;
-  padding-top: 72px;
+  position: fixed;
+  inset: 0;
+  z-index: 200;
   display: flex;
-  flex-direction: column;
-  gap: 0;
-  animation: riseIn 0.5s cubic-bezier(.16,1,.3,1);
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+  background: rgba(0, 0, 0, 0.60);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.sel-card {
+  width: 100%;
+  max-width: 430px;
+  padding: 36px 32px 30px;
 }
 .sel-header {
-  background: var(--glass);
-  border: 1px solid var(--border);
-  border-radius: 18px 18px 0 0;
-  padding: 28px 28px 22px;
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
+  margin-bottom: 24px;
 }
 .sel-header h2 {
-  font-family: 'Playfair Display', serif;
+  font-family: var(--font-display);
   font-size: 1.9em;
   font-weight: 400;
-  color: var(--text);
+  color: var(--c-text);
   letter-spacing: -0.02em;
   margin: 4px 0 6px;
 }
-
-.song-form {
-  background: var(--glass);
-  border: 1px solid var(--border);
-  border-top: none;
-  border-radius: 0 0 18px 18px;
-  padding: 20px 28px 28px;
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
+.cancel-btn {
+  display: block;
+  margin: 12px auto 0;
 }
 
-.hint {
-  color: var(--text3);
-  font-size: 0.78em;
-  margin-bottom: 16px;
-  padding: 10px 12px;
-  background: rgba(16,16,28,0.60);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  line-height: 1.6;
-}
-
-#cancel-btn {
-  align-self: center;
-  margin-top: 12px;
-  padding: 8px 20px;
-  background: transparent;
-  color: var(--text3);
-  border: 1px solid var(--border);
-  border-radius: 20px;
-  font-family: 'DM Sans', sans-serif;
-  font-size: 12px;
-  cursor: pointer;
-  transition: border-color .2s, color .2s;
-}
-#cancel-btn:hover { border-color: var(--border-hi); color: var(--accent); }
-
-/* ── Responsive ──────────────────────────────────────────────── */
+/* ── Responsive ───────────────────────────────────────────── */
 @media (max-width: 540px) {
-  .auth-box       { padding: 32px 22px; }
-  .song-meta,
-  .sel-header,
-  .song-form      { padding-left: 18px; padding-right: 18px; }
-  .song-title     { font-size: 1.6em; }
-  .topbar         { padding: 12px 16px; }
+  .auth-card  { padding: 30px 20px; }
+  .identity-block {
+    bottom: 140px;
+    left: 16px;
+    max-width: calc(100vw - 32px);
+  }
+  .transport {
+    width: calc(100vw - 32px);
+    bottom: 16px;
+    padding: 12px 14px;
+  }
+  .btn-change-song { right: 16px; }
+  .song-title  { font-size: 1.35em; }
 }

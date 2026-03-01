@@ -2,116 +2,160 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
   <title>OneSong</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,600;1,400&family=DM+Mono:ital,wght@0,300;0,400;1,300&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
   <!--
-    GPGPU canvas — Three.js renders here.
-    z-index: -1 set by ambient.js at init time to guarantee it's always behind UI.
+    THREE.JS GPGPU CANVAS
+    Must be the FIRST element in body so it exists before any script executes.
+    ambient.js sets: position:fixed; inset:0; z-index:-1; pointer-events:none.
+    DO NOT add any wrapper div around this canvas.
   -->
   <canvas id="ambient-canvas"></canvas>
 
-  <!-- Global loading overlay -->
-  <div id="loading" class="loading hidden">
-    <div class="spinner"></div>
+  <!-- Loading veil — translucent, particles glow through -->
+  <div id="loading-veil" class="veil hidden">
+    <div class="veil-ring"></div>
+    <p  id="loading-msg">Starting…</p>
   </div>
 
-  <!-- ── AUTH ──────────────────────────────────────────────────── -->
-  <div id="auth-container" class="page-layer">
-    <div class="auth-box">
-      <div class="auth-logo">
-        <span class="logo-glyph">♪</span>
-        <h1>OneSong</h1>
-      </div>
-      <p class="tagline">The one song that defines you</p>
+  <!-- ════════════════ AUTH ════════════════ -->
+  <div id="auth-container" class="layer">
+    <div class="glass-card auth-card">
 
-      <!-- Login -->
+      <div class="brand">
+        <span class="brand-mark">◈</span>
+        <h1 class="brand-name">OneSong</h1>
+      </div>
+      <p class="sub-text">the one track that is closest to who you are</p>
+
       <div id="login-form" class="auth-form">
-        <h2>Welcome back</h2>
-        <input type="email"    id="login-email"    placeholder="Email"    autocomplete="email" required>
-        <input type="password" id="login-password"  placeholder="Password" autocomplete="current-password" required>
-        <button onclick="login()">Sign In</button>
-        <p class="auth-switch">New here? <a href="#" onclick="showSignup()">Create account</a></p>
+        <h2>Sign in</h2>
+        <input id="login-email"    type="email"    placeholder="Email"    autocomplete="email">
+        <input id="login-password" type="password" placeholder="Password" autocomplete="current-password">
+        <button class="btn-primary" onclick="login()">Continue</button>
+        <p class="auth-switch">No account? <a href="#" onclick="showSignup(event)">Create one</a></p>
       </div>
 
-      <!-- Sign up -->
       <div id="signup-form" class="auth-form hidden">
-        <h2>Join OneSong</h2>
-        <input type="text"     id="signup-username" placeholder="Username"           autocomplete="username"     required>
-        <input type="email"    id="signup-email"    placeholder="Email"              autocomplete="email"        required>
-        <input type="password" id="signup-password"  placeholder="Password (min 6)"  autocomplete="new-password" required>
-        <button onclick="signup()">Create Account</button>
-        <p class="auth-switch">Already have one? <a href="#" onclick="showLogin()">Sign in</a></p>
+        <h2>Create account</h2>
+        <input id="signup-username" type="text"     placeholder="Username"         autocomplete="username">
+        <input id="signup-email"    type="email"    placeholder="Email"            autocomplete="email">
+        <input id="signup-password" type="password" placeholder="Password (min 6)" autocomplete="new-password">
+        <button class="btn-primary" onclick="signup()">Create account</button>
+        <p class="auth-switch">Have one? <a href="#" onclick="showLogin(event)">Sign in</a></p>
       </div>
 
-      <div id="auth-error" class="err hidden"></div>
+      <p id="auth-error" class="err-msg hidden"></p>
     </div>
   </div>
 
-  <!-- ── APP ───────────────────────────────────────────────────── -->
-  <div id="app-container" class="page-layer hidden">
+  <!-- ════════════════ APP ════════════════ -->
+  <div id="app-container" class="layer hidden">
 
-    <!-- Minimal top bar -->
-    <header class="topbar">
-      <span class="topbar-logo">♪ OneSong</span>
+    <!-- Minimal persistent nav -->
+    <nav class="topbar">
+      <span class="topbar-brand">◈</span>
       <div class="topbar-right">
-        <span id="username-display" class="topbar-user"></span>
-        <button onclick="logout()" class="btn-ghost">Logout</button>
+        <span id="user-label" class="topbar-user"></span>
+        <button class="btn-ghost-sm" onclick="logout()">out</button>
       </div>
-    </header>
+    </nav>
 
-    <!-- Song display: title + artist + YouTube player + spacebar hint -->
-    <main id="song-display" class="song-display hidden">
-      <div class="song-meta">
-        <p class="song-label">YOUR SIGNATURE TRACK</p>
-        <h2 id="song-name" class="song-title"></h2>
+    <!-- ── ZEN / NOW PLAYING ──────────────────────── -->
+    <main id="now-playing" class="now-playing hidden">
+
+      <!-- Song identity — glass pill overlay bottom-left -->
+      <div class="identity-block" id="identity-block">
+        <p class="eyebrow">YOUR SIGNATURE TRACK</p>
+        <h2 id="song-title"  class="song-title">—</h2>
         <p  id="song-artist" class="song-artist"></p>
       </div>
 
-      <!-- YouTube IFrame API mounts here -->
-      <div id="youtube-player" class="yt-wrap"></div>
+      <!--
+        HEADLESS AUDIO ELEMENT
+        src is set by app.js to the /stream endpoint (yt-dlp pipe).
+        AudioContext latches onto this element as its source node.
+        No <video>, no IFrame, no YouTube JS API.
+      -->
+      <audio id="headless-audio" crossorigin="anonymous" preload="metadata"></audio>
 
-      <p id="sync-hint" class="sync-hint hidden">
-        Tap <kbd>Space</kbd> to the beat to sync the particle field
-      </p>
+      <!-- Transport: progress bar + controls -->
+      <div class="transport" id="transport">
 
-      <button onclick="showSongSelection()" class="btn-change">Change song</button>
+        <div class="progress-wrap" id="progress-wrap">
+          <div class="progress-bg">
+            <div class="progress-fill" id="progress-fill"></div>
+          </div>
+          <input id="seek-slider" class="seek-input" type="range"
+                 min="0" max="100" step="0.1" value="0"
+                 aria-label="Seek"
+                 oninput="seekTo(this.value)">
+        </div>
+
+        <div class="time-row">
+          <span id="time-cur">0:00</span>
+          <span id="time-tot">0:00</span>
+        </div>
+
+        <div class="controls-row">
+          <button id="play-btn" class="play-btn" onclick="togglePlay()" aria-label="Play">
+            <!-- Play icon -->
+            <svg id="ico-play"  viewBox="0 0 24 24"><polygon points="6,3 20,12 6,21"/></svg>
+            <!-- Pause icon (hidden by default) -->
+            <svg id="ico-pause" viewBox="0 0 24 24" class="hidden"><rect x="5" y="3" width="4" height="18"/><rect x="15" y="3" width="4" height="18"/></svg>
+          </button>
+
+          <div class="vol-wrap">
+            <svg viewBox="0 0 24 24" class="vol-icon"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07" stroke-linecap="round"/></svg>
+            <input id="vol-slider" class="vol-slider" type="range"
+                   min="0" max="1" step="0.01" value="0.85"
+                   aria-label="Volume"
+                   oninput="setVolume(this.value)">
+          </div>
+        </div>
+
+        <p id="analysis-status" class="analysis-status"></p>
+        <p class="sync-hint">Hold <kbd>Space</kbd> on the beat to lock sync</p>
+      </div>
+
+      <!-- Change song — prominent so it's not invisible -->
+      <button class="btn-change-song" onclick="showSongSelection()">
+        ✦ Change song
+      </button>
     </main>
 
-    <!-- Song selection form -->
+    <!-- ── SONG SELECTION ──────────────────────────── -->
     <div id="song-selection" class="song-selection hidden">
-      <div class="sel-header">
-        <p class="song-label">CHOOSE WISELY</p>
-        <h2>Your One Song</h2>
-        <p class="tagline">the track that is closest to who you are</p>
-      </div>
+      <div class="glass-card sel-card">
+        <div class="sel-header">
+          <p class="eyebrow">CHOOSE WISELY</p>
+          <h2>Your One Song</h2>
+          <p class="sub-text">the track that defines you, rendered as a living field</p>
+        </div>
 
-      <div class="song-form">
-        <input type="text" id="input-song-name"   placeholder="Song name">
-        <input type="text" id="input-artist-name" placeholder="Artist">
-        <input type="text" id="input-youtube-url" placeholder="YouTube URL">
-        <p class="hint">Paste the URL from your browser's address bar</p>
-        <div id="song-form-error" class="err hidden"></div>
-        <button onclick="saveSong()">Save My Song</button>
-      </div>
+        <input id="inp-song"   type="text" placeholder="Song name">
+        <input id="inp-artist" type="text" placeholder="Artist">
+        <input id="inp-yt"     type="url"  placeholder="YouTube URL  (youtube.com/watch?v=…)">
 
-      <button onclick="cancelSongSelection()" class="btn-ghost" id="cancel-btn">Cancel</button>
+        <p id="form-err" class="err-msg hidden"></p>
+        <button class="btn-primary" onclick="saveSong()">Save my song</button>
+        <button class="btn-ghost-sm cancel-btn hidden" id="cancel-btn" onclick="cancelSongSelection()">Cancel</button>
+      </div>
     </div>
 
   </div><!-- /#app-container -->
 
   <!--
-    Load order (critical):
-      1. three.js         — WebGL + FBO infrastructure
-      2. gradientController.js — audio timeline + gfx state bridge
-      3. ambient.js        — GPGPU render loop (reads GradientController.gfx)
-      4. app.js            — auth, YT player, 250ms playhead poller
+    SCRIPT ORDER: three.js → GradientController → Ambient → app
+    ambient.js init() is called by app.js after DOMContentLoaded.
+    three.js MUST load before ambient.js or the ShaderMaterial constructors throw.
   -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="gradientController.js"></script>
