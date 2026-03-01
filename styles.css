@@ -19,11 +19,14 @@ body {
     font-family: 'DM Sans', sans-serif;
     background: #0d0d0f;
     min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
     padding: 20px;
     color: var(--text);
+}
+
+.container {
+    width: 100%;
+    max-width: 640px;
+    margin: 40px auto;   /* centers horizontally */
 }
 
 #ambient-canvas {
