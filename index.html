@@ -10,45 +10,44 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <canvas id="ambient-canvas"></canvas>
+    <!-- WebGL ambient background -->
+    <canvas id="bg-canvas"></canvas>
 
     <div id="loading" class="loading hidden">
         <div class="spinner"></div>
     </div>
 
+    <!-- ── Auth ──────────────────────────────────────────── -->
     <div id="auth-container" class="container">
         <div class="auth-box">
             <div class="auth-logo">
-                <span class="logo-note"></span>
+                <span class="logo-note">♪</span>
                 <h1>OneSong</h1>
             </div>
             <p class="subtitle">The one song that defines you</p>
 
             <div id="login-form" class="auth-form">
                 <h2>Welcome back</h2>
-                <input type="email" id="login-email" placeholder="Email address" required>
-                <input type="password" id="login-password" placeholder="Password" required>
+                <input type="email"    id="login-email"    placeholder="Email address" required>
+                <input type="password" id="login-password" placeholder="Password"       required>
                 <button onclick="login()">Sign In</button>
-                <p class="toggle-auth">
-                    New here? <a href="#" onclick="showSignup()">Create account</a>
-                </p>
+                <p class="toggle-auth">New here? <a href="#" onclick="showSignup()">Create account</a></p>
             </div>
 
             <div id="signup-form" class="auth-form hidden">
                 <h2>Join OneSong</h2>
-                <input type="text" id="signup-username" placeholder="Username" required>
-                <input type="email" id="signup-email" placeholder="Email address" required>
+                <input type="text"     id="signup-username" placeholder="Username"             required>
+                <input type="email"    id="signup-email"    placeholder="Email address"         required>
                 <input type="password" id="signup-password" placeholder="Password (min 6 chars)" required>
                 <button onclick="signup()">Create Account</button>
-                <p class="toggle-auth">
-                     <a href="#" onclick="showLogin()">Sign in</a>
-                </p>
+                <p class="toggle-auth"><a href="#" onclick="showLogin()">Sign in</a></p>
             </div>
 
             <div id="auth-error" class="error-message hidden"></div>
         </div>
     </div>
 
+    <!-- ── App ───────────────────────────────────────────── -->
     <div id="app-container" class="container hidden">
 
         <div class="header">
@@ -62,6 +61,7 @@
             </div>
         </div>
 
+        <!-- Song display -->
         <div id="song-display" class="song-display hidden">
             <div class="welcome-message">
                 <p class="welcome-label">YOUR SIGNATURE TRACK</p>
@@ -72,14 +72,17 @@
                 <div class="song-vinyl">🎵</div>
                 <div class="song-text">
                     <h3 id="song-name"></h3>
-                    <p id="song-artist"></p>
+                    <p  id="song-artist"></p>
                 </div>
             </div>
 
             <div id="youtube-player" class="youtube-player"></div>
-            
-            <p id="sync-hint" class="sync-hint hidden">Tap <strong>Spacebar</strong> to the beat to align the visuals</p>
 
+            <p id="sync-hint" class="sync-hint hidden">
+                Tap <strong>Spacebar</strong> to the beat to align the visuals
+            </p>
+
+            <!-- Recommendations -->
             <div id="recommendations-section" class="recommendations-section hidden">
                 <div class="rec-header">
                     <span class="rec-badge">✦ AI</span>
@@ -93,7 +96,6 @@
                 <div class="rec-spinner"></div>
                 <p>Finding matches...</p>
             </div>
-
             <div id="rec-error" class="rec-error hidden"></div>
 
             <div class="song-actions">
@@ -106,32 +108,30 @@
             </div>
         </div>
 
+        <!-- Song selection -->
         <div id="song-selection" class="song-selection hidden">
             <div class="selection-header">
                 <p class="welcome-label">CHOOSE WISELY</p>
                 <h2>Your One Song</h2>
                 <p class="subtitle">close to who you are</p>
             </div>
-
             <div class="song-form">
-                <input type="text" id="input-song-name" placeholder="song name">
-                <input type="text" id="input-artist-name" placeholder="artist">
-                <input type="text" id="input-youtube-url" placeholder="YouTube URL (paste from browser)">
-                <p class="hint">
-                    find your song on youtube and paste here
-                </p>
+                <input type="text" id="input-song-name"    placeholder="song name">
+                <input type="text" id="input-artist-name"  placeholder="artist">
+                <input type="text" id="input-youtube-url"  placeholder="YouTube URL (paste from browser)">
+                <p class="hint">find your song on youtube and paste the URL here</p>
                 <div id="song-form-error" class="error-message hidden"></div>
                 <button onclick="saveSong()">Save My Song</button>
             </div>
-
-            <button onclick="cancelSongSelection()" class="btn btn-secondary" id="cancel-btn">
-                Cancel
-            </button>
+            <button onclick="cancelSongSelection()" class="btn btn-secondary" id="cancel-btn">Cancel</button>
         </div>
 
-    </div>
+    </div><!-- /app-container -->
 
-    <script src="ambient.js"></script>
-    <script src="app.js"></script>
+    <!--
+        app.js is an ES module; it imports ambient.js which imports gradientController.js.
+        The YouTube IFrame API script is injected dynamically by app.js when a song loads.
+    -->
+    <script type="module" src="app.js"></script>
 </body>
 </html>
