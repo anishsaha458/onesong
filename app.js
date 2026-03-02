@@ -4,19 +4,22 @@
  * FIXES vs v4.4:
  *
  * [E1] DYNAMIC API URL:
- *      Hardcoded 'https://onesong.onrender.com' caused "Cannot reach server"
- *      when the frontend is served from the same origin as the backend (e.g.
- *      a single Render service, or local dev). FIX: derive API from
- *      window.location.origin so the JS always talks to the host it was
- *      served from. Override by setting window.ONESONG_API before this script.
+ *      Hardcoded origin caused "Cannot reach server" when frontend and
+ *      backend share a Render origin. FIX: derive API from
+ *      window.location.origin. Override via window.ONESONG_API.
  *
- * [E2] All other fixes from v4.4 [G1–G6] retained unchanged.
+ * [E2] GPGPU starts immediately on DOMContentLoaded, before auth check,
+ *      before server ping — canvas is live from frame 1 in all cases.
+ *
+ * [E3] _bootAsync veil is translucent (CSS rgba 80%) so particles show
+ *      through. Ambient.init() is called synchronously before veil appears.
+ *
+ * [E4] All other fixes from v4.4 [G1–G6] retained.
  */
 
-// FIX [E1]: Dynamic API base — works on Render, local, any domain.
-// To override (e.g. separate frontend/backend), set:
-//   <script>window.ONESONG_API = 'https://your-backend.onrender.com';</script>
-// BEFORE this script tag in index.html.
+// FIX [E1]: Dynamic API base. To use a separate backend host, set:
+//   <script>window.ONESONG_API = 'https://your-api.onrender.com';</script>
+//   BEFORE this script tag in index.html.
 const API = window.ONESONG_API || window.location.origin;
 
 // ── Global state ──────────────────────────────────────────
@@ -47,9 +50,13 @@ let elSeekSlider, elAnalysisStatus;
 
 // ─────────────────────────────────────────────────────────
 // BOOT
-// FIX [G1]: Ambient.init() runs FIRST, synchronously, BEFORE the veil.
+//
+// FIX [E2]: Ambient.init() is the VERY FIRST thing that runs after DOM
+// is ready. Auth checks, server pings, and veil overlays come after.
+// This guarantees the WebGL canvas is rendering from frame 1.
 // ─────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  // Cache DOM refs
   audioEl          = document.getElementById('headless-audio');
   elPlayBtn        = document.getElementById('play-btn');
   elPlayIco        = document.getElementById('ico-play');
@@ -60,7 +67,7 @@ document.addEventListener('DOMContentLoaded', () => {
   elSeekSlider     = document.getElementById('seek-slider');
   elAnalysisStatus = document.getElementById('analysis-status');
 
-  // GPGPU init before ANYTHING else — canvas is live from frame 1
+  // FIX [E2]: GPGPU init FIRST — canvas glows from frame 1
   try {
     const ok = Ambient.init();
     if (!ok) console.warn('[Boot] GPGPU init returned false — CSS fallback active');
@@ -69,15 +76,16 @@ document.addEventListener('DOMContentLoaded', () => {
     console.error('[Boot] Ambient.init() threw:', e);
   }
 
-  // Auth check runs synchronously from localStorage before ping completes.
+  // Speculatively restore UI from localStorage before any network calls.
+  // Returning users see their song without waiting for server ping.
   _checkAuthFromStorage();
 
-  // Server ping + full auth verification run in background.
+  // Server ping + token verification run async in background.
   _bootAsync().catch(e => console.error('[Boot] _bootAsync fatal:', e));
 });
 
 // ─────────────────────────────────────────────────────────
-// Pre-check localStorage so returning users get instant UI.
+// Instant UI restore for returning users
 // ─────────────────────────────────────────────────────────
 function _checkAuthFromStorage() {
   authToken = localStorage.getItem('authToken');
@@ -85,14 +93,12 @@ function _checkAuthFromStorage() {
   if (authToken && saved) {
     try { currentUser = JSON.parse(saved); } catch { currentUser = null; }
   }
-  if (authToken && currentUser) {
-    _showApp();
-  } else {
-    _showAuth();
-  }
+  if (authToken && currentUser) _showApp();
+  else _showAuth();
 }
 
 async function _bootAsync() {
+  // FIX [E3]: Veil appears AFTER canvas init. Canvas particles glow through it.
   _showVeil('Connecting…');
   await _pingServer();
   _hideVeil();
@@ -112,7 +118,7 @@ async function _pingServer() {
       serverReady = true;
       const h = await r.json().catch(() => ({}));
       console.info('[Boot] Server ready ✓', {
-        yt_dlp: h.yt_dlp, ffmpeg: h.ffmpeg, essentia: h.essentia, db: h.database
+        yt_dlp: h.yt_dlp, ffmpeg: h.ffmpeg, essentia: h.essentia, db: h.database,
       });
     }
   } catch (e) {
@@ -138,7 +144,7 @@ function _checkAuth() {
 async function _verifyToken() {
   try {
     const r = await fetch(`${API}/auth/verify`, {
-      headers: { Authorization: `Bearer ${authToken}` }
+      headers: { Authorization: `Bearer ${authToken}` },
     });
     if (r.ok) { _showApp(); _loadUserSong(); }
     else logout();
@@ -179,16 +185,20 @@ async function signup() {
   _showVeil('Creating account…');
   try {
     const r = await fetch(`${API}/auth/signup`, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, username, password }),
+      body:    JSON.stringify({ email, username, password }),
     });
     const d = await r.json();
     if (r.ok) {
       authToken = d.token; currentUser = d.user; _storeAuth();
       _hideVeil(); _showApp(); showSongSelection();
-    } else { _hideVeil(); _setAuthErr(d.detail || 'Signup failed'); }
-  } catch (e) { _hideVeil(); _setAuthErr('Cannot reach server'); }
+    } else {
+      _hideVeil(); _setAuthErr(d.detail || 'Signup failed');
+    }
+  } catch (e) {
+    _hideVeil(); _setAuthErr('Cannot reach server');
+  }
 }
 
 async function login() {
@@ -198,16 +208,20 @@ async function login() {
   _showVeil('Signing in…');
   try {
     const r = await fetch(`${API}/auth/login`, {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password }),
+      body:    JSON.stringify({ email, password }),
     });
     const d = await r.json();
     if (r.ok) {
       authToken = d.token; currentUser = d.user; _storeAuth();
       _hideVeil(); _showApp(); _loadUserSong();
-    } else { _hideVeil(); _setAuthErr(d.detail || 'Login failed'); }
-  } catch (e) { _hideVeil(); _setAuthErr('Cannot reach server'); }
+    } else {
+      _hideVeil(); _setAuthErr(d.detail || 'Login failed');
+    }
+  } catch (e) {
+    _hideVeil(); _setAuthErr('Cannot reach server');
+  }
 }
 
 function _storeAuth() {
@@ -231,7 +245,7 @@ async function _loadUserSong() {
   _showVeil('Loading your song…');
   try {
     const r = await fetch(`${API}/user/song`, {
-      headers: { Authorization: `Bearer ${authToken}` }
+      headers: { Authorization: `Bearer ${authToken}` },
     });
     const d = await r.json();
     _hideVeil();
@@ -259,15 +273,17 @@ async function saveSong() {
   _showVeil('Saving…');
   try {
     const r = await fetch(`${API}/user/song`, {
-      method: 'PUT',
+      method:  'PUT',
       headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ song_name, artist_name, youtube_url }),
+      body:    JSON.stringify({ song_name, artist_name, youtube_url }),
     });
     const d = await r.json();
     _hideVeil();
     if (r.ok) { hasSong = true; currentSong = d.song; _displaySong(d.song); }
     else _setFormErr(d.detail || 'Save failed');
-  } catch (e) { _hideVeil(); _setFormErr('Cannot reach server'); }
+  } catch (e) {
+    _hideVeil(); _setFormErr('Cannot reach server');
+  }
 }
 
 function showSongSelection() {
@@ -329,7 +345,7 @@ function _setupAudio(song) {
   audioEl.src = '';
   audioEl.load();
 
-  // FIX [E1]: API is now dynamic — stream URL always points to correct host
+  // FIX [E1]: Stream URL uses dynamic API origin
   const streamUrl = `${API}/stream`
     + `?youtube_id=${encodeURIComponent(song.youtube_video_id)}`
     + `&token=${encodeURIComponent(authToken)}`;
@@ -343,6 +359,7 @@ function _setupAudio(song) {
   audioEl.addEventListener('ended',          _onAudioEnded);
   audioEl.addEventListener('error',          _onAudioError);
 
+  // 10s fallback: enable play button if loadeddata never fires
   _playEnableTimer = setTimeout(() => {
     if (!_audioReady) {
       console.warn('[Audio] loadeddata timeout — enabling play button');
@@ -403,15 +420,14 @@ function _onAudioError() {
     4: '⚠ Audio format not supported — check server /stream',
   };
   const msg = msgs[code] || `⚠ Audio error (code ${code})`;
-  console.error('[Audio] MediaError:', code, err?.message, err?.MEDIA_ERR_SRC_NOT_SUPPORTED);
+  console.error('[Audio] MediaError:', code, err?.message);
 
+  // Retry once on network errors (code 2) — handles yt-dlp probe latency
   if (code === 2 && !_audioRetried && currentSong?.youtube_video_id) {
     _audioRetried = true;
     console.info('[Audio] Retrying stream after network error…');
     _setAnalysisStatus('⏳ Retrying stream…');
-    setTimeout(() => {
-      if (currentSong) _setupAudio(currentSong);
-    }, 2000);
+    setTimeout(() => { if (currentSong) _setupAudio(currentSong); }, 2000);
     return;
   }
 
@@ -429,26 +445,24 @@ function _teardownAudio() {
     audioEl.removeEventListener('timeupdate',     _onTimeUpdate);
     audioEl.removeEventListener('ended',          _onAudioEnded);
     audioEl.removeEventListener('error',          _onAudioError);
-    audioEl.src = '';
-    audioEl.load();
+    audioEl.src = ''; audioEl.load();
   }
   if (audioCtx && audioCtx.state !== 'closed') {
     audioCtx.close().catch(() => {});
     audioCtx = null; audioSrc = null; analyserNode = null; gainNode = null;
   }
-  _audioReady   = false;
-  _audioRetried = false;
+  _audioReady = false; _audioRetried = false;
   _setPlayState(false);
   _setPlayBtnEnabled(false);
 }
 
 // ─────────────────────────────────────────────────────────
-// AudioContext bootstrap — only from user gesture (togglePlay)
+// AudioContext bootstrap — only from user gesture
 // ─────────────────────────────────────────────────────────
 async function _resumeContext() {
   if (!audioCtx) {
     try {
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      audioCtx     = new (window.AudioContext || window.webkitAudioContext)();
       gainNode     = audioCtx.createGain();
       analyserNode = audioCtx.createAnalyser();
       analyserNode.fftSize = FFT_SIZE;
@@ -535,7 +549,7 @@ async function _fetchAudioAnalysis(song) {
     if (song.youtube_video_id) params.append('youtube_id', song.youtube_video_id);
 
     const r = await fetch(`${API}/audio_analysis?${params}`, {
-      headers: { Authorization: `Bearer ${authToken}` }
+      headers: { Authorization: `Bearer ${authToken}` },
     });
     if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     const data = await r.json();
@@ -583,10 +597,9 @@ async function togglePlay() {
       } else if (e.name === 'NotSupportedError') {
         _setAnalysisStatus('⚠ Audio format not supported');
       } else if (e.name === 'AbortError') {
+        // src changed mid-play — retry automatically
         _setAnalysisStatus('⏳ Stream starting…');
-        setTimeout(() => {
-          if (audioEl && audioEl.paused) togglePlay();
-        }, 800);
+        setTimeout(() => { if (audioEl && audioEl.paused) togglePlay(); }, 800);
       } else {
         _setAnalysisStatus('⚠ Playback failed: ' + e.message);
       }
@@ -601,9 +614,8 @@ async function togglePlay() {
 
 function seekTo(val) {
   if (!audioEl || !isFinite(audioEl.duration)) return;
-  const t = parseFloat(val);
-  audioEl.currentTime = t;
-  if (window.GradientController) GradientController.updatePlayhead(t, !audioEl.paused);
+  audioEl.currentTime = parseFloat(val);
+  if (window.GradientController) GradientController.updatePlayhead(audioEl.currentTime, !audioEl.paused);
 }
 
 function setVolume(val) {
@@ -619,9 +631,9 @@ function _setPlayState(playing) {
 
 function _setPlayBtnEnabled(enabled) {
   if (!elPlayBtn) return;
-  elPlayBtn.disabled        = !enabled;
-  elPlayBtn.style.opacity   = enabled ? '1' : '0.45';
-  elPlayBtn.style.cursor    = enabled ? 'pointer' : 'wait';
+  elPlayBtn.disabled      = !enabled;
+  elPlayBtn.style.opacity = enabled ? '1' : '0.45';
+  elPlayBtn.style.cursor  = enabled ? 'pointer' : 'wait';
 }
 
 // ─────────────────────────────────────────────────────────
@@ -654,7 +666,7 @@ function _hideVeil() {
 // ─────────────────────────────────────────────────────────
 // MISC HELPERS
 // ─────────────────────────────────────────────────────────
-function _val(id) { return (document.getElementById(id)?.value || '').trim(); }
+function _val(id)  { return (document.getElementById(id)?.value || '').trim(); }
 function _fmt(sec) {
   const s = Math.floor(sec), m = Math.floor(s / 60);
   return `${m}:${String(s % 60).padStart(2, '0')}`;
