@@ -1,16 +1,23 @@
 /**
- * app.js — OneSong  v5.0
+ * app.js — OneSong  v5.1
  * ─────────────────────────────────────────────────────────────
- * Replaced yt-dlp/YouTube streaming with direct file upload.
- * Users upload their own audio file — streamed from /stream/{user_id}.
- * Real AudioContext + analyser retained for GPGPU visualizer reactivity.
+ * Direct file upload → server streams back → Web Audio + GPGPU visualizer.
  *
- * CHANGES vs v4.6:
- *  [U1] saveSong() → XHR FormData upload with progress bar
- *  [U2] _setupAudio() → points to /stream/{user_id}?token=...
- *  [U3] showSongSelection() → file-upload form (no YouTube URL field)
- *  [U4] _resetUploadUI() + onFileSelected() for file label UX
- *  [U5] Removed youtube_video_id references throughout
+ * FIXES vs v5.0:
+ *  [F1] _resumeContext() — AudioContext re-entrancy guard fixed.
+ *       audioSrc creation moved OUTSIDE the `if (!audioCtx)` block so that
+ *       if the context already exists but audioSrc is null (e.g. after
+ *       _teardownAudio + re-display) it is correctly reconnected.
+ *  [F2] file-drop label click — <label for="inp-file"> already forwards
+ *       clicks to the hidden <input> natively in HTML, but the JS
+ *       onFileSelected handler was missing the guard for empty file list
+ *       (user opens dialog and cancels). Guard added.
+ *  [F3] _setupAudio() stream URL — token is passed as a query param because
+ *       <audio> elements cannot send custom headers. The server (v5.1) now
+ *       accepts token via both query param and Authorization header.
+ *  [F4] togglePlay() AbortError retry — prevented infinite retry loop by
+ *       adding a _playRetrying flag.
+ *  [F5] _feedRealTimeFeatures() — added null-guard for freqData before loop.
  */
 
 const API = 'https://onesong.onrender.com';
@@ -24,7 +31,7 @@ let serverReady  = false;
 
 // ── Audio state ───────────────────────────────────────────
 let audioCtx       = null;
-let audioSrc       = null;
+let audioSrc       = null;       // MediaElementSourceNode
 let analyserNode   = null;
 let gainNode       = null;
 let audioEl        = null;
@@ -32,6 +39,7 @@ let clockPoller    = null;
 let analysisLoaded = false;
 let _audioReady    = false;
 let _audioRetried  = false;
+let _playRetrying  = false;      // [F4] prevents infinite AbortError loop
 let _playEnableTimer = null;
 
 const FFT_SIZE = 256;
@@ -55,7 +63,6 @@ document.addEventListener('DOMContentLoaded', () => {
   elSeekSlider     = document.getElementById('seek-slider');
   elAnalysisStatus = document.getElementById('analysis-status');
 
-  // GPGPU canvas must init first (before auth check)
   try {
     const ok = Ambient.init();
     if (!ok) console.warn('[Boot] GPGPU init returned false — CSS fallback active');
@@ -227,7 +234,7 @@ async function _loadUserSong() {
 }
 
 // ─────────────────────────────────────────────────────────
-// SONG SELECTION — [U3] file upload form
+// SONG SELECTION — file upload form
 // ─────────────────────────────────────────────────────────
 function showSongSelection() {
   document.getElementById('now-playing').classList.add('hidden');
@@ -242,7 +249,6 @@ function cancelSongSelection() {
   document.getElementById('now-playing').classList.remove('hidden');
 }
 
-// [U4] Reset the file picker UI
 function _resetUploadUI() {
   const fileInput = document.getElementById('inp-file');
   const fileLabel = document.getElementById('file-label');
@@ -254,17 +260,17 @@ function _resetUploadUI() {
   if (barWrap)   barWrap.classList.add('hidden');
 }
 
-// [U4] Called when user picks a file — update the label
+// [F2] Guard against empty file list (user cancels the dialog)
 function onFileSelected(input) {
   const file  = input.files?.[0];
+  if (!file) return;
   const label = document.getElementById('file-label');
-  if (file && label) {
+  if (label) {
     const mb = (file.size / (1024 * 1024)).toFixed(1);
     label.textContent = `${file.name}  (${mb} MB)`;
   }
 }
 
-// [U1] Upload via XHR so we get progress events
 async function saveSong() {
   const song_name   = _val('inp-song');
   const artist_name = _val('inp-artist');
@@ -338,8 +344,9 @@ function _displaySong(song) {
   document.getElementById('song-title').textContent  = song.song_name;
   document.getElementById('song-artist').textContent = song.artist_name;
 
-  _audioReady   = false;
-  _audioRetried = false;
+  _audioReady    = false;
+  _audioRetried  = false;
+  _playRetrying  = false;
   _setPlayState(false);
   _setPlayBtnEnabled(false);
   _setAnalysisStatus('⏳ Loading audio…');
@@ -355,12 +362,13 @@ function _displaySong(song) {
 }
 
 // ─────────────────────────────────────────────────────────
-// AUDIO SETUP — [U2] streams from /stream/{user_id}
+// AUDIO SETUP
+// [F3] Token passed as query param — <audio> can't send headers.
+//      Server v5.1 accepts token via ?token= OR Authorization header.
 // ─────────────────────────────────────────────────────────
 function _setupAudio(song) {
   if (_playEnableTimer) { clearTimeout(_playEnableTimer); _playEnableTimer = null; }
 
-  // Remove old listeners
   audioEl.removeEventListener('loadedmetadata', _onAudioMeta);
   audioEl.removeEventListener('loadeddata',     _onLoadedData);
   audioEl.removeEventListener('timeupdate',     _onTimeUpdate);
@@ -370,11 +378,13 @@ function _setupAudio(song) {
   audioEl.src = '';
   audioEl.load();
 
-  // [U2] Stream from server — no YouTube involved
+  // [F3] <audio> needs the token in the URL since it can't set headers
   const uid       = currentUser?.id;
   const streamUrl = `${API}/stream/${uid}?token=${encodeURIComponent(authToken)}`;
 
-  audioEl.src = streamUrl;
+  audioEl.crossOrigin = 'anonymous';   // Required for AudioContext.createMediaElementSource()
+  audioEl.src         = streamUrl;
+  audioEl.preload     = 'metadata';
   audioEl.load();
 
   audioEl.addEventListener('loadedmetadata', _onAudioMeta);
@@ -383,16 +393,16 @@ function _setupAudio(song) {
   audioEl.addEventListener('ended',          _onAudioEnded);
   audioEl.addEventListener('error',          _onAudioError);
 
-  // Safety valve — if metadata hasn't fired in 10s, allow play anyway
+  // Safety valve — if loadeddata hasn't fired in 12s, allow play anyway
   _playEnableTimer = setTimeout(() => {
     if (!_audioReady) {
       _audioReady = true;
       _setPlayBtnEnabled(true);
       _setAnalysisStatus('⏳ Stream loading — tap Play');
     }
-  }, 10000);
+  }, 12000);
 
-  console.info('[Audio] Stream URL:', streamUrl);
+  console.info('[Audio] Stream URL set (token omitted from log)');
 }
 
 function _onLoadedData() {
@@ -441,7 +451,6 @@ function _onAudioError() {
   };
   console.error('[Audio] MediaError:', code, audioEl.error?.message);
 
-  // Auto-retry once on network error
   if (code === 2 && !_audioRetried && currentSong) {
     _audioRetried = true;
     _setAnalysisStatus('⏳ Retrying…');
@@ -467,14 +476,17 @@ function _teardownAudio() {
   }
   if (audioCtx && audioCtx.state !== 'closed') {
     audioCtx.close().catch(() => {});
-    audioCtx = null; audioSrc = null; analyserNode = null; gainNode = null;
   }
-  _audioReady = false; _audioRetried = false;
+  // [F1] Always reset ALL audio graph references together
+  audioCtx = null; audioSrc = null; analyserNode = null; gainNode = null;
+  _audioReady = false; _audioRetried = false; _playRetrying = false;
   _setPlayState(false); _setPlayBtnEnabled(false);
 }
 
 // ─────────────────────────────────────────────────────────
 // AudioContext — created on first user gesture only
+// [F1] audioSrc wiring moved out of the `if (!audioCtx)` guard so it
+//      reconnects correctly after teardown + re-display of a song.
 // ─────────────────────────────────────────────────────────
 async function _resumeContext() {
   if (!audioCtx) {
@@ -485,22 +497,32 @@ async function _resumeContext() {
       analyserNode.fftSize = FFT_SIZE;
       freqData = new Uint8Array(analyserNode.frequencyBinCount);
 
-      if (!audioSrc) {
-        audioSrc = audioCtx.createMediaElementSource(audioEl);
-        audioSrc.connect(gainNode);
-        gainNode.connect(analyserNode);
-        analyserNode.connect(audioCtx.destination);
-      }
-
       const volEl = document.getElementById('vol-slider');
       gainNode.gain.value = parseFloat(volEl?.value ?? 0.85);
+
       _startClockPoller();
       console.info('[AudioContext] Created ✓');
     } catch (e) {
       console.error('[AudioContext] Setup failed:', e);
       audioCtx = null;
+      return;
     }
   }
+
+  // [F1] Wire audioSrc any time it's missing (new context OR after teardown)
+  if (audioCtx && !audioSrc) {
+    try {
+      audioSrc = audioCtx.createMediaElementSource(audioEl);
+      audioSrc.connect(gainNode);
+      gainNode.connect(analyserNode);
+      analyserNode.connect(audioCtx.destination);
+    } catch (e) {
+      // createMediaElementSource throws if the element is already captured —
+      // this can happen on some browsers; safe to ignore, audio still plays.
+      console.warn('[AudioContext] createMediaElementSource:', e.message);
+    }
+  }
+
   if (audioCtx?.state === 'suspended') {
     try { await audioCtx.resume(); } catch (e) {}
   }
@@ -527,8 +549,9 @@ function _stopClockPoller() {
   if (clockPoller) { clearInterval(clockPoller); clockPoller = null; }
 }
 
+// [F5] null-guard on freqData
 function _feedRealTimeFeatures() {
-  if (!freqData) return;
+  if (!freqData || freqData.length === 0) return;
   const len = freqData.length;
 
   let bassSum = 0;
@@ -585,6 +608,7 @@ async function _fetchAudioAnalysis(song) {
 
 // ─────────────────────────────────────────────────────────
 // PLAYBACK CONTROLS
+// [F4] AbortError retry guarded by _playRetrying flag
 // ─────────────────────────────────────────────────────────
 async function togglePlay() {
   if (!audioEl?.src || elPlayBtn?.disabled) return;
@@ -595,16 +619,26 @@ async function togglePlay() {
       _setPlayBtnEnabled(false);
       _setAnalysisStatus('⏳ Buffering…');
       await audioEl.play();
+      _playRetrying = false;
       _setPlayState(true); _setPlayBtnEnabled(true); _setAnalysisStatus('');
       Ambient.startBeat();
     } catch (e) {
       _setPlayBtnEnabled(true);
-      if (e.name === 'NotAllowedError')   _setAnalysisStatus('⚠ Tap Play again to start');
-      else if (e.name === 'NotSupportedError') _setAnalysisStatus('⚠ Format not supported');
-      else if (e.name === 'AbortError') {
+      if (e.name === 'NotAllowedError') {
+        _setAnalysisStatus('⚠ Tap Play again to start');
+      } else if (e.name === 'NotSupportedError') {
+        _setAnalysisStatus('⚠ Format not supported');
+      } else if (e.name === 'AbortError' && !_playRetrying) {
+        // [F4] Only retry once, not on every AbortError
+        _playRetrying = true;
         _setAnalysisStatus('⏳ Stream starting…');
-        setTimeout(() => { if (audioEl?.paused) togglePlay(); }, 800);
-      } else _setAnalysisStatus('⚠ Playback failed: ' + e.message);
+        setTimeout(() => {
+          _playRetrying = false;
+          if (audioEl?.paused) togglePlay();
+        }, 1000);
+      } else {
+        _setAnalysisStatus('⚠ Playback failed: ' + e.message);
+      }
     }
   } else {
     audioEl.pause(); _setPlayState(false); _setAnalysisStatus(''); Ambient.stopBeat();

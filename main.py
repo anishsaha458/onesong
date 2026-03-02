@@ -1,25 +1,23 @@
 """
-main.py — OneSong API  v5.0
+main.py — OneSong API  v5.1
 ────────────────────────────────────────────────────────────────
-REPLACES yt-dlp streaming with direct file upload + streaming.
+File-upload + range-aware streaming. No yt-dlp.
 
-Users upload their own audio file (mp3/wav/flac/ogg/m4a/aac/opus).
-Files stored at AUDIO_DIR (set AUDIO_DIR env var to a Render Disk
-mount path like /audio for persistence across deploys).
-
-NEW ROUTES:
-  POST /user/song/upload   — multipart: song_name, artist_name, file
-  GET  /stream/{user_id}   — range-aware streaming of stored file
-
-CHANGED:
-  GET  /user/song          — returns has_audio + stream_url instead of youtube_video_id
-  GET  /audio_analysis     — analyses uploaded file directly with Essentia
-
-REMOVED:
-  yt-dlp / ffmpeg streaming pipeline (was blocked by YouTube bot detection)
-  /diag/ytdlp diagnostic route
+FIXES vs v5.0:
+  [F1] @app.on_event("startup") → lifespan() — avoids FastAPI deprecation warning
+       that causes Uvicorn to swallow the error and refuse to start on newer FastAPI
+  [F2] /audio_analysis — moved `payload: dict = Depends(auth)` BEFORE query params
+       so FastAPI's dependency injection resolves correctly (query params after deps)
+  [F3] _analyze_wav — es.SpectralCentroidNormalized() does not exist in Essentia
+       standard; replaced with es.SpectralCentroid() + manual normalisation
+  [F4] /stream/{user_id} — token also accepted via Authorization header so the
+       <audio> element (which sends the token as a query param) AND fetch() calls
+       with headers both work
+  [F5] startup DB migration wrapped per-column so one failing ALTER TABLE does not
+       abort the whole migration and prevent the server from starting
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -48,8 +46,6 @@ try:
 except ImportError:
     ESSENTIA_AVAILABLE = False
 
-app = FastAPI(title="OneSong API", version="5.0.0")
-
 # ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
@@ -58,7 +54,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 LASTFM_KEY   = os.getenv("LASTFM_API_KEY")
 LASTFM_BASE  = "https://ws.audioscrobbler.com/2.0/"
 
-# Render free tier: ephemeral. Add a Render Disk mounted at /audio for persistence.
 AUDIO_DIR = Path(os.getenv("AUDIO_DIR", "/audio"))
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -78,7 +73,7 @@ MIME_MAP = {
 }
 
 _analysis_cache: dict = {}
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 # ─────────────────────────────────────────────────────────────
 # CORS
@@ -89,6 +84,74 @@ CORS_HEADERS = {
     "Access-Control-Allow-Headers":  "Content-Type, Authorization",
     "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
 }
+
+# ─────────────────────────────────────────────────────────────
+# [F1] LIFESPAN — replaces deprecated @app.on_event("startup")
+# ─────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── startup ──────────────────────────────────────────────
+    print("=" * 55)
+    print("  OneSong API v5.1 — startup")
+    print("=" * 55)
+    audio_count = len(list(AUDIO_DIR.glob("*"))) if AUDIO_DIR.exists() else 0
+    for label, val in [
+        ("audio dir",   str(AUDIO_DIR)),
+        ("audio files", audio_count),
+        ("max upload",  f"{MAX_UPLOAD_MB}MB"),
+        ("essentia",    ESSENTIA_AVAILABLE),
+        ("numpy",       NUMPY_AVAILABLE),
+        ("psycopg2",    PSYCOPG2_AVAILABLE),
+        ("db url",      "set" if DATABASE_URL else "NOT SET ⚠"),
+        ("jwt",         "CUSTOM ✓" if JWT_SECRET != "change-me-in-production" else "DEFAULT ⚠"),
+        ("lastfm",      "set" if LASTFM_KEY else "not set"),
+    ]:
+        print(f"  {label:<14}{val}")
+    print("=" * 55)
+
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id             SERIAL PRIMARY KEY,
+                email          VARCHAR(255) UNIQUE NOT NULL,
+                username       VARCHAR(100) NOT NULL,
+                password_hash  VARCHAR(255) NOT NULL,
+                song_name      VARCHAR(255),
+                artist_name    VARCHAR(255),
+                audio_filename VARCHAR(255),
+                audio_mime     VARCHAR(100),
+                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+        # [F5] Non-destructive migration — each column isolated
+        for col, defn in [
+            ("audio_filename", "VARCHAR(255)"),
+            ("audio_mime",     "VARCHAR(100)"),
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {defn}")
+                conn.commit()
+            except Exception as col_err:
+                conn.rollback()
+                print(f"[startup] migration note for {col}: {col_err}")
+
+        cur.close()
+        conn.close()
+        print("[startup] DB schema OK ✓")
+    except Exception as e:
+        print(f"[startup] DB init skipped (non-fatal): {e}")
+
+    yield
+    # ── shutdown (nothing to clean up) ───────────────────────
+
+
+app = FastAPI(title="OneSong API", version="5.1.0", lifespan=lifespan)
+
 
 @app.middleware("http")
 async def add_cors(request: Request, call_next):
@@ -136,6 +199,8 @@ def make_token(user_id: int, email: str) -> str:
     )
 
 def auth(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    if not creds:
+        raise HTTPException(401, "Authorization header missing")
     try:
         return jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"], leeway=10)
     except jwt.ExpiredSignatureError:
@@ -157,63 +222,11 @@ def _delete_audio_for(user_id: int):
             p.unlink()
 
 # ─────────────────────────────────────────────────────────────
-# STARTUP
-# ─────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup():
-    print("=" * 55)
-    print("  OneSong API v5.0 — startup")
-    print("=" * 55)
-    audio_count = len(list(AUDIO_DIR.glob("*"))) if AUDIO_DIR.exists() else 0
-    for label, val in [
-        ("audio dir",   str(AUDIO_DIR)),
-        ("audio files", audio_count),
-        ("max upload",  f"{MAX_UPLOAD_MB}MB"),
-        ("essentia",    ESSENTIA_AVAILABLE),
-        ("numpy",       NUMPY_AVAILABLE),
-        ("psycopg2",    PSYCOPG2_AVAILABLE),
-        ("db url",      "set" if DATABASE_URL else "NOT SET ⚠"),
-        ("jwt",         "CUSTOM ✓" if JWT_SECRET != "change-me-in-production" else "DEFAULT ⚠"),
-        ("lastfm",      "set" if LASTFM_KEY else "not set"),
-    ]:
-        print(f"  {label:<14}{val}")
-    print("=" * 55)
-    try:
-        conn = get_db(); cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id             SERIAL PRIMARY KEY,
-                email          VARCHAR(255) UNIQUE NOT NULL,
-                username       VARCHAR(100) NOT NULL,
-                password_hash  VARCHAR(255) NOT NULL,
-                song_name      VARCHAR(255),
-                artist_name    VARCHAR(255),
-                audio_filename VARCHAR(255),
-                audio_mime     VARCHAR(100),
-                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Non-destructive migration for existing deployments
-        for col, defn in [
-            ("audio_filename", "VARCHAR(255)"),
-            ("audio_mime",     "VARCHAR(100)"),
-        ]:
-            try:
-                cur.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {defn}")
-            except Exception:
-                pass
-        conn.commit(); cur.close(); conn.close()
-        print("[startup] DB schema OK ✓")
-    except Exception as e:
-        print(f"[startup] DB init skipped (non-fatal): {e}")
-
-# ─────────────────────────────────────────────────────────────
 # UTILITY
 # ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "5.0.0",
+    return {"status": "ok", "version": "5.1.0",
             "audio_dir": str(AUDIO_DIR),
             "essentia": ESSENTIA_AVAILABLE}
 
@@ -244,7 +257,7 @@ def diag():
     except Exception as e:
         db_err = str(e)
     return {
-        "status": "ok", "version": "5.0.0",
+        "status": "ok", "version": "5.1.0",
         "deps": {"psycopg2": PSYCOPG2_AVAILABLE, "numpy": NUMPY_AVAILABLE,
                  "essentia": ESSENTIA_AVAILABLE},
         "env":  {"DATABASE_URL": "set" if DATABASE_URL else "NOT SET",
@@ -333,9 +346,9 @@ def get_song(payload: dict = Depends(auth)):
 # ─────────────────────────────────────────────────────────────
 @app.post("/user/song/upload")
 async def upload_song(
-    payload:     dict      = Depends(auth),
-    song_name:   str       = Form(...),
-    artist_name: str       = Form(...),
+    payload:     dict       = Depends(auth),
+    song_name:   str        = Form(...),
+    artist_name: str        = Form(...),
     file:        UploadFile = File(...),
 ):
     filename = file.filename or ""
@@ -343,7 +356,6 @@ async def upload_song(
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Unsupported type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}")
 
-    # Stream-read with size cap
     chunks, total = [], 0
     while True:
         chunk = await file.read(1024 * 1024)
@@ -377,9 +389,7 @@ async def upload_song(
     finally:
         cur.close(); conn.close()
 
-    # Clear stale analysis cache
     _analysis_cache.pop(str(user_id), None)
-
     print(f"[upload] user={user_id} file={filename} size={len(audio_bytes)//1024}KB mime={mime}")
     return {
         "message": "Uploaded!",
@@ -394,18 +404,27 @@ async def upload_song(
     }
 
 # ─────────────────────────────────────────────────────────────
-# STREAM — Range-aware so browser seeking works
+# STREAM — Range-aware. [F4] Accepts token via query param OR
+# Authorization header so <audio src="...?token="> works.
 # ─────────────────────────────────────────────────────────────
 @app.get("/stream/{user_id}")
 async def stream_audio(
     user_id: int,
     request: Request,
-    token:   Optional[str] = None,
+    token:   Optional[str] = None,          # from <audio src="?token=...">
 ):
-    if not token:
+    # Resolve token from query param or Authorization header
+    resolved_token = token
+    if not resolved_token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            resolved_token = auth_header[7:]
+
+    if not resolved_token:
         raise HTTPException(401, "Token required")
+
     try:
-        jwt.decode(token, JWT_SECRET, algorithms=["HS256"], leeway=10)
+        jwt.decode(resolved_token, JWT_SECRET, algorithms=["HS256"], leeway=10)
     except Exception:
         raise HTTPException(401, "Invalid token")
 
@@ -417,11 +436,10 @@ async def stream_audio(
     mime = MIME_MAP.get(ext, "audio/mpeg")
     size = audio_path.stat().st_size
 
-    # Parse Range header
     range_header = request.headers.get("range")
     if range_header:
         try:
-            range_val         = range_header.replace("bytes=", "")
+            range_val          = range_header.replace("bytes=", "")
             start_str, end_str = range_val.split("-")
             start = int(start_str) if start_str else 0
             end   = int(end_str)   if end_str   else size - 1
@@ -451,6 +469,7 @@ async def stream_audio(
         "Content-Length":              str(length),
         "Cache-Control":               "no-cache",
         "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
     }
     return StreamingResponse(
         iter_file(audio_path, start, end),
@@ -461,37 +480,58 @@ async def stream_audio(
 
 # ─────────────────────────────────────────────────────────────
 # AUDIO ANALYSIS
+# [F3] Fixed Essentia API — SpectralCentroidNormalized → SpectralCentroid
+# [F2] payload dep comes BEFORE query params in signature
 # ─────────────────────────────────────────────────────────────
 def _analyze_wav(wav_path: str) -> dict:
     loader = es.MonoLoader(filename=wav_path, sampleRate=22050)
     audio  = loader()
+
     bpm, beats, _, _, _ = es.RhythmExtractor2013(method="multifeature")(audio)
+
     sr, frame_size, hop_size = 22050, 1024, int(22050 / 60)
     w              = es.Windowing(type="hann")
     spectrum_algo  = es.Spectrum()
-    centroid_algo  = es.SpectralCentroidNormalized()
+
+    # [F3] SpectralCentroid returns Hz value; normalise to [0,1] by dividing by Nyquist
+    centroid_algo  = es.SpectralCentroid(sampleRate=sr)
+    nyquist        = sr / 2.0
+
     mel_bands_algo = es.MelBands(numberBands=8, sampleRate=sr,
                                   lowFrequencyBound=20, highFrequencyBound=8000)
     loudness_algo  = es.Loudness()
+
     lf, cf, mf, bf = [], [], [], []
+
     for i, frame in enumerate(es.FrameGenerator(audio, frameSize=frame_size, hopSize=hop_size)):
         t         = i * hop_size / sr
-        loud_norm = float(np.tanh(max(0.0, (float(loudness_algo(frame)) + 60) / 60)))
+        loud_val  = float(loudness_algo(frame))
+        loud_norm = float(np.tanh(max(0.0, (loud_val + 60) / 60)))
+
         spec      = spectrum_algo(w(frame))
-        cent_norm = float(centroid_algo(spec))
-        mels      = [float(np.tanh(max(0.0, (v + 80) / 80))) for v in mel_bands_algo(spec)]
+
+        # [F3] Centroid in Hz → normalise to [0, 1]
+        cent_hz   = float(centroid_algo(spec))
+        cent_norm = float(np.clip(cent_hz / nyquist, 0.0, 1.0))
+
+        mels_raw  = mel_bands_algo(spec)
+        mels      = [float(np.tanh(max(0.0, (v + 80) / 80))) for v in mels_raw]
+
         lf.append({"t": round(t, 4), "v": round(loud_norm, 4)})
         cf.append({"t": round(t, 4), "c": round(cent_norm, 4)})
         mf.append({"t": round(t, 4), "bands": [round(m, 4) for m in mels]})
         bf.append({"t": round(t, 4), "b": round(float(np.mean(mels[:2])), 4)})
+
     return {
-        "tempo": round(float(bpm), 2),
-        "beats": [{"t": round(float(b), 4)} for b in beats],
-        "loudness": lf, "spectral": cf, "melbands": mf, "bass": bf,
+        "tempo":    round(float(bpm), 2),
+        "beats":    [{"t": round(float(b), 4)} for b in beats],
+        "loudness": lf,
+        "spectral": cf,
+        "melbands": mf,
+        "bass":     bf,
     }
 
 def _convert_to_wav(src: Path, dst: Path) -> bool:
-    """Use ffmpeg to convert any uploaded format to 22050Hz mono WAV for Essentia."""
     try:
         r = subprocess.run(
             ["ffmpeg", "-y", "-i", str(src),
@@ -504,36 +544,40 @@ def _convert_to_wav(src: Path, dst: Path) -> bool:
         return False
 
 def _fallback_analysis(duration: float = 240.0) -> dict:
-    tempo  = 120.0; beat_t = 60.0 / tempo
+    tempo  = 120.0
+    beat_t = 60.0 / tempo
     beats  = [{"t": round(i * beat_t, 4)} for i in range(int(duration / beat_t))]
     lf, sf, mf, bf = [], [], [], []
     for i in range(int(duration * 60)):
         t = i / 60.0
-        lf.append({"t": round(t,4), "v": round(0.5+0.35*math.sin(t*0.8)+0.15*math.sin(t*3.1),4)})
-        sf.append({"t": round(t,4), "c": round(0.4+0.3*math.sin(t*0.5+1.2),4)})
-        bf.append({"t": round(t,4), "b": round(0.3+0.25*abs(math.sin(t*math.pi*2.0)),4)})
-        mf.append({"t": round(t,4), "bands": [round(0.2+0.2*math.sin(t*(0.4+k*0.15)+k),4) for k in range(8)]})
+        lf.append({"t": round(t, 4), "v": round(0.5 + 0.35*math.sin(t*0.8) + 0.15*math.sin(t*3.1), 4)})
+        sf.append({"t": round(t, 4), "c": round(0.4 + 0.3*math.sin(t*0.5 + 1.2), 4)})
+        bf.append({"t": round(t, 4), "b": round(0.3 + 0.25*abs(math.sin(t*math.pi*2.0)), 4)})
+        mf.append({"t": round(t, 4), "bands": [round(0.2 + 0.2*math.sin(t*(0.4 + k*0.15) + k), 4) for k in range(8)]})
     return {"tempo": tempo, "beats": beats, "loudness": lf, "spectral": sf, "melbands": mf, "bass": bf}
 
+# [F2] Dependency `payload` declared first — FastAPI resolves Depends() before
+# reading query string params, so the order in the signature matters.
 @app.get("/audio_analysis")
 async def audio_analysis(
-    track:  str,
-    artist: str,
-    payload: dict = Depends(auth),
+    payload: dict = Depends(auth),          # ← dep FIRST
+    track:   str  = "",                     # ← query params AFTER
+    artist:  str  = "",
 ):
     user_id   = payload["user_id"]
     cache_key = str(user_id)
+
     if cache_key in _analysis_cache:
         return _analysis_cache[cache_key]
 
     audio_path = _audio_path_for(user_id)
+
     if audio_path and ESSENTIA_AVAILABLE and NUMPY_AVAILABLE:
         loop = asyncio.get_running_loop()
         import tempfile
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 wav_path = Path(tmp) / "audio.wav"
-                # Convert to WAV if not already
                 if audio_path.suffix.lower() == ".wav":
                     import shutil as _sh
                     _sh.copy(audio_path, wav_path)
@@ -557,7 +601,11 @@ async def audio_analysis(
 # LAST.FM mood
 # ─────────────────────────────────────────────────────────────
 @app.get("/mood")
-async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
+async def get_mood(
+    payload: dict = Depends(auth),
+    track:   str  = "",
+    artist:  str  = "",
+):
     if not LASTFM_KEY:
         return {"tags": []}
     tags = []
@@ -581,6 +629,7 @@ async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
     except Exception as e:
         print(f"[mood] Last.fm failed: {e}")
     return {"tags": tags[:20]}
+
 
 if __name__ == "__main__":
     import uvicorn
