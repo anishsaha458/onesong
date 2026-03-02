@@ -86,11 +86,8 @@ async def add_cors(request: Request, call_next):
         response = await call_next(request)
     except Exception as exc:
         # FIX [H2]: CORS headers even on unhandled exceptions
-        return JSONResponse(
-            status_code=500,
-            content={"detail": str(exc)},
-            headers=CORS_HEADERS,
-        )
+        return Response(status_code=204, headers=CORS_HEADERS)
+        
     for k, v in CORS_HEADERS.items():
         response.headers[k] = v
     return response
