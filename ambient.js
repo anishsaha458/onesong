@@ -473,9 +473,9 @@ const Ambient = (() => {
     // UnrealBloomPass(resolution, strength, radius, threshold)
     bloomPass = new THREE.UnrealBloomPass(
       new THREE.Vector2(innerWidth, innerHeight),
-      0.9,    // strength  — boosted by bass at runtime
-      0.4,    // radius
-      0.0,    // threshold — low so dim particles still glow
+      0.7,    // strength  — boosted by bass at runtime
+      0.5,    // radius
+      0.2,    // threshold — low so dim particles still glow
     );
     composer.addPass(bloomPass);
   }
