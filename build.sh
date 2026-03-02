@@ -2,8 +2,14 @@
 # Exit on error
 set -o errexit
 
-# Install ffmpeg (Required for yt-dlp audio extraction)
-apt-get update && apt-get install -y ffmpeg
+# Install System Dependencies for Audio Processing & Essentia
+apt-get update && apt-get install -y \
+    ffmpeg \
+    libfftw3-dev \
+    libyaml-dev \
+    libsamplerate0-dev \
+    libtag1-dev \
+    libchromaprint-dev
 
 # Install Python dependencies
 pip install --upgrade pip
