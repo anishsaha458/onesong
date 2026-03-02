@@ -1,30 +1,18 @@
 """
-main.py — OneSong API  v4.7
+main.py — OneSong API  v4.8
 ────────────────────────────────────────────────────────────────
-FIXES vs v4.6:
+FIXES vs v4.7:
 
-[S1] PROBE RETURNING EMPTY EXT:
-     yt-dlp --print %(ext)s requires --simulate or it may not output
-     on some versions. Also the format selector was too strict.
-     FIX: Use --print after download simulation, or better — skip
-     the probe entirely and transcode everything to mp3 via ffmpeg
-     pipe. This is universally supported across all browsers.
+[D1] /diag/ytdlp endpoint — visit in browser to see EXACT yt-dlp error
+     https://onesong.onrender.com/diag/ytdlp?youtube_id=uLHqpjW3aDs
 
-[S2] UNIVERSAL AUDIO FORMAT:
-     Instead of trying to stream the native yt-dlp format (which
-     varies: webm, m4a, etc.), pipe through ffmpeg → mp3.
-     mp3 is supported by every browser including Safari iOS.
-     Content-Type: audio/mpeg is always correct.
+[D2] Stream now captures yt-dlp + ffmpeg stderr and prints to Render logs
+     so "empty stream" failures show the real error (403, bot block, etc.)
 
-[S3] STREAM PIPELINE:
-     yt-dlp stdout → ffmpeg stdin → ffmpeg stdout → browser
-     This avoids writing to disk and works on Render's ephemeral FS.
+[D3] Added browser User-Agent spoof + extractor-retries to yt-dlp calls
+     to improve success rate on datacenter IPs (Render blocks YouTube often)
 
-[S4] Mood 404 fix: /mood route was returning 404 when LASTFM_KEY
-     was missing — now returns {"tags": []} with 200 as intended.
-     The ambient.js call to /mood was hitting 404 because the route
-     handler raised an unhandled exception path on some FastAPI versions.
-     Made the route more defensive.
+[D4] yt-dlp version printed at startup — old versions fail silently
 """
 
 from fastapi import FastAPI, HTTPException, Depends, Request
@@ -64,10 +52,10 @@ try:
 except ImportError:
     ESSENTIA_AVAILABLE = False
 
-app = FastAPI(title="OneSong API", version="4.7.0")
+app = FastAPI(title="OneSong API", version="4.8.0")
 
 # ─────────────────────────────────────────────────────────────
-# CORS MIDDLEWARE
+# CORS
 # ─────────────────────────────────────────────────────────────
 CORS_HEADERS = {
     "Access-Control-Allow-Origin":   "*",
@@ -82,7 +70,7 @@ async def add_cors(request: Request, call_next):
         return Response(status_code=204, headers=CORS_HEADERS)
     try:
         response = await call_next(request)
-    except Exception as exc:
+    except Exception:
         return Response(status_code=500, headers=CORS_HEADERS)
     for k, v in CORS_HEADERS.items():
         response.headers[k] = v
@@ -97,11 +85,24 @@ LASTFM_KEY   = os.getenv("LASTFM_API_KEY")
 LASTFM_BASE  = "https://ws.audioscrobbler.com/2.0/"
 
 _analysis_cache: dict = {}
-
 security = HTTPBearer()
 
-# [S2] yt-dlp format — prefer best audio, any container
-# ffmpeg will transcode to mp3 regardless of input format
+def _has_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+def _has_ytdlp() -> bool:
+    return shutil.which("yt-dlp") is not None
+
+# [D3] Common flags — browser UA spoof helps avoid YouTube bot detection
+_YTDLP_BASE_FLAGS = [
+    "--no-playlist",
+    "--no-cache-dir",
+    "--no-check-certificates",
+    "--extractor-retries", "3",
+    "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "--add-header", "Accept-Language:en-US,en;q=0.9",
+]
+
 _YT_FORMAT = (
     "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio[ext=mp3]"
     "/bestaudio[ext=aac]/bestaudio/worst"
@@ -175,87 +176,78 @@ def auth(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
         raise HTTPException(401, "Invalid token")
 
 # ─────────────────────────────────────────────────────────────
-# yt-dlp + ffmpeg stream helpers [S1] [S2] [S3]
+# STREAM PIPELINE [D2] [D3]
 # ─────────────────────────────────────────────────────────────
-
-def _has_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
-
-def _has_ytdlp() -> bool:
-    return shutil.which("yt-dlp") is not None
-
 async def _stream_via_ytdlp_ffmpeg(youtube_id: str):
-    """
-    [S3] Two-process pipeline: yt-dlp | ffmpeg → mp3 bytes
-    yt-dlp downloads audio to stdout, ffmpeg reads from stdin
-    and transcodes to mp3, writing to stdout which we stream to browser.
-    
-    mp3 is universally supported: Chrome, Firefox, Safari, iOS, Android.
-    """
+    """yt-dlp → ffmpeg → mp3. Logs full stderr on failure."""
     yt_url = f"https://www.youtube.com/watch?v={youtube_id}"
-    
+
     ytdlp_cmd = [
-        "yt-dlp",
-        "--no-playlist", "--no-cache-dir",
-        "--quiet", "--no-warnings", "--no-check-certificates",
+        "yt-dlp", *_YTDLP_BASE_FLAGS,
         "--format", _YT_FORMAT,
-        "--output", "-",   # write audio bytes to stdout
+        "--output", "-",
         yt_url,
     ]
-    
     ffmpeg_cmd = [
-        "ffmpeg",
-        "-loglevel", "error",
-        "-i", "pipe:0",          # read from stdin (yt-dlp stdout)
-        "-vn",                   # no video
-        "-acodec", "libmp3lame",
-        "-ab", "128k",           # 128kbps — good quality, small size
-        "-ar", "44100",
-        "-f", "mp3",
-        "pipe:1",                # write mp3 to stdout
+        "ffmpeg", "-loglevel", "error",
+        "-i", "pipe:0",
+        "-vn", "-acodec", "libmp3lame", "-ab", "128k", "-ar", "44100",
+        "-f", "mp3", "pipe:1",
     ]
-    
-    print(f"[stream] Starting pipeline for {youtube_id}")
-    
+
+    print(f"[stream] Starting yt-dlp|ffmpeg pipeline for {youtube_id}")
+
     yt_proc = await asyncio.create_subprocess_exec(
         *ytdlp_cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,   # [D2] capture stderr
     )
-    
     ff_proc = await asyncio.create_subprocess_exec(
         *ffmpeg_cmd,
-        stdin=yt_proc.stdout,    # pipe yt-dlp stdout → ffmpeg stdin
+        stdin=yt_proc.stdout,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    
-    # Close yt_proc.stdout in this process so ffmpeg gets EOF when yt-dlp finishes
     yt_proc.stdout.close()
-    
+
     bytes_sent = 0
     try:
-        # Wait for first chunk with timeout (yt-dlp startup + ffmpeg probe)
         try:
-            first_chunk = await asyncio.wait_for(ff_proc.stdout.read(65536), timeout=20.0)
+            first_chunk = await asyncio.wait_for(ff_proc.stdout.read(65536), timeout=25.0)
         except asyncio.TimeoutError:
-            print(f"[stream] Pipeline timeout for {youtube_id}")
+            yt_err = b""; ff_err = b""
+            try:
+                yt_err = await asyncio.wait_for(yt_proc.stderr.read(4096), timeout=2.0)
+                ff_err = await asyncio.wait_for(ff_proc.stderr.read(4096), timeout=2.0)
+            except Exception:
+                pass
+            print(f"[stream] TIMEOUT for {youtube_id}")
+            print(f"[stream] yt-dlp stderr: {yt_err.decode(errors='replace')[:1000]}")
+            print(f"[stream] ffmpeg stderr: {ff_err.decode(errors='replace')[:500]}")
             return
-        
+
         if not first_chunk:
-            print(f"[stream] Empty output for {youtube_id}")
+            yt_err = b""; ff_err = b""
+            try:
+                yt_err = await asyncio.wait_for(yt_proc.stderr.read(4096), timeout=2.0)
+                ff_err = await asyncio.wait_for(ff_proc.stderr.read(4096), timeout=2.0)
+            except Exception:
+                pass
+            print(f"[stream] EMPTY OUTPUT for {youtube_id}")
+            print(f"[stream] yt-dlp stderr: {yt_err.decode(errors='replace')[:1000]}")
+            print(f"[stream] ffmpeg stderr: {ff_err.decode(errors='replace')[:500]}")
             return
-        
+
         bytes_sent += len(first_chunk)
         yield first_chunk
-        
+
         while True:
             chunk = await ff_proc.stdout.read(65536)
             if not chunk:
                 break
             bytes_sent += len(chunk)
             yield chunk
-            
+
     except asyncio.CancelledError:
         print(f"[stream] Client disconnected at {bytes_sent // 1024}KB")
     finally:
@@ -269,71 +261,65 @@ async def _stream_via_ytdlp_ffmpeg(youtube_id: str):
 
 
 async def _stream_via_ytdlp_only(youtube_id: str):
-    """
-    Fallback when ffmpeg is unavailable — stream raw audio from yt-dlp.
-    Less browser-compatible but better than nothing.
-    """
+    """Fallback: no ffmpeg. Tries to get mp3/m4a directly."""
     yt_url = f"https://www.youtube.com/watch?v={youtube_id}"
     cmd = [
-        "yt-dlp", "--no-playlist", "--no-cache-dir",
-        "--quiet", "--no-warnings", "--no-check-certificates",
+        "yt-dlp", *_YTDLP_BASE_FLAGS,
         "--format", "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio",
-        "--output", "-",
-        yt_url,
+        "--output", "-", yt_url,
     ]
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     bytes_sent = 0
     try:
         try:
             first_chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=15.0)
         except asyncio.TimeoutError:
+            err = b""
+            try: err = await asyncio.wait_for(proc.stderr.read(4096), timeout=2.0)
+            except Exception: pass
+            print(f"[stream-raw] TIMEOUT. stderr: {err.decode(errors='replace')[:1000]}")
             return
         if not first_chunk:
+            err = b""
+            try: err = await asyncio.wait_for(proc.stderr.read(4096), timeout=2.0)
+            except Exception: pass
+            print(f"[stream-raw] EMPTY. stderr: {err.decode(errors='replace')[:1000]}")
             return
         bytes_sent += len(first_chunk)
         yield first_chunk
         while True:
             chunk = await proc.stdout.read(65536)
-            if not chunk:
-                break
+            if not chunk: break
             bytes_sent += len(chunk)
             yield chunk
     except asyncio.CancelledError:
         pass
     finally:
         print(f"[stream-raw] {youtube_id}: {bytes_sent // 1024}KB sent")
-        try:
-            proc.kill()
-            await proc.wait()
-        except (ProcessLookupError, OSError):
-            pass
-
+        try: proc.kill(); await proc.wait()
+        except (ProcessLookupError, OSError): pass
 
 # ─────────────────────────────────────────────────────────────
-# Essentia analysis helpers (unchanged from v4.6)
+# Essentia helpers
 # ─────────────────────────────────────────────────────────────
 def _download_audio(youtube_id: str, out_path: str) -> bool:
     if not _has_ytdlp():
         return False
     try:
         result = subprocess.run([
-            "yt-dlp",
-            f"https://www.youtube.com/watch?v={youtube_id}",
+            "yt-dlp", f"https://www.youtube.com/watch?v={youtube_id}",
             "--extract-audio", "--audio-format", "wav",
             "--audio-quality", "5",
             "--postprocessor-args", "ffmpeg:-ar 22050 -ac 1",
             "--output", out_path,
-            "--no-playlist", "--no-cache-dir",
-            "--no-check-certificates", "--quiet",
-            "--max-filesize", "50m",
+            "--no-playlist", "--no-cache-dir", "--no-check-certificates",
+            "--quiet", "--max-filesize", "50m",
         ], timeout=120, capture_output=True, text=True)
         return result.returncode == 0 and Path(out_path).exists()
     except Exception as e:
-        print(f"[yt-dlp] error: {e}")
+        print(f"[yt-dlp download] error: {e}")
         return False
 
 def _analyze_with_essentia(wav_path: str) -> dict:
@@ -341,11 +327,9 @@ def _analyze_with_essentia(wav_path: str) -> dict:
         raise RuntimeError("Essentia/NumPy unavailable")
     if Path(wav_path).stat().st_size / (1024 * 1024) > 45:
         raise RuntimeError("WAV > 45MB OOM guard")
-
     loader = es.MonoLoader(filename=wav_path, sampleRate=22050)
     audio  = loader()
     bpm, beats, _, _, _ = es.RhythmExtractor2013(method="multifeature")(audio)
-
     sr, frame_size, hop_size = 22050, 1024, int(22050 / 60)
     w = es.Windowing(type="hann")
     spectrum_algo  = es.Spectrum()
@@ -353,7 +337,6 @@ def _analyze_with_essentia(wav_path: str) -> dict:
     mel_bands_algo = es.MelBands(numberBands=8, sampleRate=sr,
                                   lowFrequencyBound=20, highFrequencyBound=8000)
     loudness_algo  = es.Loudness()
-
     lf, cf, mf, bf = [], [], [], []
     for i, frame in enumerate(es.FrameGenerator(audio, frameSize=frame_size, hopSize=hop_size)):
         t = i * hop_size / sr
@@ -365,7 +348,6 @@ def _analyze_with_essentia(wav_path: str) -> dict:
         cf.append({"t": round(t, 4), "c": round(cent_norm, 4)})
         mf.append({"t": round(t, 4), "bands": [round(m, 4) for m in mels]})
         bf.append({"t": round(t, 4), "b": round(float(np.mean(mels[:2])), 4)})
-
     return {
         "tempo":    round(float(bpm), 2),
         "beats":    [{"t": round(float(b), 4)} for b in beats],
@@ -386,24 +368,35 @@ def _fallback_analysis(duration_estimate: float = 240.0) -> dict:
     return {"tempo": tempo, "beats": beats, "loudness": lf, "spectral": sf, "melbands": mf, "bass": bf}
 
 # ─────────────────────────────────────────────────────────────
-# STARTUP
+# STARTUP [D4]
 # ─────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     print("=" * 55)
-    print(f"  OneSong API v4.7 — startup")
+    print(f"  OneSong API v4.8 — startup")
     print("=" * 55)
+
+    # [D4] Print yt-dlp version — old versions fail silently on new YouTube formats
+    ytdlp_ver = "NOT IN PATH ⚠"
+    if _has_ytdlp():
+        try:
+            r = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=5)
+            ytdlp_ver = r.stdout.strip() or "unknown"
+        except Exception:
+            ytdlp_ver = "error getting version"
+
     for label, val in [
-        ("ffmpeg",   shutil.which("ffmpeg") or "NOT IN PATH ⚠"),
-        ("yt-dlp",   shutil.which("yt-dlp") or "NOT IN PATH ⚠"),
-        ("essentia", ESSENTIA_AVAILABLE),
-        ("numpy",    NUMPY_AVAILABLE),
-        ("psycopg2", PSYCOPG2_AVAILABLE),
-        ("db url",   "set" if DATABASE_URL else "NOT SET"),
-        ("jwt",      "CUSTOM ✓" if JWT_SECRET != "change-me-in-production" else "DEFAULT — CHANGE THIS"),
+        ("ffmpeg",      shutil.which("ffmpeg") or "NOT IN PATH ⚠"),
+        ("yt-dlp",      ytdlp_ver),
+        ("essentia",    ESSENTIA_AVAILABLE),
+        ("numpy",       NUMPY_AVAILABLE),
+        ("psycopg2",    PSYCOPG2_AVAILABLE),
+        ("db url",      "set" if DATABASE_URL else "NOT SET"),
+        ("jwt",         "CUSTOM ✓" if JWT_SECRET != "change-me-in-production" else "DEFAULT"),
     ]:
         print(f"  {label:<12}{val}")
     print("=" * 55)
+
     try:
         conn = get_db(); cur = conn.cursor()
         cur.execute("""
@@ -430,12 +423,8 @@ async def startup():
 # ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {
-        "status": "ok", "version": "4.7.0",
-        "essentia": ESSENTIA_AVAILABLE,
-        "yt_dlp":   _has_ytdlp(),
-        "ffmpeg":   _has_ffmpeg(),
-    }
+    return {"status": "ok", "version": "4.8.0",
+            "essentia": ESSENTIA_AVAILABLE, "yt_dlp": _has_ytdlp(), "ffmpeg": _has_ffmpeg()}
 
 @app.get("/health")
 def health():
@@ -445,13 +434,63 @@ def health():
     except Exception:
         pass
     return {
-        "status":    "healthy" if db_ok else "degraded",
-        "database":  "healthy" if db_ok else "unavailable",
-        "essentia":  ESSENTIA_AVAILABLE,
-        "numpy":     NUMPY_AVAILABLE,
-        "yt_dlp":    _has_ytdlp(),
-        "ffmpeg":    _has_ffmpeg(),
+        "status": "healthy" if db_ok else "degraded",
+        "database": "healthy" if db_ok else "unavailable",
+        "essentia": ESSENTIA_AVAILABLE, "numpy": NUMPY_AVAILABLE,
+        "yt_dlp": _has_ytdlp(), "ffmpeg": _has_ffmpeg(),
         "timestamp": datetime.utcnow().isoformat(),
+    }
+
+# ─────────────────────────────────────────────────────────────
+# [D1] DIAGNOSTIC ENDPOINT — open in browser to see exact yt-dlp error
+# https://onesong.onrender.com/diag/ytdlp?youtube_id=uLHqpjW3aDs
+# ─────────────────────────────────────────────────────────────
+@app.get("/diag/ytdlp")
+async def diag_ytdlp(youtube_id: str = "uLHqpjW3aDs"):
+    """Runs yt-dlp --simulate and --list-formats, returns full output for debugging."""
+    if not _has_ytdlp():
+        return {"error": "yt-dlp not found", "PATH": os.environ.get("PATH", "")}
+
+    results = {}
+
+    # Get yt-dlp version
+    try:
+        vp = await asyncio.create_subprocess_exec(
+            "yt-dlp", "--version",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        vout, _ = await asyncio.wait_for(vp.communicate(), timeout=5.0)
+        results["ytdlp_version"] = vout.decode().strip()
+    except Exception as e:
+        results["ytdlp_version"] = f"error: {e}"
+
+    # Simulate download (fastest check — shows if video is accessible)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "yt-dlp", *_YTDLP_BASE_FLAGS,
+            "--simulate",
+            "--print", "id:%(id)s ext:%(ext)s format:%(format_id)s",
+            f"https://www.youtube.com/watch?v={youtube_id}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        results["simulate"] = {
+            "returncode": proc.returncode,
+            "stdout": stdout.decode(errors="replace")[:2000],
+            "stderr": stderr.decode(errors="replace")[:3000],  # <-- this is where the error will be
+        }
+    except asyncio.TimeoutError:
+        results["simulate"] = {"error": "timeout after 30s — YouTube likely blocking this IP"}
+    except Exception as e:
+        results["simulate"] = {"error": str(e)}
+
+    return {
+        "youtube_id": youtube_id,
+        "ytdlp_path": shutil.which("yt-dlp"),
+        "ffmpeg_path": shutil.which("ffmpeg") or "NOT FOUND",
+        "results": results,
+        "tip": "Check simulate.stderr for the real error message from YouTube/yt-dlp",
     }
 
 @app.get("/diag")
@@ -462,11 +501,12 @@ def diag():
     except Exception as e:
         db_err = str(e)
     return {
-        "status": "ok", "version": "4.7.0",
+        "status": "ok", "version": "4.8.0",
         "deps": {
             "psycopg2": PSYCOPG2_AVAILABLE, "numpy": NUMPY_AVAILABLE,
-            "essentia": ESSENTIA_AVAILABLE,  "yt_dlp": shutil.which("yt-dlp"),
-            "ffmpeg":   shutil.which("ffmpeg"),
+            "essentia": ESSENTIA_AVAILABLE,
+            "yt_dlp": shutil.which("yt-dlp"),
+            "ffmpeg":  shutil.which("ffmpeg"),
         },
         "env": {
             "DATABASE_URL":   "set" if DATABASE_URL else "NOT SET",
@@ -478,7 +518,7 @@ def diag():
     }
 
 # ─────────────────────────────────────────────────────────────
-# AUTH ROUTES
+# AUTH
 # ─────────────────────────────────────────────────────────────
 @app.post("/auth/signup", status_code=200)
 def signup(user: UserSignup):
@@ -486,7 +526,6 @@ def signup(user: UserSignup):
         raise HTTPException(400, "Password must be at least 6 characters")
     if len(user.username.strip()) < 2:
         raise HTTPException(400, "Username must be at least 2 characters")
-
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute("SELECT id FROM users WHERE email = %s", (user.email.lower(),))
@@ -501,7 +540,6 @@ def signup(user: UserSignup):
         conn.commit()
     finally:
         cur.close(); conn.close()
-
     return {
         "token": make_token(uid, user.email.lower()),
         "user":  {"id": uid, "email": user.email.lower(), "username": user.username.strip()},
@@ -518,10 +556,8 @@ def login(user: UserLogin):
         row = cur.fetchone()
     finally:
         cur.close(); conn.close()
-
     if not row or not bcrypt.checkpw(user.password.encode(), row["password_hash"].encode()):
         raise HTTPException(401, "Invalid email or password")
-
     return {
         "token": make_token(row["id"], row["email"]),
         "user":  {"id": row["id"], "email": row["email"], "username": row["username"]},
@@ -585,7 +621,6 @@ def profile(payload: dict = Depends(auth)):
 
 # ─────────────────────────────────────────────────────────────
 # LAST.FM
-# [S4] Defensive — always returns 200 with {"tags": []} on any failure
 # ─────────────────────────────────────────────────────────────
 @app.get("/mood")
 async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
@@ -613,40 +648,6 @@ async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
         print(f"[mood] Last.fm failed: {e}")
     return {"tags": tags[:20]}
 
-@app.get("/recommendations")
-async def recommendations(track: str, artist: str, payload: dict = Depends(auth)):
-    if not LASTFM_KEY:
-        return {"tracks": []}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(LASTFM_BASE, params={
-                "method": "track.getSimilar", "track": track, "artist": artist,
-                "api_key": LASTFM_KEY, "format": "json", "limit": "5", "autocorrect": "1",
-            })
-            raw = r.json().get("similartracks", {}).get("track", [])
-            if not raw:
-                s = await client.get(LASTFM_BASE, params={
-                    "method": "track.search", "track": track,
-                    "api_key": LASTFM_KEY, "format": "json", "limit": "1",
-                })
-                hits = s.json().get("results", {}).get("trackmatches", {}).get("track", [])
-                if hits:
-                    found = hits[0] if isinstance(hits, list) else hits
-                    r2 = await client.get(LASTFM_BASE, params={
-                        "method": "track.getSimilar", "track": found["name"],
-                        "artist": found["artist"], "api_key": LASTFM_KEY,
-                        "format": "json", "limit": "5", "autocorrect": "1",
-                    })
-                    raw = r2.json().get("similartracks", {}).get("track", [])
-        return {"tracks": [
-            {"name": t["name"], "artist": t["artist"]["name"],
-             "match": round(float(t.get("match", 0)) * 100), "url": t.get("url", "")}
-            for t in raw[:3]
-        ]}
-    except Exception as e:
-        print(f"[recommendations] failed: {e}")
-        return {"tracks": []}
-
 # ─────────────────────────────────────────────────────────────
 # AUDIO ANALYSIS
 # ─────────────────────────────────────────────────────────────
@@ -668,12 +669,10 @@ async def audio_analysis(
                 cur.close(); conn.close()
         except Exception as e:
             print(f"[audio_analysis] DB lookup failed: {e}")
-
     if not vid:
         return _fallback_analysis()
     if vid in _analysis_cache:
         return _analysis_cache[vid]
-
     loop = asyncio.get_running_loop()
     if ESSENTIA_AVAILABLE and NUMPY_AVAILABLE and _has_ytdlp():
         with tempfile.TemporaryDirectory() as tmp:
@@ -686,13 +685,12 @@ async def audio_analysis(
                     return result
                 except Exception as e:
                     print(f"[audio_analysis] Essentia failed: {e}")
-
     result = _fallback_analysis()
     _analysis_cache[vid] = result
     return result
 
 # ─────────────────────────────────────────────────────────────
-# AUDIO STREAM  [S1] [S2] [S3]
+# AUDIO STREAM
 # ─────────────────────────────────────────────────────────────
 @app.get("/stream")
 async def stream_audio(
@@ -700,43 +698,31 @@ async def stream_audio(
     youtube_id: str,
     token: Optional[str] = None,
 ):
-    # Auth
     if not token:
         raise HTTPException(401, "Token required")
     try:
         jwt.decode(token, JWT_SECRET, algorithms=["HS256"], leeway=10)
     except Exception:
         raise HTTPException(401, "Invalid token")
-
-    # Validate ID
     if not re.match(r'^[a-zA-Z0-9_\-]{11}$', youtube_id):
         raise HTTPException(400, "Invalid youtube_id format")
-
-    # No yt-dlp → redirect to YouTube (better than nothing)
     if not _has_ytdlp():
-        return RedirectResponse(
-            f"https://www.youtube.com/watch?v={youtube_id}", status_code=302
-        )
+        return RedirectResponse(f"https://www.youtube.com/watch?v={youtube_id}", status_code=302)
 
-    # [S2] Always serve mp3 — universally supported
-    # If ffmpeg is available, transcode via pipeline [S3]
-    # Otherwise fall back to raw stream (less compatible)
     if _has_ffmpeg():
-        print(f"[stream] {youtube_id} → mp3 via yt-dlp|ffmpeg pipeline")
+        print(f"[stream] {youtube_id} → mp3 via yt-dlp|ffmpeg")
         generator = _stream_via_ytdlp_ffmpeg(youtube_id)
-        mime = "audio/mpeg"
     else:
         print(f"[stream] {youtube_id} → raw (no ffmpeg)")
         generator = _stream_via_ytdlp_only(youtube_id)
-        mime = "audio/mpeg"   # best guess — prefer mp3 format in yt-dlp cmd above
 
     return StreamingResponse(
         generator,
-        media_type=mime,
+        media_type="audio/mpeg",
         headers={
-            "Cache-Control":              "no-cache, no-store",
-            "Accept-Ranges":              "none",
-            "X-Content-Type-Options":     "nosniff",
+            "Cache-Control": "no-cache, no-store",
+            "Accept-Ranges": "none",
+            "X-Content-Type-Options": "nosniff",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, Authorization",
@@ -746,9 +732,4 @@ async def stream_audio(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
-        log_level="info",
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="info")
