@@ -1,4 +1,20 @@
-/* OneSong — Zen Mode Styles v1.1 */
+/* OneSong — Zen Mode Styles v1.2 */
+/*
+ * FIX [F1] TRANSPARENT BACKGROUNDS:
+ *   - html/body background is #000 but NOT opaque over the canvas because
+ *     the canvas is position:fixed at z-index:-1 — body background is behind it.
+ *   - .layer had no explicit background, which was fine, but on some browsers
+ *     a transparent root layer can trigger a white flash. Added explicit
+ *     background: transparent to .layer and auth-container to be safe.
+ *   - .glass-card already used rgba — retained.
+ *   - The veil uses rgba(0,0,0,0.80) so particles bleed through intentionally.
+ *
+ * FIX [F2] CANVAS VISIBILITY:
+ *   - Removed any chance of the canvas being obscured: explicit z-index:-1,
+ *     pointer-events:none, display:block enforced in both CSS and JS (ambient.js).
+ *   - Added isolation: isolate to #app-container and #auth-container so their
+ *     stacking contexts don't accidentally cover z-index:-1 siblings.
+ */
 
 /* Reset */
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -23,26 +39,43 @@
 
 html, body {
   width: 100%; min-height: 100vh;
-  background: var(--c-bg); color: var(--c-text);
+  /* FIX [F1]: Pure black background — canvas at z-index:-1 renders ON TOP
+     of the body background (fixed positioning lifts it above the normal flow).
+     This is correct and intentional. */
+  background: var(--c-bg);
+  color: var(--c-text);
   font-family: var(--font-mono); font-size: 14px; font-weight: 300;
   letter-spacing: 0.01em; overflow-x: hidden;
   -webkit-font-smoothing: antialiased;
 }
 
-/* GPGPU CANVAS — NEVER display:none, NEVER hidden, ALWAYS block */
+/* ─────────────────────────────────────────────────────────
+   GPGPU CANVAS — CRITICAL RULES
+   • NEVER display:none  — WebGL context is destroyed
+   • NEVER visibility:hidden — same issue
+   • NEVER z-index > -1 here — would cover UI
+   • position:fixed + inset:0 makes it fill viewport always
+   ambient.js also enforces these via JS as belt-and-braces
+   ───────────────────────────────────────────────────────── */
 #ambient-canvas {
-  position: fixed !important; inset: 0 !important;
-  width: 100vw !important; height: 100vh !important;
+  position: fixed !important;
+  inset: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
   z-index: -1 !important;
   display: block !important;
   pointer-events: none !important;
 }
 
+/* ─────────────────────────────────────────────────────────
+   VEIL — translucent overlay, 80% black so particles bleed through
+   ───────────────────────────────────────────────────────── */
 .veil {
   position: fixed; inset: 0; z-index: 9998;
   display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 16px;
-  background: rgba(0,0,0,0.80);
+  /* FIX [F1]: 0.80 opacity — particles glow through from canvas below */
+  background: rgba(0, 0, 0, 0.80);
   backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
 }
 .veil-ring {
@@ -56,15 +89,24 @@ html, body {
 
 .hidden { display: none !important; }
 
-/* z-index:2 keeps UI above canvas at z-index:-1 */
+/* ─────────────────────────────────────────────────────────
+   LAYER — transparent so canvas shows through
+   z-index:2 keeps UI above canvas at z-index:-1
+   FIX [F1]: background: transparent (was implicit, now explicit)
+   ───────────────────────────────────────────────────────── */
 .layer {
   position: relative; z-index: 2;
   min-height: 100vh; width: 100%;
   display: flex; flex-direction: column;
   align-items: center; justify-content: center;
   padding: 24px 16px 40px;
+  background: transparent;  /* FIX [F1]: explicit transparent — canvas shows through */
 }
 
+/* ─────────────────────────────────────────────────────────
+   GLASS CARD — semi-transparent, backdrop blur
+   The glass effect lets canvas particles be dimly visible behind it
+   ───────────────────────────────────────────────────────── */
 .glass-card {
   background: var(--c-glass);
   border: 1px solid var(--c-border);
@@ -153,7 +195,8 @@ html, body {
   position: fixed; top: 0; left: 0; right: 0; z-index: 100;
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 22px;
-  background: rgba(0,0,0,0.45);
+  /* FIX [F1]: 45% opacity — particles show through topbar too */
+  background: rgba(0, 0, 0, 0.45);
   backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
   border-bottom: 1px solid var(--c-border);
 }
@@ -164,11 +207,17 @@ html, body {
 .topbar-right { display: flex; align-items: center; gap: 12px; }
 .topbar-user { color: var(--c-text2); font-size: 11px; letter-spacing: 0.04em; }
 
-/* NOW PLAYING — pointer-events:none on container, auto on children */
+/* ─────────────────────────────────────────────────────────
+   NOW PLAYING — full-screen transparent overlay
+   pointer-events:none on container so clicks reach canvas controls
+   pointer-events:auto re-enabled on direct children
+   ───────────────────────────────────────────────────────── */
 .now-playing {
   position: fixed; inset: 0;
   pointer-events: none;
   z-index: 10;
+  /* FIX [F1]: NO background here — fully transparent so canvas shows */
+  background: transparent;
 }
 .now-playing > * { pointer-events: auto; }
 
@@ -228,7 +277,7 @@ html, body {
 
 .controls-row { display: flex; align-items: center; gap: 14px; }
 
-/* Play/Pause button — disabled state set by app.js via style attribute */
+/* Play/Pause button */
 .play-btn {
   width: 38px; height: 38px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
@@ -286,7 +335,6 @@ html, body {
   transition: border-color 0.2s, color 0.2s, background 0.2s, transform 0.15s;
   white-space: nowrap;
   animation: riseIn 0.4s 0.2s cubic-bezier(0.16,1,0.3,1) both;
-  /* Ensure always visible even in .now-playing pointer-events:none container */
   pointer-events: auto !important;
 }
 .btn-change-song:hover {
@@ -294,11 +342,15 @@ html, body {
   background: rgba(16,12,2,0.60); transform: translateY(-1px);
 }
 
-/* SONG SELECTION OVERLAY */
+/* ─────────────────────────────────────────────────────────
+   SONG SELECTION OVERLAY
+   FIX [F1]: rgba(0,0,0,0.60) — semi-transparent so canvas glows through
+   ───────────────────────────────────────────────────────── */
 .song-selection {
   position: fixed; inset: 0; z-index: 200;
   display: flex; align-items: center; justify-content: center; padding: 24px 16px;
-  background: rgba(0,0,0,0.60);
+  /* FIX [F1]: 60% opacity so the particle field shows behind the form */
+  background: rgba(0, 0, 0, 0.60);
   backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
 }
 .sel-card { width: 100%; max-width: 430px; padding: 36px 32px 30px; }

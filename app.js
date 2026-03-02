@@ -1,38 +1,23 @@
 /**
- * app.js — OneSong  v4.4
+ * app.js — OneSong  v4.5
  * ────────────────────────────────────────────────────────────
- * FIXES vs v4.3:
+ * FIXES vs v4.4:
  *
- * [G1] GPGPU + veil sequencing fix:
- *      Previously _bootAsync() called _showVeil('Waking up…') BEFORE
- *      Ambient.init(). The veil (z-index:9998) covered the canvas for
- *      the entire server ping duration — up to 65s on a cold Render start.
- *      FIX: Ambient.init() is called FIRST, synchronously, before the veil
- *      appears. Particles are visible from frame 1 even during the ping.
- *      The veil then overlays briefly during ping without blocking WebGL.
+ * [E1] DYNAMIC API URL:
+ *      Hardcoded 'https://onesong.onrender.com' caused "Cannot reach server"
+ *      when the frontend is served from the same origin as the backend (e.g.
+ *      a single Render service, or local dev). FIX: derive API from
+ *      window.location.origin so the JS always talks to the host it was
+ *      served from. Override by setting window.ONESONG_API before this script.
  *
- * [G2] Server ping timeout reduced to 30s and made non-blocking for auth.
- *      If the server is cold-starting, we show a status message but still
- *      allow the auth UI to appear. The ping result gates API calls only.
- *
- * [G3] _onAudioError now logs the full MediaError message alongside the code
- *      and attempts one automatic stream URL retry before showing error UI.
- *      This handles the case where yt-dlp's probe adds ~2s latency and the
- *      browser fires an error event on the initial empty-headers response.
- *
- * [G4] _setupAudio clears audioEl.src = '' and calls audioEl.load() before
- *      setting the new src, preventing the browser from re-using a stale
- *      cached stream URL from the previous song.
- *
- * [G5] togglePlay: if play() rejects with AbortError (src changed mid-play),
- *      we automatically retry once after 800ms rather than showing an error.
- *
- * [G6] _pingServer now uses a 30s timeout (was 65s). Cold Render starts
- *      take 30-50s; at 65s the AbortController fires but the veil has
- *      already been visible for over a minute which looks broken.
+ * [E2] All other fixes from v4.4 [G1–G6] retained unchanged.
  */
 
-const API = 'https://onesong.onrender.com';
+// FIX [E1]: Dynamic API base — works on Render, local, any domain.
+// To override (e.g. separate frontend/backend), set:
+//   <script>window.ONESONG_API = 'https://your-backend.onrender.com';</script>
+// BEFORE this script tag in index.html.
+const API = window.ONESONG_API || window.location.origin;
 
 // ── Global state ──────────────────────────────────────────
 let authToken    = null;
@@ -50,7 +35,7 @@ let audioEl        = null;
 let clockPoller    = null;
 let analysisLoaded = false;
 let _audioReady    = false;
-let _audioRetried  = false;          // FIX [G3]: retry flag
+let _audioRetried  = false;
 let _playEnableTimer = null;
 
 const FFT_SIZE = 256;
@@ -63,8 +48,6 @@ let elSeekSlider, elAnalysisStatus;
 // ─────────────────────────────────────────────────────────
 // BOOT
 // FIX [G1]: Ambient.init() runs FIRST, synchronously, BEFORE the veil.
-// The veil (rgba black overlay) was covering the canvas for 65s during
-// the server ping, making the app look frozen/black.
 // ─────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   audioEl          = document.getElementById('headless-audio');
@@ -77,7 +60,7 @@ document.addEventListener('DOMContentLoaded', () => {
   elSeekSlider     = document.getElementById('seek-slider');
   elAnalysisStatus = document.getElementById('analysis-status');
 
-  // FIX [G1]: GPGPU init before ANYTHING else — canvas is live from frame 1
+  // GPGPU init before ANYTHING else — canvas is live from frame 1
   try {
     const ok = Ambient.init();
     if (!ok) console.warn('[Boot] GPGPU init returned false — CSS fallback active');
@@ -87,7 +70,6 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Auth check runs synchronously from localStorage before ping completes.
-  // This means returning users see their song immediately.
   _checkAuthFromStorage();
 
   // Server ping + full auth verification run in background.
@@ -95,9 +77,7 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ─────────────────────────────────────────────────────────
-// FIX [G1]: Pre-check localStorage so returning users get instant UI.
-// If token exists, speculatively show app UI now; _bootAsync will verify
-// and log out if the token is invalid.
+// Pre-check localStorage so returning users get instant UI.
 // ─────────────────────────────────────────────────────────
 function _checkAuthFromStorage() {
   authToken = localStorage.getItem('authToken');
@@ -105,7 +85,6 @@ function _checkAuthFromStorage() {
   if (authToken && saved) {
     try { currentUser = JSON.parse(saved); } catch { currentUser = null; }
   }
-  // Show the appropriate UI immediately — don't wait for network
   if (authToken && currentUser) {
     _showApp();
   } else {
@@ -114,21 +93,18 @@ function _checkAuthFromStorage() {
 }
 
 async function _bootAsync() {
-  // Show veil with a TRANSLUCENT overlay — canvas glows through it.
-  // Veil background is rgba(0,0,0,0.80) per CSS — particles are still visible.
   _showVeil('Connecting…');
-  await _pingServer();  // FIX [G6]: 30s timeout
+  await _pingServer();
   _hideVeil();
-  _checkAuth();         // Now do full token verification
+  _checkAuth();
 }
 
 // ─────────────────────────────────────────────────────────
-// SERVER PING — FIX [G6]: 30s timeout, non-fatal
+// SERVER PING — 30s timeout, non-fatal
 // ─────────────────────────────────────────────────────────
 async function _pingServer() {
   try {
     const ctrl = new AbortController();
-    // FIX [G6]: 30s — long enough for Render cold start but not 65s
     const tid  = setTimeout(() => ctrl.abort(), 30000);
     const r    = await fetch(`${API}/health`, { signal: ctrl.signal });
     clearTimeout(tid);
@@ -141,7 +117,6 @@ async function _pingServer() {
     }
   } catch (e) {
     console.warn('[Boot] Server ping failed:', e.message);
-    // Non-fatal: show message briefly then continue to auth
     _showVeil('⚠ Server slow to start — trying anyway…', true);
     await new Promise(res => setTimeout(res, 2500));
   }
@@ -317,8 +292,8 @@ function _displaySong(song) {
   document.getElementById('song-title').textContent  = song.song_name;
   document.getElementById('song-artist').textContent = song.artist_name;
 
-  _audioReady  = false;
-  _audioRetried = false;   // FIX [G3]: reset retry flag for new song
+  _audioReady   = false;
+  _audioRetried = false;
   _setPlayState(false);
   _setPlayBtnEnabled(false);
   _setAnalysisStatus('⏳ Connecting to stream…');
@@ -335,7 +310,6 @@ function _displaySong(song) {
 
 // ─────────────────────────────────────────────────────────
 // AUDIO SETUP
-// FIX [G4]: clear stale src before setting new one
 // ─────────────────────────────────────────────────────────
 function _setupAudio(song) {
   if (!song.youtube_video_id) {
@@ -346,9 +320,6 @@ function _setupAudio(song) {
 
   if (_playEnableTimer) { clearTimeout(_playEnableTimer); _playEnableTimer = null; }
 
-  // FIX [G4]: fully reset the element before setting new src.
-  // Without this, the browser may reuse the previous stream's buffered data
-  // or fire stale events from the previous URL.
   audioEl.removeEventListener('loadedmetadata', _onAudioMeta);
   audioEl.removeEventListener('loadeddata',     _onLoadedData);
   audioEl.removeEventListener('timeupdate',     _onTimeUpdate);
@@ -356,8 +327,9 @@ function _setupAudio(song) {
   audioEl.removeEventListener('error',          _onAudioError);
   audioEl.pause();
   audioEl.src = '';
-  audioEl.load();   // FIX [G4]: force browser to release previous stream
+  audioEl.load();
 
+  // FIX [E1]: API is now dynamic — stream URL always points to correct host
   const streamUrl = `${API}/stream`
     + `?youtube_id=${encodeURIComponent(song.youtube_video_id)}`
     + `&token=${encodeURIComponent(authToken)}`;
@@ -371,8 +343,6 @@ function _setupAudio(song) {
   audioEl.addEventListener('ended',          _onAudioEnded);
   audioEl.addEventListener('error',          _onAudioError);
 
-  // 10s fallback: if loadeddata never fires (slow Render cold start),
-  // enable the play button so the user can try clicking it.
   _playEnableTimer = setTimeout(() => {
     if (!_audioReady) {
       console.warn('[Audio] loadeddata timeout — enabling play button');
@@ -423,7 +393,6 @@ function _onAudioEnded() {
   _setPlayState(false);
 }
 
-// FIX [G3]: log full error, attempt one automatic retry for transient failures
 function _onAudioError() {
   const err  = audioEl.error;
   const code = err ? err.code : 0;
@@ -436,9 +405,6 @@ function _onAudioError() {
   const msg = msgs[code] || `⚠ Audio error (code ${code})`;
   console.error('[Audio] MediaError:', code, err?.message, err?.MEDIA_ERR_SRC_NOT_SUPPORTED);
 
-  // FIX [G3]: for network errors (code 2) on first attempt, retry once.
-  // This handles the case where the yt-dlp probe added latency and the
-  // browser fired an error on an empty-headers initial response.
   if (code === 2 && !_audioRetried && currentSong?.youtube_video_id) {
     _audioRetried = true;
     console.info('[Audio] Retrying stream after network error…');
@@ -583,7 +549,7 @@ async function _fetchAudioAnalysis(song) {
       setTimeout(() => _setAnalysisStatus(''), 5000);
       console.info(`[Analysis] Loaded: ${bpm} BPM, ${beats} beats`);
     } else {
-      _setAnalysisStatus('');  // idle field mode — no status needed
+      _setAnalysisStatus('');
     }
   } catch (e) {
     console.info('[Analysis] unavailable:', e.message);
@@ -593,7 +559,6 @@ async function _fetchAudioAnalysis(song) {
 
 // ─────────────────────────────────────────────────────────
 // PLAYBACK CONTROLS
-// FIX [G5]: AbortError retries automatically after 800ms
 // ─────────────────────────────────────────────────────────
 async function togglePlay() {
   if (!audioEl || !audioEl.src) return;
@@ -618,7 +583,6 @@ async function togglePlay() {
       } else if (e.name === 'NotSupportedError') {
         _setAnalysisStatus('⚠ Audio format not supported');
       } else if (e.name === 'AbortError') {
-        // FIX [G5]: AbortError = src changed mid-play — retry automatically
         _setAnalysisStatus('⏳ Stream starting…');
         setTimeout(() => {
           if (audioEl && audioEl.paused) togglePlay();

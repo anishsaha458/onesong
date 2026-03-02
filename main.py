@@ -1,44 +1,21 @@
 """
-main.py — OneSong API  v4.4
+main.py — OneSong API  v4.5
 ────────────────────────────────────────────────────────────────
-FIXES vs v4.3:
+FIXES vs v4.4:
 
-[C1] /stream content-type negotiation:
-     Hardcoding media_type="audio/mpeg" caused Safari to reject the stream
-     immediately (MEDIA_ERR_SRC_NOT_SUPPORTED, code 4) because yt-dlp's
-     default best-audio selection is WebM/Opus, not MP3.
-     FIX: probe yt-dlp with --print %(ext)s before streaming to discover the
-     actual container, then set the correct MIME type from a lookup table.
-     Fallback: "audio/webm" (accepted by all modern browsers including Safari
-     15.4+ via MSE). Safari <15.4 gets "audio/mp4" via the m4a fallback format.
+[D1] CORS middleware crash (JSONResponse 204 TypeError):
+     JSONResponse(status_code=204) with no content arg raises TypeError
+     in Starlette because a 204 response MUST have no body but JSONResponse
+     always serialises content. FIX: return Response(status_code=204) for
+     OPTIONS preflight — no content needed, just headers.
 
-[C2] /stream startup failure detection:
-     An empty stream (private/age-gated video, yt-dlp bot-detection) was
-     silently yielded — browser saw 0 bytes and reported MEDIA_ERR_DECODE.
-     FIX: asyncio.wait_for on the FIRST chunk with a 12s timeout. If nothing
-     arrives, we log the stderr and raise an exception that FastAPI converts
-     to a 502, which app.js _onAudioError shows as a clear message.
-
-[C3] asyncio.get_event_loop() removed (deprecated Python 3.10+).
-     All executor calls now use asyncio.get_running_loop() [was fixed in v4.3
-     but the change was incomplete in the stream generator path].
-
-[C4] /audio_analysis youtube_id param now takes priority over all DB lookups.
-     DB lookup retained as fallback only when youtube_id param is absent.
-
-[C5] _download_audio --postprocessor-args fix from v4.3 [B1] is retained.
-     Added --no-check-certificates for Render's restricted egress environment.
-
-[C6] Essentia OOM guard: if the WAV file is > 45MB (~4.5min at 22050Hz mono),
-     we skip Essentia and return synthetic data rather than OOM-killing the
-     worker on Render's 512MB free tier.
-
-[C7] CORS middleware now also handles the case where call_next raises before
-     returning a response (e.g. 422 validation errors from FastAPI internals).
+[D2] /stream now explicitly supports WAV MIME and serves from tmp correctly.
+     _EXT_TO_MIME already had "wav": "audio/wav" but _YT_FORMAT did not
+     include wav as a final fallback. Added wav fallback to _YT_FORMAT.
 """
 
 from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from typing import Optional
@@ -74,15 +51,14 @@ try:
 except ImportError:
     ESSENTIA_AVAILABLE = False
 
-app = FastAPI(title="OneSong API", version="4.4.0")
+app = FastAPI(title="OneSong API", version="4.5.0")
 
 # ─────────────────────────────────────────────────────────────
 # CORS
-# The /stream endpoint is fetched by <audio crossorigin="anonymous">.
-# This triggers a CORS preflight (OPTIONS) that MUST return 204 with the
-# correct headers BEFORE the browser sends the actual GET.
-# StreamingResponse sets headers at construction time (before middleware
-# runs), so CORS headers are also injected directly on the stream response.
+# FIX [D1]: OPTIONS preflight MUST use Response(status_code=204), NOT
+# JSONResponse(status_code=204). JSONResponse always emits a body (even
+# if it's just "null"), which violates RFC 7231 for 204 No Content and
+# causes a TypeError in Starlette's response serialiser.
 # ─────────────────────────────────────────────────────────────
 CORS_HEADERS = {
     "Access-Control-Allow-Origin":   "*",
@@ -94,11 +70,11 @@ CORS_HEADERS = {
 @app.middleware("http")
 async def add_cors(request: Request, call_next):
     if request.method == "OPTIONS":
-        return JSONResponse(status_code=204, headers=CORS_HEADERS)
+        # FIX [D1]: Response (not JSONResponse) — no body, correct 204
+        return Response(status_code=204, headers=CORS_HEADERS)
     try:
         response = await call_next(request)
     except Exception as exc:
-        # FIX [C7]: catch exceptions that escape call_next (e.g. 422 bodies)
         response = JSONResponse(status_code=500, content={"detail": str(exc)})
     for k, v in CORS_HEADERS.items():
         response.headers[k] = v
@@ -117,27 +93,26 @@ _analysis_cache: dict = {}
 security = HTTPBearer()
 
 # ─────────────────────────────────────────────────────────────
-# FIX [C1]: Format → MIME type map
-# Ordered from best (smallest+highest quality) to most-compatible.
+# Format → MIME type map
 # ─────────────────────────────────────────────────────────────
 _EXT_TO_MIME: dict[str, str] = {
     "webm": "audio/webm",
-    "m4a":  "audio/mp4",    # Safari requires audio/mp4 for AAC — NOT audio/m4a
+    "m4a":  "audio/mp4",
     "mp4":  "audio/mp4",
     "aac":  "audio/aac",
     "mp3":  "audio/mpeg",
     "ogg":  "audio/ogg",
     "opus": "audio/ogg; codecs=opus",
-    "wav":  "audio/wav",
+    "wav":  "audio/wav",     # FIX [D2]: explicit WAV MIME support
 }
 _FALLBACK_MIME = "audio/webm"
 
-# Format preference chain: webm/opus for Chrome+Firefox, m4a for Safari.
-# The probe step discovers which one yt-dlp actually selects.
+# FIX [D2]: Added wav as final fallback in format chain
 _YT_FORMAT = (
     "bestaudio[ext=webm]"
     "/bestaudio[ext=m4a]"
     "/bestaudio[ext=mp3]"
+    "/bestaudio[ext=wav]"
     "/bestaudio"
     "/worst"
 )
@@ -200,12 +175,9 @@ def auth(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
         raise HTTPException(401, "Invalid token")
 
 # ─────────────────────────────────────────────────────────────
-# FIX [C1]: Probe yt-dlp for the actual extension BEFORE streaming.
-# Uses --print %(ext)s which exits immediately without downloading.
-# Times out in 10s; returns "webm" on any failure (safe default).
+# Probe yt-dlp for actual MIME type before streaming
 # ─────────────────────────────────────────────────────────────
 async def _probe_stream_mime(youtube_id: str) -> str:
-    """Return the MIME type string for the format yt-dlp will select."""
     if not shutil.which("yt-dlp"):
         return _FALLBACK_MIME
     cmd = [
@@ -235,12 +207,6 @@ async def _probe_stream_mime(youtube_id: str) -> str:
 # ─────────────────────────────────────────────────────────────
 
 def _download_audio(youtube_id: str, out_path: str) -> bool:
-    """
-    Download + transcode to 22050Hz mono WAV via yt-dlp + ffmpeg.
-    FIX [C5]: --postprocessor-args uses "ffmpeg:" prefix (required by yt-dlp
-    to route args to the correct postprocessor). Also --no-check-certificates
-    for Render's restricted egress.
-    """
     if not shutil.which("yt-dlp"):
         print("[yt-dlp] not in PATH")
         return False
@@ -272,11 +238,6 @@ def _download_audio(youtube_id: str, out_path: str) -> bool:
 
 
 def _analyze_with_essentia(wav_path: str) -> dict:
-    """
-    Run Essentia analysis pipeline at 60Hz.
-    FIX [C6]: skip if WAV > 45MB to avoid OOM on Render free tier.
-    45MB ≈ 4.5 min at 22050Hz mono 16-bit; full songs are usually under this.
-    """
     if not ESSENTIA_AVAILABLE or not NUMPY_AVAILABLE:
         raise RuntimeError("Essentia or NumPy not available")
 
@@ -292,7 +253,7 @@ def _analyze_with_essentia(wav_path: str) -> dict:
     bpm, beats, _, _, _ = rhythm_extractor(audio)
 
     frame_size = 1024
-    hop_size   = int(sr / 60)  # 60 Hz output
+    hop_size   = int(sr / 60)
 
     w             = es.Windowing(type="hann")
     spectrum_algo = es.Spectrum()
@@ -333,11 +294,6 @@ def _analyze_with_essentia(wav_path: str) -> dict:
 
 
 def _fallback_analysis(duration_estimate: float = 240.0) -> dict:
-    """
-    Synthetic 60Hz analysis — used when Essentia/yt-dlp unavailable.
-    Smooth sinusoidal patterns so the GPGPU field animates pleasingly
-    in idle mode even without real audio features.
-    """
     tempo  = 120.0
     beat_t = 60.0 / tempo
     beats  = [{"t": round(i * beat_t, 4)}
@@ -367,7 +323,7 @@ def _fallback_analysis(duration_estimate: float = 240.0) -> dict:
 @app.on_event("startup")
 async def startup():
     print("=" * 55)
-    print("  OneSong API v4.4 — startup")
+    print("  OneSong API v4.5 — startup")
     print("=" * 55)
     print(f"  ffmpeg:    {shutil.which('ffmpeg') or 'NOT IN PATH ← stream will fail'}")
     print(f"  yt-dlp:    {shutil.which('yt-dlp') or 'NOT IN PATH ← stream will fail'}")
@@ -410,7 +366,7 @@ def root():
     return {
         "status":   "ok",
         "message":  "OneSong API",
-        "version":  "4.4.0",
+        "version":  "4.5.0",
         "essentia": ESSENTIA_AVAILABLE,
         "yt_dlp":   shutil.which("yt-dlp") is not None,
         "ffmpeg":   shutil.which("ffmpeg") is not None,
@@ -441,7 +397,7 @@ def diag():
     except Exception as e:
         db_err = str(e)
     return {
-        "status": "ok", "version": "4.4.0",
+        "status": "ok", "version": "4.5.0",
         "routes": [
             "GET /", "GET /health", "GET /diag",
             "POST /auth/signup", "POST /auth/login", "GET /auth/verify",
@@ -624,8 +580,6 @@ async def recommendations(track: str, artist: str, payload: dict = Depends(auth)
 
 # ─────────────────────────────────────────────────────────────
 # AUDIO ANALYSIS
-# FIX [C4]: youtube_id query param takes priority over DB lookup
-# FIX [C3]: asyncio.get_running_loop() throughout
 # ─────────────────────────────────────────────────────────────
 @app.get("/audio_analysis")
 async def audio_analysis(
@@ -634,7 +588,6 @@ async def audio_analysis(
     payload: dict = Depends(auth),
     youtube_id: Optional[str] = None,
 ):
-    # FIX [C4]: prefer param, fall back to DB
     vid = youtube_id
     if not vid:
         try:
@@ -660,7 +613,7 @@ async def audio_analysis(
         print(f"[audio_analysis] Cache hit: {vid}")
         return _analysis_cache[vid]
 
-    loop = asyncio.get_running_loop()  # FIX [C3]
+    loop = asyncio.get_running_loop()
 
     if ESSENTIA_AVAILABLE and NUMPY_AVAILABLE and shutil.which("yt-dlp"):
         with tempfile.TemporaryDirectory() as tmp:
@@ -694,8 +647,7 @@ async def audio_analysis(
 
 # ─────────────────────────────────────────────────────────────
 # AUDIO STREAM
-# FIX [C1]: content-type negotiated from actual yt-dlp format (probe step)
-# FIX [C2]: first-chunk timeout — 502 on stalled yt-dlp instead of empty stream
+# FIX [D2]: WAV MIME type now correctly negotiated via probe
 # ─────────────────────────────────────────────────────────────
 @app.get("/stream")
 async def stream_audio(
@@ -703,18 +655,6 @@ async def stream_audio(
     youtube_id: str,
     token: Optional[str] = None,
 ):
-    """
-    Pipes yt-dlp audio to the browser <audio> element.
-
-    Auth via query param token (can't set Authorization header on <audio src>).
-
-    FIX [C1]: MIME type is now probed from yt-dlp BEFORE streaming begins.
-    This prevents Safari rejecting the stream due to content-type mismatch.
-
-    FIX [C2]: If yt-dlp produces no bytes within 12s (private video, bot
-    detection, network error), we stop gracefully. The browser gets a clean
-    connection close rather than a misleading empty 200 response.
-    """
     if not token:
         raise HTTPException(401, "Token required")
     try:
@@ -731,7 +671,6 @@ async def stream_audio(
             f"https://www.youtube.com/watch?v={youtube_id}", status_code=302
         )
 
-    # FIX [C1]: probe for correct MIME type (~1-2s overhead, worth it)
     mime = await _probe_stream_mime(youtube_id)
 
     cmd = [
@@ -746,8 +685,7 @@ async def stream_audio(
 
     print(f"[stream] Starting stream: {youtube_id}  mime={mime}")
 
-    # FIX [C2]: first-chunk timeout guard
-    _FIRST_CHUNK_TIMEOUT = 12.0  # seconds to wait for yt-dlp to produce first bytes
+    _FIRST_CHUNK_TIMEOUT = 12.0
 
     async def audio_generator():
         proc = await asyncio.create_subprocess_exec(
@@ -757,8 +695,6 @@ async def stream_audio(
         )
         bytes_sent = 0
         try:
-            # FIX [C2]: timeout waiting for first chunk — catches bot-detection,
-            # private videos, and yt-dlp startup failures silently.
             try:
                 first_chunk = await asyncio.wait_for(
                     proc.stdout.read(65536),
@@ -771,7 +707,7 @@ async def stream_audio(
                 except Exception:
                     pass
                 print(f"[stream] First-chunk timeout for {youtube_id}. stderr: {stderr_bytes.decode()[:200]}")
-                return  # yields nothing — browser gets clean close
+                return
 
             if not first_chunk:
                 stderr_bytes = b""
@@ -785,7 +721,6 @@ async def stream_audio(
             bytes_sent += len(first_chunk)
             yield first_chunk
 
-            # Stream remaining chunks
             while True:
                 chunk = await proc.stdout.read(65536)
                 if not chunk:
@@ -794,7 +729,7 @@ async def stream_audio(
                 yield chunk
 
         except asyncio.CancelledError:
-            pass  # client disconnected — normal
+            pass
         finally:
             print(f"[stream] {youtube_id}: sent {bytes_sent // 1024}KB")
             try:
@@ -814,7 +749,7 @@ async def stream_audio(
 
     return StreamingResponse(
         audio_generator(),
-        media_type=mime,          # FIX [C1]: negotiated MIME, not hardcoded
+        media_type=mime,
         headers=stream_headers,
     )
 
