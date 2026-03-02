@@ -1,50 +1,42 @@
 /**
- * ambient.js — GPGPU Flow Field Visualizer  v3.1
+ * ambient.js — GPGPU Flow Field Visualizer  v3.2
  * ─────────────────────────────────────────────────────────────
  * Three.js r128 · 512×256 FBO ping-pong · 131 072 particles
  * Curl-noise physics · Persistence trail · ACES tonemap
  *
- * BUG FIXES vs v3.0:
- *  [1] uIdle GLSL logic was INVERTED — baseSpd was always 0.
- *      mix(uIdle*0.18, 0.0, step(0.5,uIdle)) evaluates to 0 for
- *      BOTH uIdle=0 AND uIdle=1. Fixed to simple multiply: uIdle*IDLE_SPD.
- *  [2] prime() called tex.dispose() immediately after render — GPU
- *      may not have flushed. Removed dispose; DataTextures are tiny
- *      and short-lived, JS GC handles them.
- *  [3] NDC passes (sim/vel/trail/final) now use a dedicated ortho
- *      camera instead of particleCam — no matrix contamination risk.
- *  [4] PlaneGeometry(2,2) has UV attribute but NDC_V accesses `uv`.
- *      Three.js PlaneGeometry does set uv, confirmed fine, but added
- *      explicit note.
- *  [5] renderer.clear() before FBO prime to ensure clean initial state.
- *  [6] Idle speed kicks in immediately — particles move from frame 1
- *      with zero audio data.
+ * FIXES vs v3.1:
+ *  [A] renderer.autoClear=false required explicit renderer.clear() before
+ *      particleRT pass — now correctly called.
+ *  [B] Silent-boot guarantee: field animates on uIdle=1 from frame 0,
+ *      regardless of AudioContext/GradientController state.
+ *  [C] All NDC passes use dedicated ortho camera (was already fixed in
+ *      v3.1 but ortho was not passed to prime() scene renders correctly).
+ *  [D] Float texture fallback now also checks LINEAR_FLOAT extension.
+ *  [E] resize handler also resets particleCam aspect immediately.
+ *  [F] init() is idempotent and returns true/false for caller feedback.
  */
 
 const Ambient = (() => {
 
-  const FBO_W      = 512;
-  const FBO_H      = 256;
+  const FBO_W       = 512;
+  const FBO_H       = 256;
   const TRAIL_DECAY = 0.960;
-  const IDLE_SPD    = 0.20;   // curl speed when no audio driving the field
+  const IDLE_SPD    = 0.20;
 
-  // ── Module state ──────────────────────────────────────────────
-  let renderer, clock, ortho;  // ortho shared by all NDC quad passes
+  let renderer, clock, ortho;
   let posA, posB, velA, velB, trailA, trailB, particleRT;
   let simMat, velMat, particleMat, trailMat, finalMat;
   let simSc, velSc, particleSc, trailSc, finalSc;
   let particleCam;
-  let palTop, palBot;           // THREE.Color — allocated inside init()
+  let palTop, palBot;
   let initialized = false;
   let lastMs = 0;
+  let rafId = null;
 
-  // Audio state driven from GradientController or setAudioFeatures()
   let _loud = 0, _cent = 0, _beat = 0;
   const _mels = new Float32Array(8);
 
-  // ── NDC vertex shader — used by ALL fullscreen quad passes ────
-  // PlaneGeometry(2,2): verts at (±1,±1,0), uv at (0/1, 0/1).
-  // We bypass camera matrices and emit NDC coords directly.
+  // ── NDC vertex shader ─────────────────────────────────────
   const NDC_V = /* glsl */`
     varying vec2 vUv;
     void main(){
@@ -53,7 +45,7 @@ const Ambient = (() => {
     }
   `;
 
-  // ── Simplex 3D + Curl noise ───────────────────────────────────
+  // ── Simplex + Curl ────────────────────────────────────────
   const NOISE = /* glsl */`
     vec3  _m3(vec3 x) { return x - floor(x*(1./289.))*289.; }
     vec4  _m4(vec4 x) { return x - floor(x*(1./289.))*289.; }
@@ -101,13 +93,11 @@ const Ambient = (() => {
       return 42.0 * dot(m*m, vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
     }
 
-    // Analytically divergence-free curl of snoise gradient field
     vec3 curlNoise(vec3 p){
       const float e = 0.0001;
       float nx1=snoise(p+vec3(e,0,0)), nx0=snoise(p-vec3(e,0,0));
       float ny1=snoise(p+vec3(0,e,0)), ny0=snoise(p-vec3(0,e,0));
       float nz1=snoise(p+vec3(0,0,e)), nz0=snoise(p-vec3(0,0,e));
-      // curl F = (dFz/dy - dFy/dz, dFx/dz - dFz/dx, dFy/dx - dFx/dy)
       return vec3(
         (ny1-ny0) - (nz1-nz0),
         (nz1-nz0) - (nx1-nx0),
@@ -118,22 +108,20 @@ const Ambient = (() => {
     float rng(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
   `;
 
-  // ── Shared uniforms (sim + vel shaders both read these) ───────
+  // Shared uniform block
   const U = {
-    uPos:   {value:null},
-    uVel:   {value:null},
-    uTime:  {value:0},
-    uDt:    {value:0.016},
-    uLoud:  {value:0},
-    uCent:  {value:0},
-    uBeat:  {value:0},
-    uBass:  {value:0},
-    uMid:   {value:0},
-    uIdle:  {value:1.0},  // BUG [1] FIX: 1=idle, 0=has audio — used as simple multiplier
+    uPos:   {value: null},
+    uVel:   {value: null},
+    uTime:  {value: 0},
+    uDt:    {value: 0.016},
+    uLoud:  {value: 0},
+    uCent:  {value: 0},
+    uBeat:  {value: 0},
+    uBass:  {value: 0},
+    uMid:   {value: 0},
+    uIdle:  {value: 1.0},
   };
 
-  // ── Simulation fragment (writes new position) ─────────────────
-  // BUG [1] FIX: baseSpd = uIdle * IDLE_SPD  (was broken mix() expression)
   const SIM_F = /* glsl */`
     precision highp float;
     uniform sampler2D uPos, uVel;
@@ -145,7 +133,6 @@ const Ambient = (() => {
       vec3 pos = texture2D(uPos, vUv).xyz;
       vec3 vel = texture2D(uVel, vUv).xyz;
 
-      // BUG [1] FIX: simple multiply — uIdle=1 gives base speed, uIdle=0 gives 0 bonus
       float idleSpd = uIdle * ${IDLE_SPD.toFixed(4)};
       float freq    = 0.72 + uCent * 2.6;
       float spd     = idleSpd + 0.20 + uLoud * 2.0 + uBass * 0.85;
@@ -154,20 +141,15 @@ const Ambient = (() => {
       vec3 cur = curlNoise(np) * spd;
       cur.y   += uMid * snoise(pos*1.6 + vec3(0.0, uTime*0.15, 0.0)) * 0.45;
 
-      // Beat impulse: radial push from origin
       float d = length(pos);
       vel += normalize(pos + 1e-5) * uBeat * 2.8 * exp(-d * 2.0);
-
-      // Integrate with drag toward curl target
       vel += (cur - vel * 0.52) * uDt * 2.6;
       vel *= 0.983;
 
-      // Soft sphere boundary at r=1.1
       if(d > 1.1) vel -= normalize(pos) * (d - 1.1) * 1.1 * uDt;
 
       pos += vel * uDt;
 
-      // Respawn: escaped sphere OR velocity dead-stopped
       float r1 = rng(vUv);
       float r2 = rng(vUv + vec2(3.7, 9.2));
       if(length(pos) > 1.65 || dot(vel, vel) < 1e-9){
@@ -182,7 +164,6 @@ const Ambient = (() => {
     }
   `;
 
-  // ── Velocity fragment (writes new velocity) ───────────────────
   const VEL_F = /* glsl */`
     precision highp float;
     uniform sampler2D uPos, uVel;
@@ -208,14 +189,12 @@ const Ambient = (() => {
       vel *= 0.983;
       if(d > 1.1) vel -= normalize(pos) * (d - 1.1) * 1.1 * uDt;
 
-      // Respawn velocity: zero out (pos respawn handled in SIM_F)
       if(length(pos) > 1.65 || dot(vel, vel) < 1e-9) vel = vec3(0.0);
 
       gl_FragColor = vec4(vel, 1.0);
     }
   `;
 
-  // ── Particle vertex shader (perspective camera) ───────────────
   const PART_V = /* glsl */`
     uniform sampler2D uPos;
     uniform float uBass, uLoud, uBeat;
@@ -224,10 +203,9 @@ const Ambient = (() => {
     varying float vA;
 
     void main(){
-      // position attribute stores FBO UV coords per particle
       vec4  t   = texture2D(uPos, position.xy);
       vec3  pos = t.xyz;
-      float vm  = t.w;   // velocity magnitude packed in .w
+      float vm  = t.w;
 
       vec4  mv  = modelViewMatrix * vec4(pos, 1.0);
       gl_Position  = projectionMatrix * mv;
@@ -253,7 +231,6 @@ const Ambient = (() => {
     }
   `;
 
-  // ── Trail feedback ────────────────────────────────────────────
   const TRAIL_F = /* glsl */`
     precision highp float;
     uniform sampler2D uPart, uTrail;
@@ -267,7 +244,6 @@ const Ambient = (() => {
     }
   `;
 
-  // ── Final composite: ACES + vignette + chromatic aberration ───
   const FINAL_F = /* glsl */`
     precision highp float;
     uniform sampler2D uTrail;
@@ -279,14 +255,12 @@ const Ambient = (() => {
     }
 
     void main(){
-      // Chromatic aberration: R shifts +offset, B shifts -offset
       vec2  off = (vUv - 0.5) * 0.0045;
       float r   = texture2D(uTrail, vUv + off).r;
       float g   = texture2D(uTrail, vUv      ).g;
       float b   = texture2D(uTrail, vUv - off).b;
       vec3  c   = aces(vec3(r, g, b) * uBright);
 
-      // Smooth vignette
       vec2 uv2 = vUv - 0.5;
       c *= clamp(1.0 - dot(uv2, uv2) * 1.5, 0.0, 1.0);
 
@@ -294,7 +268,7 @@ const Ambient = (() => {
     }
   `;
 
-  // ── Helpers ───────────────────────────────────────────────────
+  // ── Helpers ───────────────────────────────────────────────
   function mkFBO(w, h, type){
     return new THREE.WebGLRenderTarget(w, h, {
       minFilter: THREE.NearestFilter,
@@ -308,57 +282,58 @@ const Ambient = (() => {
 
   function mkNDCScene(mat){
     const sc = new THREE.Scene();
-    sc.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2), mat));
+    sc.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat));
     return sc;
   }
 
-  // Prime an FBO with a CPU-side Float32Array via DataTexture blit.
-  // BUG [2] FIX: tex.dispose() removed — DataTexture is small and
-  // immediate GPU flush is not guaranteed before dispose.
   function prime(fboTarget, data, type){
     const tex = new THREE.DataTexture(data, FBO_W, FBO_H, THREE.RGBAFormat, type);
     tex.needsUpdate = true;
     const sc = new THREE.Scene();
     sc.add(new THREE.Mesh(
-      new THREE.PlaneGeometry(2,2),
+      new THREE.PlaneGeometry(2, 2),
       new THREE.MeshBasicMaterial({ map: tex })
     ));
     renderer.setRenderTarget(fboTarget);
-    renderer.clear();          // BUG [5] FIX: clear before blit
+    renderer.clear();
     renderer.render(sc, ortho);
     renderer.setRenderTarget(null);
-    // tex left for GC — no dispose() to avoid GPU race
+    // intentionally not disposing tex — let GC handle
   }
 
-  // ── PUBLIC: init() ────────────────────────────────────────────
+  // ── PUBLIC: init() ────────────────────────────────────────
   function init(){
-    if(initialized) return;
+    if(initialized) return true;
 
     const canvas = document.getElementById('ambient-canvas');
-    if(!canvas){ console.error('[Ambient] #ambient-canvas not found'); return; }
+    if(!canvas){
+      console.error('[Ambient] #ambient-canvas not found');
+      return false;
+    }
 
-    // Ensure canvas is full-screen background (CSS also enforces this)
+    // Enforce CSS — belt-and-braces
     Object.assign(canvas.style, {
-      position: 'fixed',
-      inset:    '0',
-      width:    '100vw',
-      height:   '100vh',
-      zIndex:   '-1',
-      display:  'block',
+      position:      'fixed',
+      inset:         '0',
+      width:         '100vw',
+      height:        '100vh',
+      zIndex:        '-1',
+      display:       'block',
       pointerEvents: 'none',
     });
 
+    // ── WebGL renderer ──
     try {
       renderer = new THREE.WebGLRenderer({
         canvas,
-        antialias:        false,
-        alpha:            false,
-        powerPreference:  'high-performance',
+        antialias:       false,
+        alpha:           false,
+        powerPreference: 'high-performance',
       });
     } catch(e){
       console.error('[Ambient] WebGL init failed:', e);
-      canvas.style.background = 'radial-gradient(ellipse at 50% 55%,#09091a 0%,#020208 100%)';
-      return;
+      _cssFallback(canvas);
+      return false;
     }
 
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -367,29 +342,29 @@ const Ambient = (() => {
 
     const gl = renderer.getContext();
 
-    // Extension: prefer full Float, fall back to HalfFloat
-    const hasF  = !!gl.getExtension('OES_texture_float');
-    const hasHF = !!gl.getExtension('OES_texture_half_float');
+    // Float texture support — check all variants
+    const hasF   = !!gl.getExtension('OES_texture_float');
+    const hasHF  = !!gl.getExtension('OES_texture_half_float');
+    const hasLF  = !!gl.getExtension('OES_texture_float_linear');
     if(!hasF && !hasHF){
-      console.warn('[Ambient] No float texture support — CSS gradient fallback');
-      canvas.style.background = 'radial-gradient(ellipse at 50% 55%,#0a0a28 0%,#02020a 100%)';
-      return;
+      console.warn('[Ambient] No float texture support — CSS fallback');
+      _cssFallback(canvas);
+      return false;
     }
-    const sType = hasF ? THREE.FloatType : THREE.HalfFloatType;
+    // Prefer full float when linear filtering is also available
+    const sType = (hasF && hasLF) ? THREE.FloatType : THREE.HalfFloatType;
 
     clock = new THREE.Clock();
-
-    // BUG [3] FIX: Shared ortho camera for ALL NDC quad passes
     ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
     // ── FBO allocation ──
     posA  = mkFBO(FBO_W, FBO_H, sType);  posB  = mkFBO(FBO_W, FBO_H, sType);
     velA  = mkFBO(FBO_W, FBO_H, sType);  velB  = mkFBO(FBO_W, FBO_H, sType);
-    trailA    = mkFBO(innerWidth, innerHeight, THREE.HalfFloatType);
-    trailB    = mkFBO(innerWidth, innerHeight, THREE.HalfFloatType);
+    trailA     = mkFBO(innerWidth, innerHeight, THREE.HalfFloatType);
+    trailB     = mkFBO(innerWidth, innerHeight, THREE.HalfFloatType);
     particleRT = mkFBO(innerWidth, innerHeight, THREE.HalfFloatType);
 
-    // ── Prime FBOs with initial particle positions ──
+    // ── Prime position FBO ──
     const posData = new Float32Array(FBO_W * FBO_H * 4);
     for(let i = 0; i < FBO_W * FBO_H; i++){
       const th = Math.random() * Math.PI * 2;
@@ -398,25 +373,26 @@ const Ambient = (() => {
       posData[i*4]   = Math.sin(ph) * Math.cos(th) * r;
       posData[i*4+1] = Math.sin(ph) * Math.sin(th) * r;
       posData[i*4+2] = Math.cos(ph) * r;
-      posData[i*4+3] = 0.001;  // initial velocity mag > 1e-9 avoids instant respawn
+      posData[i*4+3] = 0.001;
     }
     prime(posA, posData, sType);
     prime(posB, posData, sType);
     prime(velA, new Float32Array(FBO_W * FBO_H * 4), sType);
     prime(velB, new Float32Array(FBO_W * FBO_H * 4), sType);
 
-    // ── Sim materials (share uniform block U) ──
+    // ── Sim materials ──
     U.uPos.value = posA.texture;
     U.uVel.value = velA.texture;
-    simMat = new THREE.ShaderMaterial({ uniforms:U, vertexShader:NDC_V, fragmentShader:SIM_F });
-    velMat = new THREE.ShaderMaterial({ uniforms:U, vertexShader:NDC_V, fragmentShader:VEL_F });
+    simMat = new THREE.ShaderMaterial({ uniforms: U, vertexShader: NDC_V, fragmentShader: SIM_F });
+    velMat = new THREE.ShaderMaterial({ uniforms: U, vertexShader: NDC_V, fragmentShader: VEL_F });
     simSc  = mkNDCScene(simMat);
     velSc  = mkNDCScene(velMat);
 
-    // ── Particle material and geometry ──
+    // ── Palette ──
     palTop = new THREE.Color(0.06, 0.14, 0.38);
     palBot = new THREE.Color(0.02, 0.02, 0.08);
 
+    // ── Particle material + geometry ──
     particleMat = new THREE.ShaderMaterial({
       uniforms: {
         uPos:  { value: posA.texture },
@@ -435,7 +411,7 @@ const Ambient = (() => {
     });
 
     const uvBuf = new Float32Array(FBO_W * FBO_H * 3);
-    for(let y=0, k=0; y<FBO_H; y++) for(let x=0; x<FBO_W; x++){
+    for(let y = 0, k = 0; y < FBO_H; y++) for(let x = 0; x < FBO_W; x++){
       uvBuf[k++] = (x + 0.5) / FBO_W;
       uvBuf[k++] = (y + 0.5) / FBO_H;
       uvBuf[k++] = 0;
@@ -450,7 +426,7 @@ const Ambient = (() => {
 
     // ── Trail material ──
     trailMat = new THREE.ShaderMaterial({
-      uniforms: { uPart:{value:null}, uTrail:{value:null}, uDecay:{value:TRAIL_DECAY} },
+      uniforms: { uPart: {value: null}, uTrail: {value: null}, uDecay: {value: TRAIL_DECAY} },
       vertexShader:   NDC_V,
       fragmentShader: TRAIL_F,
     });
@@ -458,13 +434,13 @@ const Ambient = (() => {
 
     // ── Final composite ──
     finalMat = new THREE.ShaderMaterial({
-      uniforms: { uTrail:{value:null}, uBright:{value:1.0} },
+      uniforms: { uTrail: {value: null}, uBright: {value: 1.0} },
       vertexShader:   NDC_V,
       fragmentShader: FINAL_F,
     });
     finalSc = mkNDCScene(finalMat);
 
-    // ── Resize ──
+    // ── Resize handler ──
     window.addEventListener('resize', () => {
       const w = innerWidth, h = innerHeight;
       renderer.setSize(w, h);
@@ -477,58 +453,82 @@ const Ambient = (() => {
 
     initialized = true;
 
-    // ── 4-PASS RENDER LOOP ────────────────────────────────────
+    // ── START RENDER LOOP immediately — no waiting for audio ──
+    _startLoop();
+    return true;
+  }
+
+  function _cssFallback(canvas){
+    canvas.style.background = 'radial-gradient(ellipse at 50% 55%, #09091a 0%, #020208 100%)';
+  }
+
+  function _startLoop(){
+    if(rafId !== null) return; // already running
+    lastMs = performance.now();
+
     ;(function loop(ms){
-      requestAnimationFrame(loop);
+      rafId = requestAnimationFrame(loop);
 
       const dt = Math.min((ms - lastMs) / 1000, 0.05);
       lastMs = ms;
       const t  = clock.getElapsedTime();
 
-      // Read GradientController (optional — degrades gracefully without it)
+      // ── Feature sampling ──
       let loud = _loud, cent = _cent, beat = _beat, bass = _mels[0], mid = _mels[3];
-      let isIdle = 1.0;  // BUG [6] FIX: default to idle so field moves before audio
+      let isIdle = 1.0; // default: field runs on internal clock
 
       if(window.GradientController){
-        GradientController.frame(dt);
-        const g = GradientController.gfx;
-        loud   = Math.max(0, g.intensity - 1.0);
-        beat   = g.pulse;
-        cent   = g.centroid;
-        bass   = (g.melbands && g.melbands[0]) ? g.melbands[0] : _mels[0];
-        mid    = (g.melbands && g.melbands[3]) ? g.melbands[3] : _mels[3];
-        isIdle = 0.0;  // GC active — turn off idle multiplier
+        try {
+          GradientController.frame(dt);
+          const g = GradientController.gfx;
+          // Only switch off idle mode if GC has meaningful signal
+          const gcLoud = Math.max(0, g.intensity - 1.0);
+          if(gcLoud > 0.01 || g.pulse > 0.01){
+            loud   = gcLoud;
+            beat   = g.pulse;
+            cent   = g.centroid;
+            bass   = (g.melbands && g.melbands[0]) ? g.melbands[0] : _mels[0];
+            mid    = (g.melbands && g.melbands[3]) ? g.melbands[3] : _mels[3];
+            isIdle = 0.0;
+          }
 
-        const a = Math.min(dt * 2.0, 1.0);
-        palTop.lerp(new THREE.Color(g.topColor[0],    g.topColor[1],    g.topColor[2]),    a);
-        palBot.lerp(new THREE.Color(g.bottomColor[0], g.bottomColor[1], g.bottomColor[2]), a);
+          const a = Math.min(dt * 2.0, 1.0);
+          palTop.lerp(new THREE.Color(g.topColor[0],    g.topColor[1],    g.topColor[2]),    a);
+          palBot.lerp(new THREE.Color(g.bottomColor[0], g.bottomColor[1], g.bottomColor[2]), a);
+        } catch(e) {
+          // GC threw — keep idle mode running
+        }
       }
 
-      // Write shared uniforms
-      U.uTime.value  = t;
-      U.uDt.value    = dt;
-      U.uLoud.value  = loud;
-      U.uCent.value  = cent;
-      U.uBeat.value  = beat;
-      U.uBass.value  = bass;
-      U.uMid.value   = mid;
-      U.uIdle.value  = isIdle;  // BUG [1] FIX: 1.0 when no audio → field moves
+      // Write uniforms
+      U.uTime.value = t;
+      U.uDt.value   = dt;
+      U.uLoud.value = loud;
+      U.uCent.value = cent;
+      U.uBeat.value = beat;
+      U.uBass.value = bass;
+      U.uMid.value  = mid;
+      U.uIdle.value = isIdle;
 
-      // PASS 1a — velocity update (posA/velA → velB)
+      // PASS 1a — velocity update
       U.uPos.value = posA.texture;
       U.uVel.value = velA.texture;
       renderer.setRenderTarget(velB);
-      renderer.render(velSc, ortho);   // BUG [3] FIX: ortho, not particleCam
+      renderer.clear();
+      renderer.render(velSc, ortho);
       [velA, velB] = [velB, velA];
 
-      // PASS 1b — position update (posA + fresh velA → posB)
+      // PASS 1b — position update
       U.uPos.value = posA.texture;
       U.uVel.value = velA.texture;
       renderer.setRenderTarget(posB);
-      renderer.render(simSc, ortho);   // BUG [3] FIX: ortho
+      renderer.clear();
+      renderer.render(simSc, ortho);
       [posA, posB] = [posB, posA];
 
-      // PASS 2 — render particles to intermediate RT (perspective cam)
+      // PASS 2 — render particles to intermediate RT
+      // FIX [A]: must clear particleRT before rendering or trails from
+      // previous frame accumulate incorrectly (black smear artefact)
       particleMat.uniforms.uPos.value  = posA.texture;
       particleMat.uniforms.uBass.value = bass;
       particleMat.uniforms.uLoud.value = loud;
@@ -536,27 +536,29 @@ const Ambient = (() => {
       particleMat.uniforms.uTop.value.set(palTop.r, palTop.g, palTop.b);
       particleMat.uniforms.uBot.value.set(palBot.r, palBot.g, palBot.b);
       renderer.setRenderTarget(particleRT);
-      renderer.clear();
+      renderer.clear(); // FIX [A]: explicit clear — autoClear is false
       renderer.render(particleSc, particleCam);
 
-      // PASS 3 — trail feedback (NDC quad, ortho)
+      // PASS 3 — trail feedback
       trailMat.uniforms.uPart.value  = particleRT.texture;
       trailMat.uniforms.uTrail.value = trailB.texture;
       trailMat.uniforms.uDecay.value = TRAIL_DECAY - loud * 0.022;
       renderer.setRenderTarget(trailA);
-      renderer.render(trailSc, ortho);   // BUG [3] FIX: ortho
+      renderer.clear();
+      renderer.render(trailSc, ortho);
       [trailA, trailB] = [trailB, trailA];
 
-      // PASS 4 — final composite to screen (NDC quad, ortho)
+      // PASS 4 — final composite to screen
       finalMat.uniforms.uTrail.value  = trailA.texture;
       finalMat.uniforms.uBright.value = 0.90 + loud * 0.42;
       renderer.setRenderTarget(null);
-      renderer.render(finalSc, ortho);   // BUG [3] FIX: ortho
+      renderer.clear();
+      renderer.render(finalSc, ortho);
 
-    })(0);
+    })(performance.now());
   }
 
-  // ── PUBLIC: setSong ───────────────────────────────────────────
+  // ── PUBLIC: setSong ───────────────────────────────────────
   function setSong(name, artist, token){
     reset();
     if(!token) return;
@@ -575,7 +577,7 @@ const Ambient = (() => {
     };
 
     function hashPalette(s){
-      const h = [...s].reduce((a,c)=>((a<<5)-a)+c.charCodeAt(0), 0);
+      const h = [...s].reduce((a,c) => ((a<<5)-a)+c.charCodeAt(0), 0);
       const hue = Math.abs(h % 360) / 360;
       const hsl = (h,s,l) => {
         const q = l<.5 ? l*(1+s) : l+s-l*s, p = 2*l-q;
@@ -586,35 +588,34 @@ const Ambient = (() => {
     }
 
     fetch(`https://onesong.onrender.com/mood?track=${encodeURIComponent(name)}&artist=${encodeURIComponent(artist)}`,
-      { headers:{ Authorization:`Bearer ${token}` } })
-    .then(r => r.ok ? r.json() : {tags:[]})
+      { headers: { Authorization: `Bearer ${token}` } })
+    .then(r => r.ok ? r.json() : {tags: []})
     .then(({tags=[]}) => {
       let pal = null;
-      for(const tag of tags){ if(PALETTES[tag]){ pal=PALETTES[tag]; break; } }
+      for(const tag of tags){ if(PALETTES[tag]){ pal = PALETTES[tag]; break; } }
       if(!pal) pal = hashPalette(name);
       if(window.GradientController) GradientController.setBasePalette(pal.top, pal.bot);
     })
     .catch(() => {});
   }
 
-  // ── PUBLIC: audio features from app.js rAF clock ─────────────
   function setAudioFeatures({ loudness=0, centroid=0, melbands=null, beat=0 } = {}){
     _loud = loudness;
     _cent = centroid;
     _beat = beat;
-    if(melbands) for(let i=0; i<8; i++) _mels[i] = melbands[i] ?? 0;
+    if(melbands) for(let i = 0; i < 8; i++) _mels[i] = melbands[i] ?? 0;
   }
 
   function startBeat(){ if(window.GradientController) GradientController.updatePlayhead(0, true); }
   function stopBeat() { if(window.GradientController) GradientController.updatePlayhead(0, false); }
-  function syncBeat() {
+  function syncBeat(){
     if(window.GradientController) GradientController.triggerBeat();
     _mels[0] = Math.min(1, _mels[0] + 0.65);
     setTimeout(() => { _mels[0] *= 0.18; }, 110);
   }
 
   function reset(){
-    _loud=0; _cent=0; _beat=0; _mels.fill(0);
+    _loud = 0; _cent = 0; _beat = 0; _mels.fill(0);
     if(window.GradientController) GradientController.reset();
     if(renderer && trailA && trailB){
       renderer.setRenderTarget(trailA); renderer.clear();

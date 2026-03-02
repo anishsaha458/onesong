@@ -12,17 +12,18 @@
 <body>
 
   <!--
-    THREE.JS GPGPU CANVAS
-    Must be the FIRST element in body so it exists before any script executes.
-    ambient.js sets: position:fixed; inset:0; z-index:-1; pointer-events:none.
-    DO NOT add any wrapper div around this canvas.
+    GPGPU CANVAS — MUST be first in body.
+    ambient.js enforces: position:fixed; inset:0; z-index:-1; pointer-events:none
+    CSS also enforces this as belt-and-braces.
+    NEVER wrap this in a div — it must be a direct child of body.
+    NEVER set display:none on this element — WebGL context is lost.
   -->
   <canvas id="ambient-canvas"></canvas>
 
-  <!-- Loading veil — translucent, particles glow through -->
+  <!-- Loading veil — translucent overlay, particles glow through -->
   <div id="loading-veil" class="veil hidden">
     <div class="veil-ring"></div>
-    <p  id="loading-msg">Starting…</p>
+    <p id="loading-msg">Starting…</p>
   </div>
 
   <!-- ════════════════ AUTH ════════════════ -->
@@ -59,7 +60,7 @@
   <!-- ════════════════ APP ════════════════ -->
   <div id="app-container" class="layer hidden">
 
-    <!-- Minimal persistent nav -->
+    <!-- Minimal topbar -->
     <nav class="topbar">
       <span class="topbar-brand">◈</span>
       <div class="topbar-right">
@@ -68,10 +69,10 @@
       </div>
     </nav>
 
-    <!-- ── ZEN / NOW PLAYING ──────────────────────── -->
+    <!-- ── ZEN / NOW PLAYING ── -->
     <main id="now-playing" class="now-playing hidden">
 
-      <!-- Song identity — glass pill overlay bottom-left -->
+      <!-- Song identity — bottom-left glass pill -->
       <div class="identity-block" id="identity-block">
         <p class="eyebrow">YOUR SIGNATURE TRACK</p>
         <h2 id="song-title"  class="song-title">—</h2>
@@ -79,21 +80,26 @@
       </div>
 
       <!--
-        HEADLESS AUDIO ELEMENT
-        src is set by app.js to the /stream endpoint (yt-dlp pipe).
-        AudioContext latches onto this element as its source node.
-        No <video>, no IFrame, no YouTube JS API.
+        HEADLESS AUDIO
+        crossorigin="anonymous" is REQUIRED so the browser sends CORS headers
+        when fetching the /stream URL. Without this, AudioContext.createMediaElementSource()
+        throws a SecurityError on the first play.
+        The backend /stream endpoint must return Access-Control-Allow-Origin: *
       -->
-      <audio id="headless-audio" crossorigin="anonymous" preload="metadata"></audio>
+      <audio id="headless-audio"
+             crossorigin="anonymous"
+             preload="metadata"></audio>
 
-      <!-- Transport: progress bar + controls -->
+      <!-- Transport -->
       <div class="transport" id="transport">
 
         <div class="progress-wrap" id="progress-wrap">
           <div class="progress-bg">
             <div class="progress-fill" id="progress-fill"></div>
           </div>
-          <input id="seek-slider" class="seek-input" type="range"
+          <input id="seek-slider"
+                 class="seek-input"
+                 type="range"
                  min="0" max="100" step="0.1" value="0"
                  aria-label="Seek"
                  oninput="seekTo(this.value)">
@@ -105,16 +111,33 @@
         </div>
 
         <div class="controls-row">
-          <button id="play-btn" class="play-btn" onclick="togglePlay()" aria-label="Play">
-            <!-- Play icon -->
+          <!--
+            Play button starts DISABLED (opacity 0.45, cursor:wait).
+            app.js enables it once loadedmetadata fires (_setPlayBtnEnabled(true)).
+            This prevents the "play() rejected — no src loaded" error from
+            users clicking immediately after song display.
+          -->
+          <button id="play-btn"
+                  class="play-btn"
+                  onclick="togglePlay()"
+                  aria-label="Play / Pause"
+                  disabled
+                  style="opacity:0.45;cursor:wait;">
             <svg id="ico-play"  viewBox="0 0 24 24"><polygon points="6,3 20,12 6,21"/></svg>
-            <!-- Pause icon (hidden by default) -->
-            <svg id="ico-pause" viewBox="0 0 24 24" class="hidden"><rect x="5" y="3" width="4" height="18"/><rect x="15" y="3" width="4" height="18"/></svg>
+            <svg id="ico-pause" viewBox="0 0 24 24" class="hidden">
+              <rect x="5" y="3" width="4" height="18"/>
+              <rect x="15" y="3" width="4" height="18"/>
+            </svg>
           </button>
 
           <div class="vol-wrap">
-            <svg viewBox="0 0 24 24" class="vol-icon"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07" stroke-linecap="round"/></svg>
-            <input id="vol-slider" class="vol-slider" type="range"
+            <svg viewBox="0 0 24 24" class="vol-icon">
+              <path d="M11 5L6 9H2v6h4l5 4V5z"/>
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" stroke-linecap="round"/>
+            </svg>
+            <input id="vol-slider"
+                   class="vol-slider"
+                   type="range"
                    min="0" max="1" step="0.01" value="0.85"
                    aria-label="Volume"
                    oninput="setVolume(this.value)">
@@ -125,13 +148,14 @@
         <p class="sync-hint">Hold <kbd>Space</kbd> on the beat to lock sync</p>
       </div>
 
-      <!-- Change song — prominent so it's not invisible -->
+      <!-- Change song — always visible, top-right -->
       <button class="btn-change-song" onclick="showSongSelection()">
         ✦ Change song
       </button>
+
     </main>
 
-    <!-- ── SONG SELECTION ──────────────────────────── -->
+    <!-- ── SONG SELECTION OVERLAY ── -->
     <div id="song-selection" class="song-selection hidden">
       <div class="glass-card sel-card">
         <div class="sel-header">
@@ -153,9 +177,14 @@
   </div><!-- /#app-container -->
 
   <!--
-    SCRIPT ORDER: three.js → GradientController → Ambient → app
-    ambient.js init() is called by app.js after DOMContentLoaded.
-    three.js MUST load before ambient.js or the ShaderMaterial constructors throw.
+    SCRIPT ORDER MATTERS:
+      1. three.js     — must exist before ambient.js parses ShaderMaterial
+      2. gradientController.js — GradientController global must exist before ambient.js loop
+      3. ambient.js   — registers Ambient global, does NOT call init() yet
+      4. app.js       — DOMContentLoaded calls Ambient.init() synchronously
+
+    All four scripts are defer-free intentional synchronous loads so globals
+    are available in the correct order when DOMContentLoaded fires.
   -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="gradientController.js"></script>

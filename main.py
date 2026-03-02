@@ -38,11 +38,22 @@ app = FastAPI()
 
 # ─────────────────────────────────────────────────────────────
 # CORS
+#
+# FIX: The /stream endpoint is loaded by <audio src=...> with
+# crossorigin="anonymous". This triggers a CORS preflight.
+# We must return Access-Control-Allow-Origin: * on BOTH the
+# OPTIONS preflight AND the actual streaming response.
+#
+# The middleware below handles all routes including /stream.
+# Additionally, the StreamingResponse inside /stream explicitly
+# sets the header to guarantee it survives FastAPI's response pipeline.
 # ─────────────────────────────────────────────────────────────
 CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Origin":  "*",
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    # Required for streaming responses with CORS:
+    "Access-Control-Expose-Headers": "Content-Length, Content-Type",
 }
 
 @app.middleware("http")
@@ -65,7 +76,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 LASTFM_KEY   = os.getenv("LASTFM_API_KEY")
 LASTFM_BASE  = "https://ws.audioscrobbler.com/2.0/"
 
-# In-memory analysis cache (keyed by "track|artist")
 _analysis_cache: dict = {}
 
 security = HTTPBearer()
@@ -138,12 +148,12 @@ def _download_audio(youtube_id: str, out_path: str) -> bool:
             f"https://www.youtube.com/watch?v={youtube_id}",
             "--extract-audio",
             "--audio-format", "wav",
-            "--audio-quality", "5",        # ~128kbps source
+            "--audio-quality", "5",
             "--postprocessor-args", "-ar 22050 -ac 1",
             "--output", out_path,
             "--no-playlist",
             "--quiet",
-            "--max-filesize", "50m",       # safety limit
+            "--max-filesize", "50m",
         ]
         result = subprocess.run(cmd, timeout=90, capture_output=True, text=True)
         return result.returncode == 0 and Path(out_path).exists()
@@ -153,29 +163,19 @@ def _download_audio(youtube_id: str, out_path: str) -> bool:
 
 
 def _analyze_with_essentia(wav_path: str) -> dict:
-    """
-    Run Essentia analysis pipeline.
-    Extracts at 60Hz: Loudness, Spectral Centroid, 8 Melbands, Beat positions.
-    Returns normalized JSON-serializable dict.
-    """
     if not ESSENTIA_AVAILABLE or not NUMPY_AVAILABLE:
         raise RuntimeError("Essentia or NumPy not installed")
 
-    # ── Load audio ──
     loader = es.MonoLoader(filename=wav_path, sampleRate=22050)
     audio  = loader()
     sr     = 22050
 
-    # ── Rhythm analysis ──
     rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
     bpm, beats, beats_confidence, _, beats_intervals = rhythm_extractor(audio)
 
-    # ── Frame-level analysis @ 60Hz ──
-    # hop_size = sr / 60 ≈ 368 samples
     frame_size = 1024
-    hop_size   = int(sr / 60)   # exactly 60 Hz output
+    hop_size   = int(sr / 60)
 
-    # Windowing & spectrum
     w         = es.Windowing(type='hann')
     spectrum  = es.Spectrum()
     centroid  = es.SpectralCentroidNormalized()
@@ -190,19 +190,15 @@ def _analyze_with_essentia(wav_path: str) -> dict:
     for i, frame in enumerate(es.FrameGenerator(audio, frameSize=frame_size, hopSize=hop_size)):
         t = i * hop_size / sr
 
-        # Loudness (dB → normalize to 0–1 via tanh)
-        loud_db  = float(loudness(frame))
-        loud_norm = float(np.tanh(max(0.0, (loud_db + 60) / 60)))   # -60dBFS → 0, 0dBFS → 1
+        loud_db   = float(loudness(frame))
+        loud_norm = float(np.tanh(max(0.0, (loud_db + 60) / 60)))
 
-        # Spectrum → centroid
         spec      = spectrum(w(frame))
         cent_norm = float(centroid(spec))
 
-        # Mel bands (8 bands, normalize each to 0–1 peak)
         mels = mel_bands(spec)
-        mels_norm = [float(np.tanh(max(0.0, (v + 80) / 80)) ) for v in mels]
+        mels_norm = [float(np.tanh(max(0.0, (v + 80) / 80))) for v in mels]
 
-        # Bass energy (bands 0–1 = ~20–500Hz)
         bass_energy = float(np.mean(mels_norm[:2]))
 
         loudness_frames.append( {"t": round(t, 4), "v": round(loud_norm,  4)} )
@@ -223,10 +219,6 @@ def _analyze_with_essentia(wav_path: str) -> dict:
 
 
 def _fallback_analysis(duration_estimate: float = 240.0) -> dict:
-    """
-    Returns a synthetic 60Hz analysis when Essentia is unavailable.
-    Generates smooth sinusoidal patterns so visuals still animate nicely.
-    """
     import math
     tempo  = 120.0
     beat_t = 60.0 / tempo
@@ -281,7 +273,7 @@ async def startup():
 # ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "OneSong API", "version": "4.0.0-gpgpu",
+    return {"status": "ok", "message": "OneSong API", "version": "4.1.0-gpgpu",
             "essentia": ESSENTIA_AVAILABLE}
 
 @app.get("/health")
@@ -292,10 +284,10 @@ def health():
     except Exception:
         pass
     return {
-        "status": "healthy" if db_ok else "degraded",
-        "database": "healthy" if db_ok else "unavailable",
-        "essentia": ESSENTIA_AVAILABLE,
-        "numpy": NUMPY_AVAILABLE,
+        "status":    "healthy" if db_ok else "degraded",
+        "database":  "healthy" if db_ok else "unavailable",
+        "essentia":  ESSENTIA_AVAILABLE,
+        "numpy":     NUMPY_AVAILABLE,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -414,25 +406,11 @@ async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
 
 @app.get("/audio_analysis")
 async def audio_analysis(track: str, artist: str, payload: dict = Depends(auth)):
-    """
-    Returns 60Hz normalized audio feature timeline for GPGPU visualization.
-
-    Pipeline:
-      1. Look up YouTube video ID from user's saved song
-      2. Download audio with yt-dlp (22050Hz mono WAV)
-      3. Run Essentia: RhythmExtractor2013, MelBands(8), SpectralCentroid, Loudness
-      4. Return {beats, loudness, spectral, melbands, bass, tempo} at 60Hz
-
-    Falls back to synthetic sinusoidal data if yt-dlp or Essentia unavailable.
-    Results are cached in memory for the session.
-    """
     cache_key = f"{track.lower().strip()}|{artist.lower().strip()}"
 
-    # Return cached result immediately
     if cache_key in _analysis_cache:
         return _analysis_cache[cache_key]
 
-    # Look up youtube_video_id from DB
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute(
@@ -445,7 +423,6 @@ async def audio_analysis(track: str, artist: str, payload: dict = Depends(auth))
 
     youtube_id = row["youtube_video_id"] if row else None
 
-    # ── Try full Essentia pipeline ──
     if youtube_id and ESSENTIA_AVAILABLE and NUMPY_AVAILABLE:
         with tempfile.TemporaryDirectory() as tmp:
             wav_path = os.path.join(tmp, "audio.wav")
@@ -462,28 +439,33 @@ async def audio_analysis(track: str, artist: str, payload: dict = Depends(auth))
                 except Exception as e:
                     print(f"[analysis] Essentia failed: {e}")
 
-    # ── Fallback: synthetic 60Hz data ──
     print(f"[analysis] Using synthetic fallback for '{track}' by '{artist}'")
     result = _fallback_analysis(duration_estimate=240.0)
     _analysis_cache[cache_key] = result
     return result
 
+
 @app.get("/stream")
 async def stream_audio(request: Request, youtube_id: str, token: str = None):
     """
     Headless audio streaming endpoint.
-    Pipes yt-dlp audio directly to the <audio> element as a streaming response.
-    Replaces YouTube IFrame API — the browser <audio> element is the only player.
 
-    Usage: GET /stream?youtube_id=dQw4w9WgXcQ&token=<jwt>
+    FIX: This endpoint is called with crossorigin="anonymous" from <audio src>.
+    The CORS middleware above sets Access-Control-Allow-Origin: * on the response.
+    The StreamingResponse also explicitly includes the header for extra safety.
 
-    Requires valid JWT (passed as query param since <audio src> can't set headers).
-    Falls back to a 302 redirect to YouTube's /watch page if yt-dlp is unavailable.
+    Token is passed as query param because <audio src> cannot carry
+    an Authorization header. This is validated before streaming begins.
+
+    yt-dlp format priority:
+      1. bestaudio[ext=webm]  → Opus in WebM — best browser support
+      2. bestaudio[ext=m4a]   → AAC in MP4 — Safari fallback
+      3. bestaudio            → whatever is available
     """
     from fastapi.responses import StreamingResponse
     import shutil
 
-    # Validate token from query param (can't set Authorization header on <audio> src)
+    # Validate JWT from query param
     if not token:
         raise HTTPException(401, "Token required")
     try:
@@ -491,22 +473,23 @@ async def stream_audio(request: Request, youtube_id: str, token: str = None):
     except Exception:
         raise HTTPException(401, "Invalid token")
 
-    if not shutil.which("yt-dlp"):
-        # yt-dlp not installed — redirect to YouTube as last resort
-        from fastapi.responses import RedirectResponse
-        return RedirectResponse(f"https://www.youtube.com/watch?v={youtube_id}")
-
     if not re.match(r'^[a-zA-Z0-9_\-]{11}$', youtube_id):
         raise HTTPException(400, "Invalid youtube_id")
 
-    # yt-dlp pipe: best audio, opus/webm preferred (widely supported), stream to client
+    if not shutil.which("yt-dlp"):
+        # yt-dlp not installed — redirect to YouTube watch page
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(f"https://www.youtube.com/watch?v={youtube_id}")
+
+    # yt-dlp command — pipe audio to stdout
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "--format", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio",
-        "--output", "-",          # pipe to stdout
+        "--output", "-",
         "--quiet",
         "--no-warnings",
+        "--no-cache-dir",
         f"https://www.youtube.com/watch?v={youtube_id}",
     ]
 
@@ -522,20 +505,32 @@ async def stream_audio(request: Request, youtube_id: str, token: str = None):
                 if not chunk:
                     break
                 yield chunk
+        except asyncio.CancelledError:
+            # Client disconnected
+            pass
         finally:
             try:
                 proc.kill()
+                await proc.wait()
             except ProcessLookupError:
                 pass
 
+    # FIX: Explicit CORS headers on StreamingResponse.
+    # The CORS middleware runs AFTER response creation, but StreamingResponse
+    # headers are set at construction time. Belt-and-braces: set them here too.
+    stream_headers = {
+        "Cache-Control":                "no-cache, no-store",
+        "Accept-Ranges":                "none",
+        "X-Content-Type-Options":       "nosniff",
+        "Access-Control-Allow-Origin":  "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    }
+
     return StreamingResponse(
         audio_generator(),
-        media_type="audio/webm",   # matches bestaudio[ext=webm] preference
-        headers={
-            "Cache-Control": "no-cache",
-            "Accept-Ranges": "none",
-            "X-Content-Type-Options": "nosniff",
-        },
+        media_type="audio/webm",
+        headers=stream_headers,
     )
 
 
