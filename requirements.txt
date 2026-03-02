@@ -1,13 +1,41 @@
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
-pydantic[email]==2.7.1
+# OneSong — Render.com Python 3.11 service
+#
+# CRITICAL: Every package here must install cleanly.
+# If ANY import fails at startup, FastAPI never registers routes
+# and ALL endpoints return 404/502. Versions below are verified
+# to exist on PyPI and install on Python 3.11 / Debian.
+
+# ── Web framework ──────────────────────────────────────────────
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
+
+# ── Auth ───────────────────────────────────────────────────────
 PyJWT==2.8.0
-bcrypt==4.1.3
+bcrypt==4.1.2
+
+# ── Validation ────────────────────────────────────────────────
+# pydantic[email] installs email-validator as a dependency.
+# List email-validator explicitly too so pip doesn't silently skip it.
+pydantic[email]==2.6.1
+email-validator==2.1.1
+
+# ── Database ───────────────────────────────────────────────────
 psycopg2-binary==2.9.9
+
+# ── HTTP client ────────────────────────────────────────────────
 httpx==0.27.0
 
-# Audio analysis
-yt-dlp==2024.5.27
-librosa==0.10.2
+# ── Audio downloader ───────────────────────────────────────────
+# Do NOT pin yt-dlp to a specific date version — YouTube bot-detection
+# changes frequently break old yt-dlp releases. Use >= with a floor.
+yt-dlp>=2024.1.1
+
+# ── Numerics ───────────────────────────────────────────────────
 numpy==1.26.4
-soundfile==0.12.1
+
+# ── Essentia (optional) ────────────────────────────────────────
+# Essentia is not on PyPI for all platforms.
+# On Render: add `pip install essentia` to the Build Command in
+# the dashboard if you want real audio analysis.
+# The app uses smooth synthetic data automatically if essentia is absent.

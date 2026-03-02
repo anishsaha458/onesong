@@ -1,57 +1,50 @@
 /**
- * app.js — OneSong  v4.1  (Robust Audio + GPGPU Boot)
+ * app.js — OneSong  v4.2
  * ────────────────────────────────────────────────────────────
- * KEY FIXES vs v4.0:
+ * BUG FIXES vs v4.1:
  *
- *  [1] AudioContext creation moved entirely into togglePlay() gesture handler.
- *      No AudioContext is ever created outside a user gesture, preventing
- *      the "AudioContext was not allowed to start" DOMException.
+ * [F1] _fetchAudioAnalysis now passes youtube_video_id as a query param.
+ *      Previously the backend did a fragile LOWER(song_name) DB match that
+ *      failed on any name difference, always producing synthetic fallback.
+ *      Now the backend receives the ID directly and skips the DB lookup.
  *
- *  [2] _setupAudio() is now synchronous setup only — it sets audioEl.src
- *      and wires event listeners. The AudioContext graph is built lazily
- *      inside _resumeContext() which is only called from togglePlay().
+ * [F2] Play button no longer waits for 'canplaythrough' which NEVER fires
+ *      on a streaming yt-dlp pipe (the browser can't know the total size).
+ *      Instead we enable on 'loadeddata' (readyState >= 2) — enough data
+ *      buffered to start playing. Added 8s timeout fallback.
  *
- *  [3] CORS on /stream: token passed as query param (can't set Authorization
- *      header on <audio src>). The <audio> element uses crossorigin="anonymous"
- *      which tells the browser to send a CORS preflight — the backend must
- *      return Access-Control-Allow-Origin: * on the /stream route.
- *      crossorigin="anonymous" is the correct attribute for this pattern.
+ * [F3] Analysis status messages now show a clear multi-stage loading UX:
+ *      "⏳ Buffering…" → "🔍 Analysing…" → "✓ 120 BPM · 240 beats"
+ *      The GPGPU field starts on its internal clock immediately and 
+ *      transitions to audio-driven mode as soon as analysis loads.
  *
- *  [4] Ambient.init() is now the VERY FIRST thing — called synchronously
- *      inside DOMContentLoaded before any async code. GPGPU loop starts
- *      on its internal clock immediately and is never blocked by auth/audio.
+ * [F4] _onAudioError now distinguishes network errors from format errors
+ *      and shows the specific MediaError code in the status line.
  *
- *  [5] _bootAsync() failure is fully isolated — a server timeout or auth
- *      failure cannot reach Ambient.init()'s rAF loop.
- *
- *  [6] Play button state machine: loading → playing → paused. The button
- *      is disabled while the stream is buffering to prevent double-taps.
- *
- *  [7] AudioContext graph is built only once — subsequent togglePlay() calls
- *      reuse the existing context and just call play()/pause() on audioEl.
- *
- *  [8] Volume slider falls back to audioEl.volume if gainNode not ready,
- *      so volume works even before first play.
+ * [F5] togglePlay correctly handles the case where audioEl.src is a
+ *      full URL (not just a path) — the old `=== location.href` guard
+ *      was always false for API URLs, blocking the early-exit check.
  */
 
 const API = 'https://onesong.onrender.com';
 
 // ── Global state ──────────────────────────────────────────
-let authToken   = null;
-let currentUser = null;
-let hasSong     = false;
-let currentSong = null;
-let serverReady = false;
+let authToken    = null;
+let currentUser  = null;
+let hasSong      = false;
+let currentSong  = null;
+let serverReady  = false;
 
 // ── Audio state ───────────────────────────────────────────
-let audioCtx      = null;
-let audioSrc      = null;
-let analyserNode  = null;
-let gainNode      = null;
-let audioEl       = null;
-let clockPoller   = null;
+let audioCtx     = null;
+let audioSrc     = null;
+let analyserNode = null;
+let gainNode     = null;
+let audioEl      = null;
+let clockPoller  = null;
 let analysisLoaded = false;
-let _audioReady   = false; // true once loadedmetadata fires
+let _audioReady  = false;
+let _playEnableTimer = null;  // FIX [F2]: timeout to enable play if events stall
 
 const FFT_SIZE = 256;
 let freqData   = null;
@@ -64,7 +57,6 @@ let elSeekSlider, elAnalysisStatus;
 // BOOT — GPGPU FIRST, everything else async
 // ─────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-  // Cache DOM refs
   audioEl          = document.getElementById('headless-audio');
   elPlayBtn        = document.getElementById('play-btn');
   elPlayIco        = document.getElementById('ico-play');
@@ -75,19 +67,16 @@ document.addEventListener('DOMContentLoaded', () => {
   elSeekSlider     = document.getElementById('seek-slider');
   elAnalysisStatus = document.getElementById('analysis-status');
 
-  // FIX [4]: GPGPU starts immediately — synchronous, no await, no network
-  // The rAF loop runs on its idle clock from frame 1 regardless of what
-  // happens next. A failed init() returns false but does NOT throw.
+  // GPGPU engine starts synchronously — never blocked by network or auth.
+  // The field runs on its internal idle clock from frame 1.
   try {
-    const gpuOk = Ambient.init();
-    if(!gpuOk) console.warn('[Boot] GPGPU init returned false — CSS fallback active');
-    else        console.info('[Boot] GPGPU engine started ✓');
+    const ok = Ambient.init();
+    if(!ok) console.warn('[Boot] GPGPU init returned false — CSS fallback active');
+    else    console.info('[Boot] GPGPU engine running ✓');
   } catch(e) {
     console.error('[Boot] Ambient.init() threw:', e);
-    // Non-fatal — page still shows UI
   }
 
-  // FIX [5]: all network + auth work is fully isolated in async function
   _bootAsync().catch(e => console.error('[Boot] _bootAsync fatal:', e));
 });
 
@@ -107,7 +96,13 @@ async function _pingServer(){
     const tid  = setTimeout(() => ctrl.abort(), 65000);
     const r    = await fetch(`${API}/health`, { signal: ctrl.signal });
     clearTimeout(tid);
-    if(r.ok){ serverReady = true; console.info('[Boot] Server ready ✓'); }
+    if(r.ok){
+      serverReady = true;
+      const h = await r.json().catch(() => ({}));
+      console.info('[Boot] Server ready ✓', {
+        yt_dlp: h.yt_dlp, essentia: h.essentia, db: h.database
+      });
+    }
   } catch(e){
     console.warn('[Boot] Server ping failed:', e.message);
     _showVeil('⚠ Server offline — refresh in 30s', true);
@@ -173,9 +168,9 @@ async function signup(){
   _showVeil('Creating account…');
   try {
     const r = await fetch(`${API}/auth/signup`, {
-      method:  'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ email, username, password }),
+      body: JSON.stringify({ email, username, password }),
     });
     const d = await r.json();
     if(r.ok){
@@ -192,9 +187,9 @@ async function login(){
   _showVeil('Signing in…');
   try {
     const r = await fetch(`${API}/auth/login`, {
-      method:  'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ email, password }),
+      body: JSON.stringify({ email, password }),
     });
     const d = await r.json();
     if(r.ok){
@@ -253,9 +248,9 @@ async function saveSong(){
   _showVeil('Saving…');
   try {
     const r = await fetch(`${API}/user/song`, {
-      method:  'PUT',
+      method: 'PUT',
       headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ song_name, artist_name, youtube_url }),
+      body: JSON.stringify({ song_name, artist_name, youtube_url }),
     });
     const d = await r.json();
     _hideVeil();
@@ -277,7 +272,7 @@ function cancelSongSelection(){
 }
 
 // ─────────────────────────────────────────────────────────
-// DISPLAY SONG — isolated pipeline
+// DISPLAY SONG
 // ─────────────────────────────────────────────────────────
 function _displaySong(song){
   document.getElementById('song-selection').classList.add('hidden');
@@ -286,80 +281,103 @@ function _displaySong(song){
   document.getElementById('song-title').textContent  = song.song_name;
   document.getElementById('song-artist').textContent = song.artist_name;
 
-  // Reset play state UI
   _audioReady = false;
   _setPlayState(false);
   _setPlayBtnEnabled(false);
+  _setAnalysisStatus('⏳ Connecting to stream…');
 
-  // STAGE A: palette (non-blocking, non-fatal)
+  // Palette (non-blocking, non-fatal)
   try { Ambient.setSong(song.song_name, song.artist_name, authToken); }
   catch(e){ console.warn('[displaySong] Ambient.setSong:', e); }
 
-  // STAGE B: wire up headless audio element (synchronous, no AudioContext yet)
-  // FIX [2]: _setupAudio is now purely synchronous — sets src + event listeners
+  // Set up <audio> element — synchronous, no AudioContext
   _setupAudio(song);
 
-  // STAGE C: 60Hz analysis JSON (non-blocking, non-fatal)
+  // Fetch 60Hz analysis JSON — non-blocking, non-fatal
+  // FIX [F1]: pass youtube_video_id directly so backend skips fragile DB lookup
   _fetchAudioAnalysis(song).catch(e => {
-    console.info('[displaySong] Audio analysis not available:', e.message);
+    console.info('[displaySong] Audio analysis unavailable:', e.message);
   });
 }
 
 // ─────────────────────────────────────────────────────────
-// HEADLESS AUDIO SETUP (SYNCHRONOUS — no AudioContext here)
-//
-// FIX [3]: crossorigin="anonymous" is set in HTML so the browser sends CORS
-// headers. The backend /stream route must return Access-Control-Allow-Origin: *
-// The token is passed as a query parameter because <audio src> cannot carry
-// an Authorization header.
+// HEADLESS AUDIO SETUP (synchronous — no AudioContext here)
 // ─────────────────────────────────────────────────────────
 function _setupAudio(song){
   if(!song.youtube_video_id){
     _setAnalysisStatus('⚠ No video ID — cannot stream audio');
+    // Still enable play button with timeout — analysis-only mode
+    setTimeout(() => _setPlayBtnEnabled(true), 500);
     return;
   }
 
-  // Remove stale listeners before reassigning src
+  // Clear stale play-enable timer
+  if(_playEnableTimer){ clearTimeout(_playEnableTimer); _playEnableTimer = null; }
+
+  // Remove stale listeners
   audioEl.removeEventListener('loadedmetadata', _onAudioMeta);
+  audioEl.removeEventListener('loadeddata',     _onLoadedData);
   audioEl.removeEventListener('timeupdate',     _onTimeUpdate);
   audioEl.removeEventListener('ended',          _onAudioEnded);
   audioEl.removeEventListener('error',          _onAudioError);
-  audioEl.removeEventListener('canplaythrough', _onCanPlayThrough);
 
   // Build stream URL — token in query string (CORS-safe for <audio> src)
   const streamUrl = `${API}/stream`
     + `?youtube_id=${encodeURIComponent(song.youtube_video_id)}`
     + `&token=${encodeURIComponent(authToken)}`;
 
-  audioEl.src  = streamUrl;
+  audioEl.src = streamUrl;
   audioEl.load();
 
   // Re-attach listeners
-  audioEl.addEventListener('loadedmetadata',  _onAudioMeta);
-  audioEl.addEventListener('timeupdate',      _onTimeUpdate);
-  audioEl.addEventListener('ended',           _onAudioEnded);
-  audioEl.addEventListener('error',           _onAudioError);
-  audioEl.addEventListener('canplaythrough',  _onCanPlayThrough);
+  audioEl.addEventListener('loadedmetadata', _onAudioMeta);
+  audioEl.addEventListener('loadeddata',     _onLoadedData);  // FIX [F2]
+  audioEl.addEventListener('timeupdate',     _onTimeUpdate);
+  audioEl.addEventListener('ended',          _onAudioEnded);
+  audioEl.addEventListener('error',          _onAudioError);
 
-  _setAnalysisStatus('⏳ Buffering audio…');
+  // FIX [F2]: Fallback timer — if loadeddata never fires within 8s
+  // (possible if server is slow to start yt-dlp), enable the play button
+  // anyway so the user can try clicking it. play() may stall briefly but
+  // that's better than an eternally greyed-out button.
+  _playEnableTimer = setTimeout(() => {
+    if(!_audioReady){
+      console.warn('[Audio] loadeddata timeout — enabling play button anyway');
+      _audioReady = true;
+      _setPlayBtnEnabled(true);
+      _setAnalysisStatus('⏳ Stream loading slowly — tap Play to try');
+    }
+  }, 8000);
+
+  _setAnalysisStatus('⏳ Connecting to stream…');
   console.info('[Audio] Stream URL set:', streamUrl);
 }
 
-function _onCanPlayThrough(){
-  // Audio is buffered enough to play — enable the play button
-  _audioReady = true;
-  _setPlayBtnEnabled(true);
-  _setAnalysisStatus('');
+// FIX [F2]: Listen on 'loadeddata' instead of 'canplaythrough'.
+// 'canplaythrough' never fires on a streaming pipe because the browser
+// can't predict if the data will arrive fast enough (no Content-Length).
+// 'loadeddata' fires as soon as the first frame of audio data is decoded.
+function _onLoadedData(){
+  if(!_audioReady){
+    _audioReady = true;
+    _setPlayBtnEnabled(true);
+    _setAnalysisStatus('');
+    if(_playEnableTimer){ clearTimeout(_playEnableTimer); _playEnableTimer = null; }
+    console.info('[Audio] loadeddata ✓ — play button enabled');
+  }
 }
 
 function _onAudioMeta(){
   const dur = audioEl.duration;
   if(elTimeTot && isFinite(dur)) elTimeTot.textContent = _fmt(dur);
   if(elSeekSlider) elSeekSlider.max = isFinite(dur) ? dur.toFixed(1) : '300';
-  // Enable play button as soon as we have metadata (don't wait for canplaythrough)
-  _audioReady = true;
-  _setPlayBtnEnabled(true);
-  _setAnalysisStatus('');
+  // Also enable play on metadata (some servers send duration in headers)
+  if(!_audioReady){
+    _audioReady = true;
+    _setPlayBtnEnabled(true);
+    _setAnalysisStatus('');
+    if(_playEnableTimer){ clearTimeout(_playEnableTimer); _playEnableTimer = null; }
+  }
 }
 
 function _onTimeUpdate(){
@@ -378,29 +396,33 @@ function _onAudioEnded(){
   _setPlayState(false);
 }
 
-function _onAudioError(e){
-  const code = audioEl.error ? audioEl.error.code : '?';
-  console.error('[Audio] MediaError code:', code, e);
-  // Error codes: 1=ABORTED, 2=NETWORK, 3=DECODE, 4=SRC_NOT_SUPPORTED
-  if(code === 2){
-    _setAnalysisStatus('⚠ Network error streaming audio — check server CORS');
-  } else if(code === 4){
-    _setAnalysisStatus('⚠ Audio format not supported by browser');
-  } else {
-    _setAnalysisStatus('⚠ Stream error (code ' + code + ')');
-  }
-  _setPlayBtnEnabled(false);
+// FIX [F4]: distinguish error types with clear messages
+function _onAudioError(){
+  const err  = audioEl.error;
+  const code = err ? err.code : 0;
+  const msgs = {
+    1: '⚠ Playback aborted',
+    2: '⚠ Network error — check server CORS and yt-dlp',
+    3: '⚠ Audio decode error — codec unsupported',
+    4: '⚠ Audio source not supported — check /stream format',
+  };
+  const msg = msgs[code] || `⚠ Audio error (code ${code})`;
+  console.error('[Audio] MediaError:', code, err?.message);
+  _setAnalysisStatus(msg);
+  // Don't permanently disable play — let user retry
+  _setPlayBtnEnabled(true);
 }
 
 function _teardownAudio(){
   _stopClockPoller();
+  if(_playEnableTimer){ clearTimeout(_playEnableTimer); _playEnableTimer = null; }
   if(audioEl){
     audioEl.pause();
-    audioEl.removeEventListener('loadedmetadata',  _onAudioMeta);
-    audioEl.removeEventListener('timeupdate',      _onTimeUpdate);
-    audioEl.removeEventListener('ended',           _onAudioEnded);
-    audioEl.removeEventListener('error',           _onAudioError);
-    audioEl.removeEventListener('canplaythrough',  _onCanPlayThrough);
+    audioEl.removeEventListener('loadedmetadata', _onAudioMeta);
+    audioEl.removeEventListener('loadeddata',     _onLoadedData);
+    audioEl.removeEventListener('timeupdate',     _onTimeUpdate);
+    audioEl.removeEventListener('ended',          _onAudioEnded);
+    audioEl.removeEventListener('error',          _onAudioError);
     audioEl.src = '';
     audioEl.load();
   }
@@ -414,12 +436,9 @@ function _teardownAudio(){
 }
 
 // ─────────────────────────────────────────────────────────
-// AudioContext bootstrap
-// FIX [1]: ONLY called from togglePlay() — a confirmed user gesture.
-// Safe to call multiple times — idempotent.
+// AudioContext bootstrap — ONLY called from togglePlay()
 // ─────────────────────────────────────────────────────────
 async function _resumeContext(){
-  // Build AudioContext graph exactly once
   if(!audioCtx){
     try {
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -429,8 +448,6 @@ async function _resumeContext(){
       analyserNode.fftSize = FFT_SIZE;
       freqData     = new Uint8Array(analyserNode.frequencyBinCount);
 
-      // FIX [7]: createMediaElementSource can only be called once per element.
-      // Guard against duplicate calls.
       if(!audioSrc){
         audioSrc = audioCtx.createMediaElementSource(audioEl);
         audioSrc.connect(gainNode);
@@ -445,12 +462,10 @@ async function _resumeContext(){
       _startClockPoller();
     } catch(e){
       console.error('[AudioContext] Setup failed:', e);
-      // Non-fatal — audio plays without analyser if AudioContext fails
       audioCtx = null;
     }
   }
 
-  // Resume if suspended (browser suspends on background tab etc.)
   if(audioCtx && audioCtx.state === 'suspended'){
     try { await audioCtx.resume(); }
     catch(e){ console.warn('[AudioContext] resume() failed:', e); }
@@ -458,7 +473,7 @@ async function _resumeContext(){
 }
 
 // ─────────────────────────────────────────────────────────
-// CLOCK POLLER — 250ms, pushes playhead to GradientController
+// CLOCK POLLER — 250ms
 // ─────────────────────────────────────────────────────────
 function _startClockPoller(){
   _stopClockPoller();
@@ -509,56 +524,75 @@ function _feedRealTimeFeatures(){
 
 // ─────────────────────────────────────────────────────────
 // AUDIO ANALYSIS JSON
+// FIX [F1]: Pass youtube_video_id so backend skips fragile DB name lookup
 // ─────────────────────────────────────────────────────────
 async function _fetchAudioAnalysis(song){
   _setAnalysisStatus('🔍 Analysing audio…');
   try {
-    const url = `${API}/audio_analysis`
-      + `?track=${encodeURIComponent(song.song_name)}`
-      + `&artist=${encodeURIComponent(song.artist_name)}`;
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${authToken}` } });
+    // FIX [F1]: include youtube_id param — backend uses this as primary key
+    const params = new URLSearchParams({
+      track:      song.song_name,
+      artist:     song.artist_name,
+    });
+    if(song.youtube_video_id){
+      params.append('youtube_id', song.youtube_video_id);
+    }
+
+    const r = await fetch(`${API}/audio_analysis?${params}`, {
+      headers: { Authorization: `Bearer ${authToken}` }
+    });
+
     if(!r.ok) throw new Error(`${r.status} ${r.statusText}`);
     const data = await r.json();
 
     if(data && (data.beats?.length || data.loudness?.length)){
       if(window.GradientController) GradientController.loadAudioData(data);
       analysisLoaded = true;
-      _setAnalysisStatus(`✓ ${data.tempo?.toFixed(0)} BPM · ${data.beats?.length} beats`);
-      setTimeout(() => _setAnalysisStatus(''), 4000);
+      const bpm   = data.tempo?.toFixed(0) ?? '?';
+      const beats = data.beats?.length ?? 0;
+      _setAnalysisStatus(`✓ ${bpm} BPM · ${beats} beats`);
+      setTimeout(() => _setAnalysisStatus(''), 5000);
+      console.info(`[Analysis] Loaded: ${bpm} BPM, ${beats} beats`);
     } else {
-      _setAnalysisStatus('Visuals: live analysis mode');
+      _setAnalysisStatus('Visuals: idle field mode');
     }
   } catch(e){
     console.info('[Analysis] unavailable:', e.message);
-    _setAnalysisStatus('Visuals: live analysis mode');
+    _setAnalysisStatus('Visuals: idle field mode');
   }
 }
 
 // ─────────────────────────────────────────────────────────
 // PLAYBACK CONTROLS
-// FIX [6]: play button disabled while buffering
+// FIX [F5]: guard uses !audioEl.src instead of === location.href
 // ─────────────────────────────────────────────────────────
 async function togglePlay(){
-  if(!audioEl || !audioEl.src || audioEl.src === location.href) return;
-  if(elPlayBtn && elPlayBtn.disabled) return;
+  // FIX [F5]: correct no-source guard
+  if(!audioEl || !audioEl.src){ return; }
+  if(elPlayBtn && elPlayBtn.disabled){ return; }
 
-  // FIX [1]: AudioContext MUST be created inside user gesture
+  // AudioContext MUST be created inside a user gesture
   await _resumeContext();
 
   if(audioEl.paused){
     try {
       _setPlayBtnEnabled(false);
+      _setAnalysisStatus('⏳ Buffering…');
       await audioEl.play();
       _setPlayState(true);
       _setPlayBtnEnabled(true);
+      _setAnalysisStatus('');
       Ambient.startBeat();
     } catch(e){
       console.error('[togglePlay] play() rejected:', e.name, e.message);
       _setPlayBtnEnabled(true);
       if(e.name === 'NotAllowedError'){
-        _setAnalysisStatus('⚠ Playback blocked by browser — tap Play again');
+        _setAnalysisStatus('⚠ Browser blocked autoplay — tap Play again');
       } else if(e.name === 'NotSupportedError'){
-        _setAnalysisStatus('⚠ Audio format unsupported — check server codec');
+        _setAnalysisStatus('⚠ Audio format not supported');
+      } else if(e.name === 'AbortError'){
+        // Src changed mid-play — not a real error
+        _setAnalysisStatus('⏳ Reloading stream…');
       } else {
         _setAnalysisStatus('⚠ Playback failed: ' + e.message);
       }
@@ -566,6 +600,7 @@ async function togglePlay(){
   } else {
     audioEl.pause();
     _setPlayState(false);
+    _setAnalysisStatus('');
     Ambient.stopBeat();
   }
 }
@@ -579,7 +614,6 @@ function seekTo(val){
 
 function setVolume(val){
   const v = parseFloat(val);
-  // FIX [8]: update both gainNode and audioEl.volume as fallback
   if(gainNode) gainNode.gain.value = v;
   if(audioEl)  audioEl.volume = Math.min(1, v);
 }
@@ -619,8 +653,7 @@ function _showVeil(msg, noSpinner = false){
 }
 function _hideVeil(){
   document.getElementById('loading-veil')?.classList.add('hidden');
-  const ring = document.querySelector('.veil-ring');
-  if(ring) ring.style.display = '';
+  document.querySelector('.veil-ring')?.style.setProperty('display', '');
 }
 
 // ─────────────────────────────────────────────────────────

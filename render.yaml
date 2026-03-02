@@ -1,0 +1,42 @@
+# render.yaml — Render.com deployment for OneSong API v4.3
+# Place this file in the ROOT of your repository.
+# Render reads it automatically on git push.
+#
+# After deploy, verify routes by hitting:
+#   https://your-service.onrender.com/diag
+# This returns a JSON list of all registered routes + dep status.
+
+services:
+  - type: web
+    name: onesong-api
+    env: python
+    region: oregon
+    plan: free
+
+    # Build command:
+    # - Uses && so any failure aborts immediately with a clear error
+    # - Verifies all critical imports succeed before deployment finishes
+    # - The python -c check catches import errors that would cause all-routes-404
+    buildCommand: >-
+      pip install -r requirements.txt &&
+      python -c "
+      import fastapi, uvicorn, jwt, bcrypt, psycopg2, httpx, pydantic;
+      from pydantic import EmailStr;
+      print('All imports OK');
+      "
+
+    # Start: single worker (Render free tier = 512MB RAM, 0.1 CPU)
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --log-level info
+
+    # Render marks deployment healthy when this returns 200
+    healthCheckPath: /health
+
+    # Set these in Render Dashboard → your service → Environment:
+    #   JWT_SECRET      (required) — any long random string, e.g. `openssl rand -hex 32`
+    #   DATABASE_URL    (required) — Render Postgres "Internal Database URL"
+    #   LASTFM_API_KEY  (optional) — get free key at https://www.last.fm/api
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: "3.11.0"
