@@ -468,19 +468,21 @@ async function _resumeContext() {
       freqData = new Uint8Array(analyserNode.frequencyBinCount);
 
       if (!audioSrc) {
-        try {
-          audioSrc = audioCtx.createMediaElementSource(audioEl);
-          audioSrc.connect(gainNode);
-          gainNode.connect(analyserNode);
-          analyserNode.connect(audioCtx.destination);
-        } catch (e) {
-          // crossorigin not set — audio plays but visualizer won't react
-          console.warn('[AudioContext] createMediaElementSource failed (expected with CDN redirect):', e.message);
-          gainNode.connect(audioCtx.destination);
-        }
+        audioSrc = audioCtx.createMediaElementSource(audioEl);
+        audioSrc.connect(gainNode);
+        gainNode.connect(analyserNode);
+        analyserNode.connect(audioCtx.destination);
       }
 
-      
+      const volEl = document.getElementById('vol-slider');
+      gainNode.gain.value = parseFloat(volEl?.value ?? 0.85);
+      console.info('[AudioContext] Created and wired ✓');
+      _startClockPoller();
+    } catch (e) {
+      console.error('[AudioContext] Setup failed:', e);
+      audioCtx = null;
+    }
+  }
   if (audioCtx && audioCtx.state === 'suspended') {
     try { await audioCtx.resume(); }
     catch (e) { console.warn('[AudioContext] resume() failed:', e); }
