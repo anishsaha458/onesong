@@ -14,13 +14,11 @@
   <!--
     GPGPU CANVAS — MUST be first in body.
     ambient.js enforces: position:fixed; inset:0; z-index:-1; pointer-events:none
-    CSS also enforces this as belt-and-braces.
-    NEVER wrap this in a div — it must be a direct child of body.
-    NEVER set display:none on this element — WebGL context is lost.
+    NEVER wrap in a div. NEVER display:none — WebGL context is destroyed.
   -->
   <canvas id="ambient-canvas"></canvas>
 
-  <!-- Loading veil — translucent overlay, particles glow through -->
+  <!-- Loading veil — translucent, particles glow through -->
   <div id="loading-veil" class="veil hidden">
     <div class="veil-ring"></div>
     <p id="loading-msg">Starting…</p>
@@ -81,13 +79,10 @@
 
       <!--
         HEADLESS AUDIO
-        crossorigin="anonymous" is REQUIRED so the browser sends CORS headers
-        when fetching the /stream URL. Without this, AudioContext.createMediaElementSource()
-        throws a SecurityError on the first play.
-        The backend /stream endpoint must return Access-Control-Allow-Origin: *
+        No crossorigin attr needed — streaming from same origin server.
+        AudioContext.createMediaElementSource() will work fine.
       -->
-      <audio id="headless-audio"
-             preload="metadata"></audio>
+      <audio id="headless-audio" preload="metadata"></audio>
 
       <!-- Transport -->
       <div class="transport" id="transport">
@@ -110,12 +105,6 @@
         </div>
 
         <div class="controls-row">
-          <!--
-            Play button starts DISABLED (opacity 0.45, cursor:wait).
-            app.js enables it once loadedmetadata fires (_setPlayBtnEnabled(true)).
-            This prevents the "play() rejected — no src loaded" error from
-            users clicking immediately after song display.
-          -->
           <button id="play-btn"
                   class="play-btn"
                   onclick="togglePlay()"
@@ -147,14 +136,14 @@
         <p class="sync-hint">Hold <kbd>Space</kbd> on the beat to lock sync</p>
       </div>
 
-      <!-- Change song — always visible, top-right -->
+      <!-- Change song button -->
       <button class="btn-change-song" onclick="showSongSelection()">
         ✦ Change song
       </button>
 
     </main>
 
-    <!-- ── SONG SELECTION OVERLAY ── -->
+    <!-- ── SONG SELECTION / UPLOAD OVERLAY ── -->
     <div id="song-selection" class="song-selection hidden">
       <div class="glass-card sel-card">
         <div class="sel-header">
@@ -165,10 +154,31 @@
 
         <input id="inp-song"   type="text" placeholder="Song name">
         <input id="inp-artist" type="text" placeholder="Artist">
-        <input id="inp-yt"     type="url"  placeholder="YouTube URL  (youtube.com/watch?v=…)">
+
+        <!-- File drop zone -->
+        <label class="file-drop" for="inp-file">
+          <svg viewBox="0 0 24 24" class="upload-icon" fill="none"
+               stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <span id="file-label">Choose audio file…</span>
+          <span class="file-hint">mp3 · wav · flac · ogg · m4a · aac — max 50 MB</span>
+        </label>
+        <input id="inp-file"
+               type="file"
+               accept=".mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.weba,audio/*"
+               style="display:none"
+               onchange="onFileSelected(this)">
+
+        <!-- Upload progress bar -->
+        <div id="upload-bar-wrap" class="upload-bar-wrap hidden">
+          <div id="upload-bar" class="upload-bar"></div>
+        </div>
 
         <p id="form-err" class="err-msg hidden"></p>
-        <button class="btn-primary" onclick="saveSong()">Save my song</button>
+        <button class="btn-primary" onclick="saveSong()">Upload my song</button>
         <button class="btn-ghost-sm cancel-btn hidden" id="cancel-btn" onclick="cancelSongSelection()">Cancel</button>
       </div>
     </div>
@@ -176,14 +186,11 @@
   </div><!-- /#app-container -->
 
   <!--
-    SCRIPT ORDER MATTERS:
-      1. three.js     — must exist before ambient.js parses ShaderMaterial
-      2. gradientController.js — GradientController global must exist before ambient.js loop
-      3. ambient.js   — registers Ambient global, does NOT call init() yet
-      4. app.js       — DOMContentLoaded calls Ambient.init() synchronously
-
-    All four scripts are defer-free intentional synchronous loads so globals
-    are available in the correct order when DOMContentLoaded fires.
+    SCRIPT ORDER:
+      1. three.js            — must exist before ambient.js parses ShaderMaterial
+      2. gradientController.js — GradientController global before ambient.js loop
+      3. ambient.js          — registers Ambient global, does NOT call init() yet
+      4. app.js              — DOMContentLoaded calls Ambient.init() synchronously
   -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <script src="gradientController.js"></script>

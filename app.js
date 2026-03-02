@@ -1,7 +1,16 @@
 /**
- * app.js — OneSong  v4.6 (syntax-fixed)
- * Fix: Malformed try/catch in _pingServer caused "Missing catch or finally"
- * which prevented the entire script from loading, making login/signup undefined.
+ * app.js — OneSong  v5.0
+ * ─────────────────────────────────────────────────────────────
+ * Replaced yt-dlp/YouTube streaming with direct file upload.
+ * Users upload their own audio file — streamed from /stream/{user_id}.
+ * Real AudioContext + analyser retained for GPGPU visualizer reactivity.
+ *
+ * CHANGES vs v4.6:
+ *  [U1] saveSong() → XHR FormData upload with progress bar
+ *  [U2] _setupAudio() → points to /stream/{user_id}?token=...
+ *  [U3] showSongSelection() → file-upload form (no YouTube URL field)
+ *  [U4] _resetUploadUI() + onFileSelected() for file label UX
+ *  [U5] Removed youtube_video_id references throughout
  */
 
 const API = 'https://onesong.onrender.com';
@@ -46,7 +55,7 @@ document.addEventListener('DOMContentLoaded', () => {
   elSeekSlider     = document.getElementById('seek-slider');
   elAnalysisStatus = document.getElementById('analysis-status');
 
-  // GPGPU init FIRST
+  // GPGPU canvas must init first (before auth check)
   try {
     const ok = Ambient.init();
     if (!ok) console.warn('[Boot] GPGPU init returned false — CSS fallback active');
@@ -56,7 +65,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   _checkAuthFromStorage();
-  _bootAsync().catch(e => console.error('[Boot] _bootAsync fatal:', e));
+  _bootAsync().catch(e => console.error('[Boot] fatal:', e));
 });
 
 // ─────────────────────────────────────────────────────────
@@ -79,9 +88,6 @@ async function _bootAsync() {
   _checkAuth();
 }
 
-// ─────────────────────────────────────────────────────────
-// SERVER PING — 30s timeout, non-fatal
-// ─────────────────────────────────────────────────────────
 async function _pingServer() {
   try {
     const ctrl = new AbortController();
@@ -91,9 +97,7 @@ async function _pingServer() {
     if (r.ok) {
       serverReady = true;
       const h = await r.json().catch(() => ({}));
-      console.info('[Boot] Server ready ✓', {
-        yt_dlp: h.yt_dlp, ffmpeg: h.ffmpeg, essentia: h.essentia, db: h.database,
-      });
+      console.info('[Boot] Server ready ✓', { essentia: h.essentia, db: h.database, files: h.audio_files });
     }
   } catch (e) {
     console.warn('[Boot] Server ping failed:', e.message);
@@ -160,20 +164,15 @@ async function signup() {
   _showVeil('Creating account…');
   try {
     const r = await fetch(`${API}/auth/signup`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ email, username, password }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, username, password }),
     });
     const d = await r.json();
     if (r.ok) {
       authToken = d.token; currentUser = d.user; _storeAuth();
       _hideVeil(); _showApp(); showSongSelection();
-    } else {
-      _hideVeil(); _setAuthErr(d.detail || 'Signup failed');
-    }
-  } catch (e) {
-    _hideVeil(); _setAuthErr('Cannot reach server');
-  }
+    } else { _hideVeil(); _setAuthErr(d.detail || 'Signup failed'); }
+  } catch (e) { _hideVeil(); _setAuthErr('Cannot reach server'); }
 }
 
 async function login() {
@@ -183,20 +182,15 @@ async function login() {
   _showVeil('Signing in…');
   try {
     const r = await fetch(`${API}/auth/login`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ email, password }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
     });
     const d = await r.json();
     if (r.ok) {
       authToken = d.token; currentUser = d.user; _storeAuth();
       _hideVeil(); _showApp(); _loadUserSong();
-    } else {
-      _hideVeil(); _setAuthErr(d.detail || 'Login failed');
-    }
-  } catch (e) {
-    _hideVeil(); _setAuthErr('Cannot reach server');
-  }
+    } else { _hideVeil(); _setAuthErr(d.detail || 'Login failed'); }
+  } catch (e) { _hideVeil(); _setAuthErr('Cannot reach server'); }
 }
 
 function _storeAuth() {
@@ -206,15 +200,12 @@ function _storeAuth() {
 
 function logout() {
   authToken = null; currentUser = null; hasSong = false; currentSong = null;
-  localStorage.removeItem('authToken');
-  localStorage.removeItem('currentUser');
-  _teardownAudio();
-  Ambient.reset();
-  _showAuth();
+  localStorage.removeItem('authToken'); localStorage.removeItem('currentUser');
+  _teardownAudio(); Ambient.reset(); _showAuth();
 }
 
 // ─────────────────────────────────────────────────────────
-// LOAD / SAVE SONG
+// LOAD SONG
 // ─────────────────────────────────────────────────────────
 async function _loadUserSong() {
   _showVeil('Loading your song…');
@@ -231,46 +222,110 @@ async function _loadUserSong() {
       hasSong = false; showSongSelection();
     }
   } catch (e) {
-    _hideVeil();
-    console.error('[loadUserSong]', e);
-    showSongSelection();
+    _hideVeil(); console.error('[loadUserSong]', e); showSongSelection();
   }
 }
 
-async function saveSong() {
-  const song_name   = _val('inp-song');
-  const artist_name = _val('inp-artist');
-  const youtube_url = _val('inp-yt');
-  if (!song_name || !artist_name || !youtube_url) { _setFormErr('Fill in all three fields'); return; }
-  if (!youtube_url.includes('youtube.com') && !youtube_url.includes('youtu.be')) {
-    _setFormErr('Please paste a valid YouTube URL'); return;
-  }
-  _showVeil('Saving…');
-  try {
-    const r = await fetch(`${API}/user/song`, {
-      method:  'PUT',
-      headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ song_name, artist_name, youtube_url }),
-    });
-    const d = await r.json();
-    _hideVeil();
-    if (r.ok) { hasSong = true; currentSong = d.song; _displaySong(d.song); }
-    else _setFormErr(d.detail || 'Save failed');
-  } catch (e) {
-    _hideVeil(); _setFormErr('Cannot reach server');
-  }
-}
-
+// ─────────────────────────────────────────────────────────
+// SONG SELECTION — [U3] file upload form
+// ─────────────────────────────────────────────────────────
 function showSongSelection() {
   document.getElementById('now-playing').classList.add('hidden');
   document.getElementById('song-selection').classList.remove('hidden');
   document.getElementById('cancel-btn').classList.toggle('hidden', !hasSong);
   _clearFormErr();
+  _resetUploadUI();
 }
 
 function cancelSongSelection() {
   document.getElementById('song-selection').classList.add('hidden');
   document.getElementById('now-playing').classList.remove('hidden');
+}
+
+// [U4] Reset the file picker UI
+function _resetUploadUI() {
+  const fileInput = document.getElementById('inp-file');
+  const fileLabel = document.getElementById('file-label');
+  const barWrap   = document.getElementById('upload-bar-wrap');
+  const bar       = document.getElementById('upload-bar');
+  if (fileInput) fileInput.value = '';
+  if (fileLabel) fileLabel.textContent = 'Choose audio file…';
+  if (bar)       bar.style.width = '0%';
+  if (barWrap)   barWrap.classList.add('hidden');
+}
+
+// [U4] Called when user picks a file — update the label
+function onFileSelected(input) {
+  const file  = input.files?.[0];
+  const label = document.getElementById('file-label');
+  if (file && label) {
+    const mb = (file.size / (1024 * 1024)).toFixed(1);
+    label.textContent = `${file.name}  (${mb} MB)`;
+  }
+}
+
+// [U1] Upload via XHR so we get progress events
+async function saveSong() {
+  const song_name   = _val('inp-song');
+  const artist_name = _val('inp-artist');
+  const fileInput   = document.getElementById('inp-file');
+  const file        = fileInput?.files?.[0];
+
+  if (!song_name)   { _setFormErr('Enter song name'); return; }
+  if (!artist_name) { _setFormErr('Enter artist name'); return; }
+  if (!file)        { _setFormErr('Choose an audio file'); return; }
+
+  const allowed = ['.mp3','.wav','.flac','.ogg','.m4a','.aac','.opus','.weba'];
+  const ext     = '.' + file.name.split('.').pop().toLowerCase();
+  if (!allowed.includes(ext)) {
+    _setFormErr(`Unsupported format. Use: ${allowed.join(', ')}`); return;
+  }
+  if (file.size > 50 * 1024 * 1024) {
+    _setFormErr('File must be under 50 MB'); return;
+  }
+
+  const barWrap = document.getElementById('upload-bar-wrap');
+  const bar     = document.getElementById('upload-bar');
+  if (barWrap) barWrap.classList.remove('hidden');
+  if (bar)     bar.style.width = '0%';
+  _clearFormErr();
+
+  const form = new FormData();
+  form.append('song_name',   song_name);
+  form.append('artist_name', artist_name);
+  form.append('file',        file);
+
+  await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API}/user/song/upload`);
+    xhr.setRequestHeader('Authorization', `Bearer ${authToken}`);
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && bar)
+        bar.style.width = `${Math.round((e.loaded / e.total) * 100)}%`;
+    };
+
+    xhr.onload = () => {
+      if (bar) bar.style.width = '100%';
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const d = JSON.parse(xhr.responseText);
+        hasSong = true; currentSong = d.song;
+        setTimeout(() => { _displaySong(d.song); resolve(); }, 300);
+      } else {
+        let msg = 'Upload failed';
+        try { msg = JSON.parse(xhr.responseText).detail || msg; } catch (_) {}
+        _setFormErr(msg);
+        if (barWrap) barWrap.classList.add('hidden');
+        reject(new Error(msg));
+      }
+    };
+    xhr.onerror = () => {
+      _setFormErr('Upload failed — check your connection');
+      if (barWrap) barWrap.classList.add('hidden');
+      reject(new Error('Network error'));
+    };
+    xhr.send(form);
+  }).catch(() => {});
 }
 
 // ─────────────────────────────────────────────────────────
@@ -287,7 +342,7 @@ function _displaySong(song) {
   _audioRetried = false;
   _setPlayState(false);
   _setPlayBtnEnabled(false);
-  _setAnalysisStatus('⏳ Connecting to stream…');
+  _setAnalysisStatus('⏳ Loading audio…');
 
   try { Ambient.setSong(song.song_name, song.artist_name, authToken); }
   catch (e) { console.warn('[displaySong] Ambient.setSong:', e); }
@@ -300,17 +355,12 @@ function _displaySong(song) {
 }
 
 // ─────────────────────────────────────────────────────────
-// AUDIO SETUP
+// AUDIO SETUP — [U2] streams from /stream/{user_id}
 // ─────────────────────────────────────────────────────────
 function _setupAudio(song) {
-  if (!song.youtube_video_id) {
-    _setAnalysisStatus('⚠ No video ID — cannot stream audio');
-    setTimeout(() => _setPlayBtnEnabled(true), 500);
-    return;
-  }
-
   if (_playEnableTimer) { clearTimeout(_playEnableTimer); _playEnableTimer = null; }
 
+  // Remove old listeners
   audioEl.removeEventListener('loadedmetadata', _onAudioMeta);
   audioEl.removeEventListener('loadeddata',     _onLoadedData);
   audioEl.removeEventListener('timeupdate',     _onTimeUpdate);
@@ -320,9 +370,9 @@ function _setupAudio(song) {
   audioEl.src = '';
   audioEl.load();
 
-  const streamUrl = `${API}/stream`
-    + `?youtube_id=${encodeURIComponent(song.youtube_video_id)}`
-    + `&token=${encodeURIComponent(authToken)}`;
+  // [U2] Stream from server — no YouTube involved
+  const uid       = currentUser?.id;
+  const streamUrl = `${API}/stream/${uid}?token=${encodeURIComponent(authToken)}`;
 
   audioEl.src = streamUrl;
   audioEl.load();
@@ -333,16 +383,16 @@ function _setupAudio(song) {
   audioEl.addEventListener('ended',          _onAudioEnded);
   audioEl.addEventListener('error',          _onAudioError);
 
+  // Safety valve — if metadata hasn't fired in 10s, allow play anyway
   _playEnableTimer = setTimeout(() => {
     if (!_audioReady) {
-      console.warn('[Audio] loadeddata timeout — enabling play button');
       _audioReady = true;
       _setPlayBtnEnabled(true);
-      _setAnalysisStatus('⏳ Stream loading slowly — tap Play to try');
+      _setAnalysisStatus('⏳ Stream loading — tap Play');
     }
   }, 10000);
 
-  console.info('[Audio] Stream URL set:', streamUrl);
+  console.info('[Audio] Stream URL:', streamUrl);
 }
 
 function _onLoadedData() {
@@ -351,7 +401,7 @@ function _onLoadedData() {
     _setPlayBtnEnabled(true);
     _setAnalysisStatus('');
     if (_playEnableTimer) { clearTimeout(_playEnableTimer); _playEnableTimer = null; }
-    console.info('[Audio] loadeddata ✓ — play button enabled');
+    console.info('[Audio] loadeddata ✓ — play enabled');
   }
 }
 
@@ -368,8 +418,7 @@ function _onAudioMeta() {
 }
 
 function _onTimeUpdate() {
-  const cur = audioEl.currentTime;
-  const dur = audioEl.duration;
+  const cur = audioEl.currentTime, dur = audioEl.duration;
   if (elTimeCur) elTimeCur.textContent = _fmt(cur);
   if (elProgress && isFinite(dur) && dur > 0)
     elProgress.style.width = `${(cur / dur) * 100}%`;
@@ -379,31 +428,28 @@ function _onTimeUpdate() {
 
 function _onAudioEnded() {
   if (window.GradientController) GradientController.updatePlayhead(0, false);
-  Ambient.stopBeat();
-  _setPlayState(false);
+  Ambient.stopBeat(); _setPlayState(false);
 }
 
 function _onAudioError() {
-  const err  = audioEl.error;
-  const code = err ? err.code : 0;
+  const code = audioEl.error?.code || 0;
   const msgs = {
     1: '⚠ Playback aborted',
-    2: '⚠ Network error — server may be starting up',
-    3: '⚠ Audio decode error — codec unsupported in this browser',
-    4: '⚠ Audio format not supported — check server /stream',
+    2: '⚠ Network error',
+    3: '⚠ Audio decode error',
+    4: '⚠ Format not supported by this browser',
   };
-  const msg = msgs[code] || `⚠ Audio error (code ${code})`;
-  console.error('[Audio] MediaError:', code, err?.message);
+  console.error('[Audio] MediaError:', code, audioEl.error?.message);
 
-  if (code === 2 && !_audioRetried && currentSong?.youtube_video_id) {
+  // Auto-retry once on network error
+  if (code === 2 && !_audioRetried && currentSong) {
     _audioRetried = true;
-    console.info('[Audio] Retrying stream after network error…');
-    _setAnalysisStatus('⏳ Retrying stream…');
+    _setAnalysisStatus('⏳ Retrying…');
     setTimeout(() => { if (currentSong) _setupAudio(currentSong); }, 2000);
     return;
   }
 
-  _setAnalysisStatus(msg);
+  _setAnalysisStatus(msgs[code] || `⚠ Audio error (${code})`);
   _setPlayBtnEnabled(true);
 }
 
@@ -424,12 +470,11 @@ function _teardownAudio() {
     audioCtx = null; audioSrc = null; analyserNode = null; gainNode = null;
   }
   _audioReady = false; _audioRetried = false;
-  _setPlayState(false);
-  _setPlayBtnEnabled(false);
+  _setPlayState(false); _setPlayBtnEnabled(false);
 }
 
 // ─────────────────────────────────────────────────────────
-// AudioContext bootstrap — only from user gesture
+// AudioContext — created on first user gesture only
 // ─────────────────────────────────────────────────────────
 async function _resumeContext() {
   if (!audioCtx) {
@@ -449,21 +494,20 @@ async function _resumeContext() {
 
       const volEl = document.getElementById('vol-slider');
       gainNode.gain.value = parseFloat(volEl?.value ?? 0.85);
-      console.info('[AudioContext] Created and wired ✓');
       _startClockPoller();
+      console.info('[AudioContext] Created ✓');
     } catch (e) {
       console.error('[AudioContext] Setup failed:', e);
       audioCtx = null;
     }
   }
-  if (audioCtx && audioCtx.state === 'suspended') {
-    try { await audioCtx.resume(); }
-    catch (e) { console.warn('[AudioContext] resume() failed:', e); }
+  if (audioCtx?.state === 'suspended') {
+    try { await audioCtx.resume(); } catch (e) {}
   }
 }
 
 // ─────────────────────────────────────────────────────────
-// CLOCK POLLER — 250ms
+// CLOCK POLLER — feeds GradientController + GPGPU
 // ─────────────────────────────────────────────────────────
 function _startClockPoller() {
   _stopClockPoller();
@@ -512,28 +556,24 @@ function _feedRealTimeFeatures() {
 }
 
 // ─────────────────────────────────────────────────────────
-// AUDIO ANALYSIS JSON
+// AUDIO ANALYSIS
 // ─────────────────────────────────────────────────────────
 async function _fetchAudioAnalysis(song) {
   _setAnalysisStatus('🔍 Analysing audio…');
   try {
     const params = new URLSearchParams({ track: song.song_name, artist: song.artist_name });
-    if (song.youtube_video_id) params.append('youtube_id', song.youtube_video_id);
-
     const r = await fetch(`${API}/audio_analysis?${params}`, {
       headers: { Authorization: `Bearer ${authToken}` },
     });
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    if (!r.ok) throw new Error(`${r.status}`);
     const data = await r.json();
 
     if (data && (data.beats?.length || data.loudness?.length)) {
       if (window.GradientController) GradientController.loadAudioData(data);
       analysisLoaded = true;
-      const bpm   = data.tempo?.toFixed(0) ?? '?';
-      const beats = data.beats?.length ?? 0;
-      _setAnalysisStatus(`✓ ${bpm} BPM · ${beats} beats`);
+      const bpm = data.tempo?.toFixed(0) ?? '?';
+      _setAnalysisStatus(`✓ ${bpm} BPM · ${data.beats?.length ?? 0} beats`);
       setTimeout(() => _setAnalysisStatus(''), 5000);
-      console.info(`[Analysis] Loaded: ${bpm} BPM, ${beats} beats`);
     } else {
       _setAnalysisStatus('');
     }
@@ -547,9 +587,7 @@ async function _fetchAudioAnalysis(song) {
 // PLAYBACK CONTROLS
 // ─────────────────────────────────────────────────────────
 async function togglePlay() {
-  if (!audioEl || !audioEl.src) return;
-  if (elPlayBtn && elPlayBtn.disabled) return;
-
+  if (!audioEl?.src || elPlayBtn?.disabled) return;
   await _resumeContext();
 
   if (audioEl.paused) {
@@ -557,36 +595,27 @@ async function togglePlay() {
       _setPlayBtnEnabled(false);
       _setAnalysisStatus('⏳ Buffering…');
       await audioEl.play();
-      _setPlayState(true);
-      _setPlayBtnEnabled(true);
-      _setAnalysisStatus('');
+      _setPlayState(true); _setPlayBtnEnabled(true); _setAnalysisStatus('');
       Ambient.startBeat();
     } catch (e) {
-      console.error('[togglePlay] play() rejected:', e.name, e.message);
       _setPlayBtnEnabled(true);
-      if (e.name === 'NotAllowedError') {
-        _setAnalysisStatus('⚠ Browser blocked autoplay — tap Play again');
-      } else if (e.name === 'NotSupportedError') {
-        _setAnalysisStatus('⚠ Audio format not supported');
-      } else if (e.name === 'AbortError') {
+      if (e.name === 'NotAllowedError')   _setAnalysisStatus('⚠ Tap Play again to start');
+      else if (e.name === 'NotSupportedError') _setAnalysisStatus('⚠ Format not supported');
+      else if (e.name === 'AbortError') {
         _setAnalysisStatus('⏳ Stream starting…');
-        setTimeout(() => { if (audioEl && audioEl.paused) togglePlay(); }, 800);
-      } else {
-        _setAnalysisStatus('⚠ Playback failed: ' + e.message);
-      }
+        setTimeout(() => { if (audioEl?.paused) togglePlay(); }, 800);
+      } else _setAnalysisStatus('⚠ Playback failed: ' + e.message);
     }
   } else {
-    audioEl.pause();
-    _setPlayState(false);
-    _setAnalysisStatus('');
-    Ambient.stopBeat();
+    audioEl.pause(); _setPlayState(false); _setAnalysisStatus(''); Ambient.stopBeat();
   }
 }
 
 function seekTo(val) {
   if (!audioEl || !isFinite(audioEl.duration)) return;
   audioEl.currentTime = parseFloat(val);
-  if (window.GradientController) GradientController.updatePlayhead(audioEl.currentTime, !audioEl.paused);
+  if (window.GradientController)
+    GradientController.updatePlayhead(audioEl.currentTime, !audioEl.paused);
 }
 
 function setVolume(val) {
@@ -612,13 +641,13 @@ function _setPlayBtnEnabled(enabled) {
 // ─────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.code !== 'Space') return;
-  if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+  if (['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)) return;
   e.preventDefault();
   Ambient.syncBeat();
 });
 
 // ─────────────────────────────────────────────────────────
-// VEIL HELPERS
+// VEIL
 // ─────────────────────────────────────────────────────────
 function _showVeil(msg, noSpinner = false) {
   const veil = document.getElementById('loading-veil');
@@ -628,7 +657,6 @@ function _showVeil(msg, noSpinner = false) {
   if (ring) ring.style.display = noSpinner ? 'none' : '';
   if (txt)  txt.textContent = msg || '';
 }
-
 function _hideVeil() {
   document.getElementById('loading-veil')?.classList.add('hidden');
   const ring = document.querySelector('.veil-ring');
@@ -636,21 +664,22 @@ function _hideVeil() {
 }
 
 // ─────────────────────────────────────────────────────────
-// MISC HELPERS
+// HELPERS
 // ─────────────────────────────────────────────────────────
-function _val(id)  { return (document.getElementById(id)?.value || '').trim(); }
+function _val(id) { return (document.getElementById(id)?.value || '').trim(); }
 function _fmt(sec) {
+  if (!sec || !isFinite(sec)) return '0:00';
   const s = Math.floor(sec), m = Math.floor(s / 60);
   return `${m}:${String(s % 60).padStart(2, '0')}`;
 }
 function _setAuthErr(msg) {
   const el = document.getElementById('auth-error');
-  if (!el) return; el.textContent = msg; el.classList.remove('hidden');
+  if (el) { el.textContent = msg; el.classList.remove('hidden'); }
 }
 function _clearAuthErr() { document.getElementById('auth-error')?.classList.add('hidden'); }
 function _setFormErr(msg) {
   const el = document.getElementById('form-err');
-  if (!el) return; el.textContent = msg; el.classList.remove('hidden');
+  if (el) { el.textContent = msg; el.classList.remove('hidden'); }
 }
 function _clearFormErr() { document.getElementById('form-err')?.classList.add('hidden'); }
 function _setAnalysisStatus(msg) { if (elAnalysisStatus) elAnalysisStatus.textContent = msg; }

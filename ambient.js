@@ -3,39 +3,11 @@
  * ─────────────────────────────────────────────────────────────
  * Three.js r128 · 512×256 FBO ping-pong · 131 072 particles
  * Curl-noise physics · Persistence trail · ACES tonemap
- *
- * FIXES vs v3.2:
- *  [I1] GPGPU COMPATIBILITY LADDER — "No float texture support" black screen:
- *       Previous code bailed out entirely when OES_texture_float was absent
- *       (common on mobile GPUs, some integrated Intel chips, and WebGL1
- *       contexts on iOS Safari <16). New waterfall:
- *         1. Full float (OES_texture_float + OES_texture_float_linear)
- *         2. Half-float (OES_texture_half_float) — covers most mobile
- *         3. WebGL2 native float (no extension needed on WebGL2 contexts)
- *         4. CSS animated gradient fallback (never a black screen)
- *
- *  [I2] WebGL2 context attempted first, then WebGL1 fallback.
- *       Three.js r128 supports both; we pass { webgl2: true } via the
- *       renderer context attributes.
- *
- *  [I3] Particle count automatically scales to GPU tier:
- *       Full float  → 512×256 (131 072 particles)
- *       Half float  → 256×128 (32 768 particles)  — less VRAM pressure
- *       This prevents OOM on low-end mobile devices.
- *
- *  [I4] _cssFallback now animates a radial gradient in CSS so the app
- *       always looks intentional, never broken.
- *
- *  [I5] init() now catches ALL throws (including shader compile errors)
- *       and gracefully degrades rather than leaving a black canvas.
- *
- *  [I6] Silent-boot guarantee preserved from v3.2 — field animates from
- *       frame 0 on uIdle=1 regardless of AudioContext/GradientController.
+ * UNCHANGED from v3.3 — no YouTube/streaming dependencies here.
  */
 
 const Ambient = (() => {
 
-  // Will be set in init() based on GPU capability — see [I3]
   let FBO_W, FBO_H;
 
   const TRAIL_DECAY = 0.960;
@@ -54,7 +26,6 @@ const Ambient = (() => {
   let _loud = 0, _cent = 0, _beat = 0;
   const _mels = new Float32Array(8);
 
-  // ── NDC vertex shader ─────────────────────────────────────
   const NDC_V = /* glsl */`
     varying vec2 vUv;
     void main(){
@@ -63,7 +34,6 @@ const Ambient = (() => {
     }
   `;
 
-  // ── Simplex + Curl ────────────────────────────────────────
   const NOISE = /* glsl */`
     vec3  _m3(vec3 x) { return x - floor(x*(1./289.))*289.; }
     vec4  _m4(vec4 x) { return x - floor(x*(1./289.))*289.; }
@@ -126,7 +96,6 @@ const Ambient = (() => {
     float rng(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
   `;
 
-  // Shared uniform block
   const U = {
     uPos:  { value: null },
     uVel:  { value: null },
@@ -264,15 +233,11 @@ const Ambient = (() => {
     }
   `;
 
-  // ── Helpers ───────────────────────────────────────────────
   function mkFBO(w, h, type) {
     return new THREE.WebGLRenderTarget(w, h, {
-      minFilter:    THREE.NearestFilter,
-      magFilter:    THREE.NearestFilter,
-      format:       THREE.RGBAFormat,
-      type,
-      depthBuffer:   false,
-      stencilBuffer: false,
+      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+      format: THREE.RGBAFormat, type,
+      depthBuffer: false, stencilBuffer: false,
     });
   }
 
@@ -286,161 +251,82 @@ const Ambient = (() => {
     const tex = new THREE.DataTexture(data, FBO_W, FBO_H, THREE.RGBAFormat, texType);
     tex.needsUpdate = true;
     const sc = new THREE.Scene();
-    sc.add(new THREE.Mesh(
-      new THREE.PlaneGeometry(2, 2),
-      new THREE.MeshBasicMaterial({ map: tex }),
-    ));
-    renderer.setRenderTarget(fboTarget);
-    renderer.clear();
-    renderer.render(sc, ortho);
-    renderer.setRenderTarget(null);
+    sc.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2),
+      new THREE.MeshBasicMaterial({ map: tex })));
+    renderer.setRenderTarget(fboTarget); renderer.clear();
+    renderer.render(sc, ortho); renderer.setRenderTarget(null);
   }
 
-  // ── CSS animated fallback — never a plain black screen [I4] ──
   function _cssFallback(canvas) {
-    canvas.style.cssText += `
-      background: radial-gradient(ellipse at 50% 55%, #0d0d2e 0%, #020208 100%);
-    `;
-    // Animate a subtle shimmer so it never looks frozen
+    canvas.style.cssText += `background: radial-gradient(ellipse at 50% 55%, #0d0d2e 0%, #020208 100%);`;
     let hue = 220;
     const shimmer = setInterval(() => {
       hue = (hue + 0.15) % 360;
       const h2 = (hue + 40) % 360;
-      canvas.style.background = `
-        radial-gradient(ellipse at 50% 55%,
-          hsl(${hue},60%,10%) 0%,
-          hsl(${h2},40%,3%) 60%,
-          #000 100%)
-      `;
+      canvas.style.background = `radial-gradient(ellipse at 50% 55%, hsl(${hue},60%,10%) 0%, hsl(${h2},40%,3%) 60%, #000 100%)`;
     }, 50);
-    // Store reference so reset() can clear it
     canvas._shimmerTimer = shimmer;
   }
 
-  // ── Detect WebGL capability tier [I1] [I2] ───────────────
-  /**
-   * Returns { sType, halfType, fboW, fboH, ok }
-   *
-   * Tier 1 (best):  WebGL2 native float OR WebGL1 OES_texture_float
-   *                 + OES_texture_float_linear → full 512×256 FBO
-   * Tier 2:         OES_texture_half_float → 256×128 FBO (saves VRAM)
-   * Tier 3 (fail):  No float support → CSS fallback, ok=false
-   */
   function _detectCapability(gl) {
     const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined')
       && (gl instanceof WebGL2RenderingContext);
-
     if (isWebGL2) {
-      // WebGL2 always supports 32-bit float textures natively
-      console.info('[Ambient] WebGL2 detected — full float textures ✓');
-      return {
-        sType:    THREE.FloatType,
-        halfType: THREE.HalfFloatType,
-        fboW: 512, fboH: 256,
-        ok: true,
-      };
+      console.info('[Ambient] WebGL2 ✓ — full float textures');
+      return { sType: THREE.FloatType, halfType: THREE.HalfFloatType, fboW: 512, fboH: 256, ok: true };
     }
-
-    // WebGL1 — probe extensions
-    const hasF   = !!gl.getExtension('OES_texture_float');
-    const hasLF  = !!gl.getExtension('OES_texture_float_linear');
-    const hasHF  = !!gl.getExtension('OES_texture_half_float');
-    const hasHFL = !!gl.getExtension('OES_texture_half_float_linear');
-
-    console.info('[Ambient] WebGL1 extensions:', { hasF, hasLF, hasHF, hasHFL });
-
+    const hasF  = !!gl.getExtension('OES_texture_float');
+    const hasHF = !!gl.getExtension('OES_texture_half_float');
+    console.info('[Ambient] WebGL1 extensions:', { hasF, hasHF });
     if (hasF) {
-      // Full float — use it even without linear filtering (NearestFilter is fine for GPGPU)
-      console.info('[Ambient] Full float textures ✓ (512×256)');
-      return {
-        sType:    THREE.FloatType,
-        halfType: THREE.HalfFloatType,
-        fboW: 512, fboH: 256,
-        ok: true,
-      };
+      console.info('[Ambient] Full float ✓ (512×256)');
+      return { sType: THREE.FloatType, halfType: THREE.HalfFloatType, fboW: 512, fboH: 256, ok: true };
     }
-
     if (hasHF) {
-      // Half-float only — reduce particle count to save VRAM [I3]
-      console.info('[Ambient] Half-float textures ✓ (256×128 — reduced for compatibility)');
-      return {
-        sType:    THREE.HalfFloatType,
-        halfType: THREE.HalfFloatType,
-        fboW: 256, fboH: 128,
-        ok: true,
-      };
+      console.info('[Ambient] Half-float ✓ (256×128)');
+      return { sType: THREE.HalfFloatType, halfType: THREE.HalfFloatType, fboW: 256, fboH: 128, ok: true };
     }
-
     console.warn('[Ambient] No float texture support — CSS fallback');
     return { ok: false };
   }
 
-  // ── PUBLIC: init() ────────────────────────────────────────
   function init() {
     if (initialized) return true;
-
     const canvas = document.getElementById('ambient-canvas');
-    if (!canvas) {
-      console.error('[Ambient] #ambient-canvas not found');
-      return false;
-    }
+    if (!canvas) { console.error('[Ambient] #ambient-canvas not found'); return false; }
 
-    // Enforce CSS belt-and-braces
     Object.assign(canvas.style, {
-      position:      'fixed',
-      inset:         '0',
-      width:         '100vw',
-      height:        '100vh',
-      zIndex:        '-1',
-      display:       'block',
-      pointerEvents: 'none',
+      position: 'fixed', inset: '0', width: '100vw', height: '100vh',
+      zIndex: '-1', display: 'block', pointerEvents: 'none',
     });
 
-    // ── WebGL renderer — try WebGL2 first [I2] ──
     try {
       renderer = new THREE.WebGLRenderer({
-        canvas,
-        antialias:       false,
-        alpha:           false,
-        powerPreference: 'high-performance',
-        // Three.js r128: context attribute to prefer WebGL2
+        canvas, antialias: false, alpha: false, powerPreference: 'high-performance',
         context: (() => {
-          try {
-            return canvas.getContext('webgl2') || canvas.getContext('webgl') || undefined;
-          } catch (_) {
-            return undefined;
-          }
+          try { return canvas.getContext('webgl2') || canvas.getContext('webgl') || undefined; }
+          catch (_) { return undefined; }
         })(),
       });
     } catch (e) {
       console.error('[Ambient] WebGL init failed:', e);
-      _cssFallback(canvas);
-      return false;
+      _cssFallback(canvas); return false;
     }
 
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.setSize(innerWidth, innerHeight);
     renderer.autoClear = false;
 
-    const gl = renderer.getContext();
-
-    // ── Detect GPU capability [I1] ──
+    const gl  = renderer.getContext();
     const cap = _detectCapability(gl);
-    if (!cap.ok) {
-      _cssFallback(canvas);
-      return false;
-    }
+    if (!cap.ok) { _cssFallback(canvas); return false; }
 
-    // Set FBO dimensions from capability tier [I3]
-    FBO_W = cap.fboW;
-    FBO_H = cap.fboH;
+    FBO_W = cap.fboW; FBO_H = cap.fboH;
     const sType = cap.sType;
 
-    // ── Core objects ──
     clock = new THREE.Clock();
     ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
-    // ── FBO allocation ──
     posA  = mkFBO(FBO_W, FBO_H, sType);
     posB  = mkFBO(FBO_W, FBO_H, sType);
     velA  = mkFBO(FBO_W, FBO_H, sType);
@@ -449,26 +335,21 @@ const Ambient = (() => {
     trailB     = mkFBO(innerWidth, innerHeight, cap.halfType);
     particleRT = mkFBO(innerWidth, innerHeight, cap.halfType);
 
-    // ── Prime position FBO ──
     const posData = new Float32Array(FBO_W * FBO_H * 4);
     for (let i = 0; i < FBO_W * FBO_H; i++) {
       const th = Math.random() * Math.PI * 2;
       const ph = Math.acos(2 * Math.random() - 1);
       const r  = 0.25 + Math.random() * 0.55;
-      posData[i * 4]     = Math.sin(ph) * Math.cos(th) * r;
-      posData[i * 4 + 1] = Math.sin(ph) * Math.sin(th) * r;
-      posData[i * 4 + 2] = Math.cos(ph) * r;
-      posData[i * 4 + 3] = 0.001;
+      posData[i*4]   = Math.sin(ph)*Math.cos(th)*r;
+      posData[i*4+1] = Math.sin(ph)*Math.sin(th)*r;
+      posData[i*4+2] = Math.cos(ph)*r;
+      posData[i*4+3] = 0.001;
     }
-
-    // DataTexture type must match FBO type for priming
-    // For HalfFloat FBOs we still prime from Float32Array — Three.js handles conversion
     prime(posA, posData, THREE.FloatType);
     prime(posB, posData, THREE.FloatType);
     prime(velA, new Float32Array(FBO_W * FBO_H * 4), THREE.FloatType);
     prime(velB, new Float32Array(FBO_W * FBO_H * 4), THREE.FloatType);
 
-    // ── Simulation materials ──
     U.uPos.value = posA.texture;
     U.uVel.value = velA.texture;
     simMat = new THREE.ShaderMaterial({ uniforms: U, vertexShader: NDC_V, fragmentShader: SIM_F });
@@ -476,26 +357,19 @@ const Ambient = (() => {
     simSc  = mkNDCScene(simMat);
     velSc  = mkNDCScene(velMat);
 
-    // ── Palette ──
     palTop = new THREE.Color(0.06, 0.14, 0.38);
     palBot = new THREE.Color(0.02, 0.02, 0.08);
 
-    // ── Particle geometry + material ──
     particleMat = new THREE.ShaderMaterial({
       uniforms: {
         uPos:  { value: posA.texture },
-        uBass: { value: 0 },
-        uLoud: { value: 0 },
-        uBeat: { value: 0 },
+        uBass: { value: 0 }, uLoud: { value: 0 }, uBeat: { value: 0 },
         uTop:  { value: new THREE.Vector3(palTop.r, palTop.g, palTop.b) },
         uBot:  { value: new THREE.Vector3(palBot.r, palBot.g, palBot.b) },
       },
-      vertexShader:   PART_V,
-      fragmentShader: PART_F,
-      transparent:    true,
-      blending:       THREE.AdditiveBlending,
-      depthWrite:     false,
-      depthTest:      false,
+      vertexShader: PART_V, fragmentShader: PART_F,
+      transparent: true, blending: THREE.AdditiveBlending,
+      depthWrite: false, depthTest: false,
     });
 
     const uvBuf = new Float32Array(FBO_W * FBO_H * 3);
@@ -508,42 +382,32 @@ const Ambient = (() => {
     }
     const pGeo = new THREE.BufferGeometry();
     pGeo.setAttribute('position', new THREE.BufferAttribute(uvBuf, 3));
-
     particleSc  = new THREE.Scene();
     particleSc.add(new THREE.Points(pGeo, particleMat));
     particleCam = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 100);
     particleCam.position.z = 2.2;
 
-    // ── Trail + final materials ──
     trailMat = new THREE.ShaderMaterial({
       uniforms: { uPart: { value: null }, uTrail: { value: null }, uDecay: { value: TRAIL_DECAY } },
-      vertexShader:   NDC_V,
-      fragmentShader: TRAIL_F,
+      vertexShader: NDC_V, fragmentShader: TRAIL_F,
     });
     trailSc = mkNDCScene(trailMat);
 
     finalMat = new THREE.ShaderMaterial({
       uniforms: { uTrail: { value: null }, uBright: { value: 1.0 } },
-      vertexShader:   NDC_V,
-      fragmentShader: FINAL_F,
+      vertexShader: NDC_V, fragmentShader: FINAL_F,
     });
     finalSc = mkNDCScene(finalMat);
 
-    // ── Resize handler ──
     window.addEventListener('resize', () => {
       const w = innerWidth, h = innerHeight;
       renderer.setSize(w, h);
-      trailA.setSize(w, h);
-      trailB.setSize(w, h);
-      particleRT.setSize(w, h);
-      particleCam.aspect = w / h;
-      particleCam.updateProjectionMatrix();
+      trailA.setSize(w, h); trailB.setSize(w, h); particleRT.setSize(w, h);
+      particleCam.aspect = w / h; particleCam.updateProjectionMatrix();
     });
 
     initialized = true;
     console.info(`[Ambient] Init OK — ${FBO_W}×${FBO_H} FBO (${FBO_W * FBO_H} particles)`);
-
-    // Start render loop immediately — no waiting for audio [I6]
     _startLoop();
     return true;
   }
@@ -554,129 +418,94 @@ const Ambient = (() => {
 
     ;(function loop(ms) {
       rafId = requestAnimationFrame(loop);
-
       const dt = Math.min((ms - lastMs) / 1000, 0.05);
       lastMs = ms;
       const t  = clock.getElapsedTime();
 
-      // ── Feature sampling ──
       let loud = _loud, cent = _cent, beat = _beat, bass = _mels[0], mid = _mels[3];
       let isIdle = 1.0;
 
       if (window.GradientController) {
         try {
           GradientController.frame(dt);
-          const g      = GradientController.gfx;
+          const g = GradientController.gfx;
           const gcLoud = Math.max(0, g.intensity - 1.0);
           if (gcLoud > 0.01 || g.pulse > 0.01) {
-            loud   = gcLoud;
-            beat   = g.pulse;
-            cent   = g.centroid;
-            bass   = (g.melbands && g.melbands[0]) ? g.melbands[0] : _mels[0];
-            mid    = (g.melbands && g.melbands[3]) ? g.melbands[3] : _mels[3];
+            loud = gcLoud; beat = g.pulse; cent = g.centroid;
+            bass = (g.melbands && g.melbands[0]) ? g.melbands[0] : _mels[0];
+            mid  = (g.melbands && g.melbands[3]) ? g.melbands[3] : _mels[3];
             isIdle = 0.0;
           }
           const a = Math.min(dt * 2.0, 1.0);
-          palTop.lerp(new THREE.Color(g.topColor[0],    g.topColor[1],    g.topColor[2]),    a);
+          palTop.lerp(new THREE.Color(g.topColor[0], g.topColor[1], g.topColor[2]), a);
           palBot.lerp(new THREE.Color(g.bottomColor[0], g.bottomColor[1], g.bottomColor[2]), a);
-        } catch (e) {
-          // GC threw — stay in idle mode
-        }
+        } catch (e) {}
       }
 
-      U.uTime.value = t;
-      U.uDt.value   = dt;
-      U.uLoud.value = loud;
-      U.uCent.value = cent;
-      U.uBeat.value = beat;
-      U.uBass.value = bass;
-      U.uMid.value  = mid;
-      U.uIdle.value = isIdle;
+      U.uTime.value = t; U.uDt.value = dt; U.uLoud.value = loud;
+      U.uCent.value = cent; U.uBeat.value = beat; U.uBass.value = bass;
+      U.uMid.value  = mid;  U.uIdle.value = isIdle;
 
-      // PASS 1a — velocity update
-      U.uPos.value = posA.texture;
-      U.uVel.value = velA.texture;
-      renderer.setRenderTarget(velB);
-      renderer.clear();
-      renderer.render(velSc, ortho);
+      U.uPos.value = posA.texture; U.uVel.value = velA.texture;
+      renderer.setRenderTarget(velB); renderer.clear(); renderer.render(velSc, ortho);
       [velA, velB] = [velB, velA];
 
-      // PASS 1b — position update
-      U.uPos.value = posA.texture;
-      U.uVel.value = velA.texture;
-      renderer.setRenderTarget(posB);
-      renderer.clear();
-      renderer.render(simSc, ortho);
+      U.uPos.value = posA.texture; U.uVel.value = velA.texture;
+      renderer.setRenderTarget(posB); renderer.clear(); renderer.render(simSc, ortho);
       [posA, posB] = [posB, posA];
 
-      // PASS 2 — particles → intermediate RT
       particleMat.uniforms.uPos.value  = posA.texture;
       particleMat.uniforms.uBass.value = bass;
       particleMat.uniforms.uLoud.value = loud;
       particleMat.uniforms.uBeat.value = beat;
       particleMat.uniforms.uTop.value.set(palTop.r, palTop.g, palTop.b);
       particleMat.uniforms.uBot.value.set(palBot.r, palBot.g, palBot.b);
-      renderer.setRenderTarget(particleRT);
-      renderer.clear();
-      renderer.render(particleSc, particleCam);
+      renderer.setRenderTarget(particleRT); renderer.clear(); renderer.render(particleSc, particleCam);
 
-      // PASS 3 — trail feedback
       trailMat.uniforms.uPart.value  = particleRT.texture;
       trailMat.uniforms.uTrail.value = trailB.texture;
       trailMat.uniforms.uDecay.value = TRAIL_DECAY - loud * 0.022;
-      renderer.setRenderTarget(trailA);
-      renderer.clear();
-      renderer.render(trailSc, ortho);
+      renderer.setRenderTarget(trailA); renderer.clear(); renderer.render(trailSc, ortho);
       [trailA, trailB] = [trailB, trailA];
 
-      // PASS 4 — final composite to screen
       finalMat.uniforms.uTrail.value  = trailA.texture;
       finalMat.uniforms.uBright.value = 0.90 + loud * 0.42;
-      renderer.setRenderTarget(null);
-      renderer.clear();
-      renderer.render(finalSc, ortho);
+      renderer.setRenderTarget(null); renderer.clear(); renderer.render(finalSc, ortho);
 
     })(performance.now());
   }
 
-  // ── PUBLIC: setSong ───────────────────────────────────────
   function setSong(name, artist, token) {
     reset();
     if (!token) return;
 
     const PALETTES = {
-      sad:        { top: [.12, .22, .55], bot: [0, 0, .04] },
-      happy:      { top: [1, .76, .14],   bot: [.35, .02, .08] },
-      electronic: { top: [.82, .12, .98], bot: [0, 0, .10] },
-      chill:      { top: [.32, .78, .55], bot: [.04, .10, .04] },
-      rock:       { top: [.90, .26, .08], bot: [.10, 0, 0] },
-      pop:        { top: [.98, .44, .68], bot: [.18, 0, .18] },
-      jazz:       { top: [.80, .58, .16], bot: [.10, .04, 0] },
-      classical:  { top: [.90, .88, .80], bot: [.08, .08, .13] },
-      metal:      { top: [.60, .10, .10], bot: [.05, 0, 0] },
-      ambient:    { top: [.10, .40, .70], bot: [.02, .04, .08] },
+      sad:        { top: [.12,.22,.55], bot: [0,0,.04] },
+      happy:      { top: [1,.76,.14],   bot: [.35,.02,.08] },
+      electronic: { top: [.82,.12,.98], bot: [0,0,.10] },
+      chill:      { top: [.32,.78,.55], bot: [.04,.10,.04] },
+      rock:       { top: [.90,.26,.08], bot: [.10,0,0] },
+      pop:        { top: [.98,.44,.68], bot: [.18,0,.18] },
+      jazz:       { top: [.80,.58,.16], bot: [.10,.04,0] },
+      classical:  { top: [.90,.88,.80], bot: [.08,.08,.13] },
+      metal:      { top: [.60,.10,.10], bot: [.05,0,0] },
+      ambient:    { top: [.10,.40,.70], bot: [.02,.04,.08] },
     };
 
     function hashPalette(s) {
-      const h   = [...s].reduce((a, c) => ((a << 5) - a) + c.charCodeAt(0), 0);
+      const h   = [...s].reduce((a,c) => ((a<<5)-a)+c.charCodeAt(0), 0);
       const hue = Math.abs(h % 360) / 360;
-      const hsl = (h, s, l) => {
-        const q = l < .5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
-        const f = t => {
-          t = ((t % 1) + 1) % 1;
-          return t < 1 / 6 ? p + (q - p) * 6 * t : t < .5 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p;
-        };
-        return [f(h + 1 / 3), f(h), f(h - 1 / 3)];
+      const hsl = (h,s,l) => {
+        const q = l<.5?l*(1+s):l+s-l*s, p=2*l-q;
+        const f = t => { t=((t%1)+1)%1; return t<1/6?p+(q-p)*6*t:t<.5?q:t<2/3?p+(q-p)*(2/3-t)*6:p; };
+        return [f(h+1/3),f(h),f(h-1/3)];
       };
-      return { top: hsl(hue, .9, .60), bot: hsl((hue + .5) % 1, .8, .07) };
+      return { top: hsl(hue,.9,.60), bot: hsl((hue+.5)%1,.8,.07) };
     }
 
-    // Use dynamic API origin — same fix as app.js [E1]
-    const API = window.ONESONG_API || window.location.origin;
-    fetch(
-      `${API}/mood?track=${encodeURIComponent(name)}&artist=${encodeURIComponent(artist)}`,
-      { headers: { Authorization: `Bearer ${token}` } },
-    )
+    const API = window.ONESONG_API || 'https://onesong.onrender.com';
+    fetch(`${API}/mood?track=${encodeURIComponent(name)}&artist=${encodeURIComponent(artist)}`,
+      { headers: { Authorization: `Bearer ${token}` } })
       .then(r => r.ok ? r.json() : { tags: [] })
       .then(({ tags = [] }) => {
         let pal = null;
@@ -687,11 +516,9 @@ const Ambient = (() => {
       .catch(() => {});
   }
 
-  function setAudioFeatures({ loudness = 0, centroid = 0, melbands = null, beat = 0 } = {}) {
-    _loud = loudness;
-    _cent = centroid;
-    _beat = beat;
-    if (melbands) for (let i = 0; i < 8; i++) _mels[i] = melbands[i] ?? 0;
+  function setAudioFeatures({ loudness=0, centroid=0, melbands=null, beat=0 }={}) {
+    _loud = loudness; _cent = centroid; _beat = beat;
+    if (melbands) for (let i=0;i<8;i++) _mels[i] = melbands[i] ?? 0;
   }
 
   function startBeat() { if (window.GradientController) GradientController.updatePlayhead(0, true); }
@@ -704,7 +531,7 @@ const Ambient = (() => {
   }
 
   function reset() {
-    _loud = 0; _cent = 0; _beat = 0; _mels.fill(0);
+    _loud=0; _cent=0; _beat=0; _mels.fill(0);
     if (window.GradientController) GradientController.reset();
     if (renderer && trailA && trailB) {
       renderer.setRenderTarget(trailA); renderer.clear();

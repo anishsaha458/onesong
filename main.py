@@ -1,35 +1,31 @@
 """
-main.py — OneSong API  v4.8
+main.py — OneSong API  v5.0
 ────────────────────────────────────────────────────────────────
-FIXES vs v4.7:
+REPLACES yt-dlp streaming with direct file upload + streaming.
 
-[D1] /diag/ytdlp endpoint — visit in browser to see EXACT yt-dlp error
-     https://onesong.onrender.com/diag/ytdlp?youtube_id=uLHqpjW3aDs
+Users upload their own audio file (mp3/wav/flac/ogg/m4a/aac/opus).
+Files stored at AUDIO_DIR (set AUDIO_DIR env var to a Render Disk
+mount path like /audio for persistence across deploys).
 
-[D2] Stream now captures yt-dlp + ffmpeg stderr and prints to Render logs
-     so "empty stream" failures show the real error (403, bot block, etc.)
+NEW ROUTES:
+  POST /user/song/upload   — multipart: song_name, artist_name, file
+  GET  /stream/{user_id}   — range-aware streaming of stored file
 
-[D3] Added browser User-Agent spoof + extractor-retries to yt-dlp calls
-     to improve success rate on datacenter IPs (Render blocks YouTube often)
+CHANGED:
+  GET  /user/song          — returns has_audio + stream_url instead of youtube_video_id
+  GET  /audio_analysis     — analyses uploaded file directly with Essentia
 
-[D4] yt-dlp version printed at startup — old versions fail silently
+REMOVED:
+  yt-dlp / ffmpeg streaming pipeline (was blocked by YouTube bot detection)
+  /diag/ytdlp diagnostic route
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse, Response
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from typing import Optional
-import jwt
-import bcrypt
-import os
-import re
-import httpx
-import asyncio
-import tempfile
-import subprocess
-import shutil
-import math
+import jwt, bcrypt, os, re, httpx, asyncio, shutil, math, subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -52,7 +48,37 @@ try:
 except ImportError:
     ESSENTIA_AVAILABLE = False
 
-app = FastAPI(title="OneSong API", version="4.8.0")
+app = FastAPI(title="OneSong API", version="5.0.0")
+
+# ─────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────
+JWT_SECRET   = os.getenv("JWT_SECRET", "change-me-in-production")
+DATABASE_URL = os.getenv("DATABASE_URL")
+LASTFM_KEY   = os.getenv("LASTFM_API_KEY")
+LASTFM_BASE  = "https://ws.audioscrobbler.com/2.0/"
+
+# Render free tier: ephemeral. Add a Render Disk mounted at /audio for persistence.
+AUDIO_DIR = Path(os.getenv("AUDIO_DIR", "/audio"))
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_UPLOAD_MB    = int(os.getenv("MAX_UPLOAD_MB", "50"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".weba"}
+MIME_MAP = {
+    ".mp3":  "audio/mpeg",
+    ".wav":  "audio/wav",
+    ".flac": "audio/flac",
+    ".ogg":  "audio/ogg",
+    ".m4a":  "audio/mp4",
+    ".aac":  "audio/aac",
+    ".opus": "audio/ogg; codecs=opus",
+    ".weba": "audio/webm",
+}
+
+_analysis_cache: dict = {}
+security = HTTPBearer()
 
 # ─────────────────────────────────────────────────────────────
 # CORS
@@ -61,7 +87,7 @@ CORS_HEADERS = {
     "Access-Control-Allow-Origin":   "*",
     "Access-Control-Allow-Methods":  "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers":  "Content-Type, Authorization",
-    "Access-Control-Expose-Headers": "Content-Length, Content-Type",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
 }
 
 @app.middleware("http")
@@ -77,38 +103,6 @@ async def add_cors(request: Request, call_next):
     return response
 
 # ─────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────
-JWT_SECRET   = os.getenv("JWT_SECRET", "change-me-in-production")
-DATABASE_URL = os.getenv("DATABASE_URL")
-LASTFM_KEY   = os.getenv("LASTFM_API_KEY")
-LASTFM_BASE  = "https://ws.audioscrobbler.com/2.0/"
-
-_analysis_cache: dict = {}
-security = HTTPBearer()
-
-def _has_ffmpeg() -> bool:
-    return shutil.which("ffmpeg") is not None
-
-def _has_ytdlp() -> bool:
-    return shutil.which("yt-dlp") is not None
-
-# [D3] Common flags — browser UA spoof helps avoid YouTube bot detection
-_YTDLP_BASE_FLAGS = [
-    "--no-playlist",
-    "--no-cache-dir",
-    "--no-check-certificates",
-    "--extractor-retries", "3",
-    "--add-header", "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "--add-header", "Accept-Language:en-US,en;q=0.9",
-]
-
-_YT_FORMAT = (
-    "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio[ext=mp3]"
-    "/bestaudio[ext=aac]/bestaudio/worst"
-)
-
-# ─────────────────────────────────────────────────────────────
 # MODELS
 # ─────────────────────────────────────────────────────────────
 class UserSignup(BaseModel):
@@ -120,26 +114,9 @@ class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
-class SongData(BaseModel):
-    song_name: str
-    artist_name: str
-    youtube_url: str
-
 # ─────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────
-def extract_youtube_id(url: str) -> Optional[str]:
-    for pattern in [
-        r'(?:v=|\/)([0-9A-Za-z_-]{11})',
-        r'(?:embed\/)([0-9A-Za-z_-]{11})',
-        r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
-        r'(?:shorts\/)([0-9A-Za-z_-]{11})',
-    ]:
-        m = re.search(pattern, url)
-        if m:
-            return m.group(1)
-    return None
-
 def get_db():
     if not PSYCOPG2_AVAILABLE:
         raise HTTPException(503, "psycopg2 not installed")
@@ -152,279 +129,93 @@ def get_db():
 
 def make_token(user_id: int, email: str) -> str:
     return jwt.encode(
-        {
-            "user_id": user_id,
-            "email":   email,
-            "exp":     datetime.utcnow() + timedelta(days=7),
-            "iat":     datetime.utcnow(),
-        },
-        JWT_SECRET,
-        algorithm="HS256",
+        {"user_id": user_id, "email": email,
+         "exp": datetime.utcnow() + timedelta(days=7),
+         "iat": datetime.utcnow()},
+        JWT_SECRET, algorithm="HS256",
     )
 
 def auth(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     try:
-        return jwt.decode(
-            creds.credentials,
-            JWT_SECRET,
-            algorithms=["HS256"],
-            leeway=10,
-        )
+        return jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"], leeway=10)
     except jwt.ExpiredSignatureError:
         raise HTTPException(401, "Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(401, "Invalid token")
 
-# ─────────────────────────────────────────────────────────────
-# STREAM PIPELINE [D2] [D3]
-# ─────────────────────────────────────────────────────────────
-async def _stream_via_ytdlp_ffmpeg(youtube_id: str):
-    """yt-dlp → ffmpeg → mp3. Logs full stderr on failure."""
-    yt_url = f"https://www.youtube.com/watch?v={youtube_id}"
+def _audio_path_for(user_id: int) -> Optional[Path]:
+    for ext in ALLOWED_EXTENSIONS:
+        p = AUDIO_DIR / f"{user_id}{ext}"
+        if p.exists():
+            return p
+    return None
 
-    ytdlp_cmd = [
-        "yt-dlp", *_YTDLP_BASE_FLAGS,
-        "--format", _YT_FORMAT,
-        "--output", "-",
-        yt_url,
-    ]
-    ffmpeg_cmd = [
-        "ffmpeg", "-loglevel", "error",
-        "-i", "pipe:0",
-        "-vn", "-acodec", "libmp3lame", "-ab", "128k", "-ar", "44100",
-        "-f", "mp3", "pipe:1",
-    ]
-
-    print(f"[stream] Starting yt-dlp|ffmpeg pipeline for {youtube_id}")
-
-    yt_proc = await asyncio.create_subprocess_exec(
-        *ytdlp_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,   # [D2] capture stderr
-    )
-    ff_proc = await asyncio.create_subprocess_exec(
-        *ffmpeg_cmd,
-        stdin=yt_proc.stdout,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    yt_proc.stdout.close()
-
-    bytes_sent = 0
-    try:
-        try:
-            first_chunk = await asyncio.wait_for(ff_proc.stdout.read(65536), timeout=25.0)
-        except asyncio.TimeoutError:
-            yt_err = b""; ff_err = b""
-            try:
-                yt_err = await asyncio.wait_for(yt_proc.stderr.read(4096), timeout=2.0)
-                ff_err = await asyncio.wait_for(ff_proc.stderr.read(4096), timeout=2.0)
-            except Exception:
-                pass
-            print(f"[stream] TIMEOUT for {youtube_id}")
-            print(f"[stream] yt-dlp stderr: {yt_err.decode(errors='replace')[:1000]}")
-            print(f"[stream] ffmpeg stderr: {ff_err.decode(errors='replace')[:500]}")
-            return
-
-        if not first_chunk:
-            yt_err = b""; ff_err = b""
-            try:
-                yt_err = await asyncio.wait_for(yt_proc.stderr.read(4096), timeout=2.0)
-                ff_err = await asyncio.wait_for(ff_proc.stderr.read(4096), timeout=2.0)
-            except Exception:
-                pass
-            print(f"[stream] EMPTY OUTPUT for {youtube_id}")
-            print(f"[stream] yt-dlp stderr: {yt_err.decode(errors='replace')[:1000]}")
-            print(f"[stream] ffmpeg stderr: {ff_err.decode(errors='replace')[:500]}")
-            return
-
-        bytes_sent += len(first_chunk)
-        yield first_chunk
-
-        while True:
-            chunk = await ff_proc.stdout.read(65536)
-            if not chunk:
-                break
-            bytes_sent += len(chunk)
-            yield chunk
-
-    except asyncio.CancelledError:
-        print(f"[stream] Client disconnected at {bytes_sent // 1024}KB")
-    finally:
-        print(f"[stream] {youtube_id}: {bytes_sent // 1024}KB sent")
-        for proc in (ff_proc, yt_proc):
-            try:
-                proc.kill()
-                await proc.wait()
-            except (ProcessLookupError, OSError):
-                pass
-
-
-async def _stream_via_ytdlp_only(youtube_id: str):
-    """Fallback: no ffmpeg. Tries to get mp3/m4a directly."""
-    yt_url = f"https://www.youtube.com/watch?v={youtube_id}"
-    cmd = [
-        "yt-dlp", *_YTDLP_BASE_FLAGS,
-        "--format", "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio",
-        "--output", "-", yt_url,
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-    )
-    bytes_sent = 0
-    try:
-        try:
-            first_chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=15.0)
-        except asyncio.TimeoutError:
-            err = b""
-            try: err = await asyncio.wait_for(proc.stderr.read(4096), timeout=2.0)
-            except Exception: pass
-            print(f"[stream-raw] TIMEOUT. stderr: {err.decode(errors='replace')[:1000]}")
-            return
-        if not first_chunk:
-            err = b""
-            try: err = await asyncio.wait_for(proc.stderr.read(4096), timeout=2.0)
-            except Exception: pass
-            print(f"[stream-raw] EMPTY. stderr: {err.decode(errors='replace')[:1000]}")
-            return
-        bytes_sent += len(first_chunk)
-        yield first_chunk
-        while True:
-            chunk = await proc.stdout.read(65536)
-            if not chunk: break
-            bytes_sent += len(chunk)
-            yield chunk
-    except asyncio.CancelledError:
-        pass
-    finally:
-        print(f"[stream-raw] {youtube_id}: {bytes_sent // 1024}KB sent")
-        try: proc.kill(); await proc.wait()
-        except (ProcessLookupError, OSError): pass
+def _delete_audio_for(user_id: int):
+    for ext in ALLOWED_EXTENSIONS:
+        p = AUDIO_DIR / f"{user_id}{ext}"
+        if p.exists():
+            p.unlink()
 
 # ─────────────────────────────────────────────────────────────
-# Essentia helpers
-# ─────────────────────────────────────────────────────────────
-def _download_audio(youtube_id: str, out_path: str) -> bool:
-    if not _has_ytdlp():
-        return False
-    try:
-        result = subprocess.run([
-            "yt-dlp", f"https://www.youtube.com/watch?v={youtube_id}",
-            "--extract-audio", "--audio-format", "wav",
-            "--audio-quality", "5",
-            "--postprocessor-args", "ffmpeg:-ar 22050 -ac 1",
-            "--output", out_path,
-            "--no-playlist", "--no-cache-dir", "--no-check-certificates",
-            "--quiet", "--max-filesize", "50m",
-        ], timeout=120, capture_output=True, text=True)
-        return result.returncode == 0 and Path(out_path).exists()
-    except Exception as e:
-        print(f"[yt-dlp download] error: {e}")
-        return False
-
-def _analyze_with_essentia(wav_path: str) -> dict:
-    if not ESSENTIA_AVAILABLE or not NUMPY_AVAILABLE:
-        raise RuntimeError("Essentia/NumPy unavailable")
-    if Path(wav_path).stat().st_size / (1024 * 1024) > 45:
-        raise RuntimeError("WAV > 45MB OOM guard")
-    loader = es.MonoLoader(filename=wav_path, sampleRate=22050)
-    audio  = loader()
-    bpm, beats, _, _, _ = es.RhythmExtractor2013(method="multifeature")(audio)
-    sr, frame_size, hop_size = 22050, 1024, int(22050 / 60)
-    w = es.Windowing(type="hann")
-    spectrum_algo  = es.Spectrum()
-    centroid_algo  = es.SpectralCentroidNormalized()
-    mel_bands_algo = es.MelBands(numberBands=8, sampleRate=sr,
-                                  lowFrequencyBound=20, highFrequencyBound=8000)
-    loudness_algo  = es.Loudness()
-    lf, cf, mf, bf = [], [], [], []
-    for i, frame in enumerate(es.FrameGenerator(audio, frameSize=frame_size, hopSize=hop_size)):
-        t = i * hop_size / sr
-        loud_norm = float(np.tanh(max(0.0, (float(loudness_algo(frame)) + 60) / 60)))
-        spec      = spectrum_algo(w(frame))
-        cent_norm = float(centroid_algo(spec))
-        mels      = [float(np.tanh(max(0.0, (v + 80) / 80))) for v in mel_bands_algo(spec)]
-        lf.append({"t": round(t, 4), "v": round(loud_norm, 4)})
-        cf.append({"t": round(t, 4), "c": round(cent_norm, 4)})
-        mf.append({"t": round(t, 4), "bands": [round(m, 4) for m in mels]})
-        bf.append({"t": round(t, 4), "b": round(float(np.mean(mels[:2])), 4)})
-    return {
-        "tempo":    round(float(bpm), 2),
-        "beats":    [{"t": round(float(b), 4)} for b in beats],
-        "loudness": lf, "spectral": cf, "melbands": mf, "bass": bf,
-    }
-
-def _fallback_analysis(duration_estimate: float = 240.0) -> dict:
-    tempo  = 120.0
-    beat_t = 60.0 / tempo
-    beats  = [{"t": round(i * beat_t, 4)} for i in range(int(duration_estimate / beat_t))]
-    lf, sf, mf, bf = [], [], [], []
-    for i in range(int(duration_estimate * 60)):
-        t = i / 60.0
-        lf.append({"t": round(t, 4), "v": round(0.5 + 0.35 * math.sin(t * 0.8) + 0.15 * math.sin(t * 3.1), 4)})
-        sf.append({"t": round(t, 4), "c": round(0.4 + 0.3  * math.sin(t * 0.5 + 1.2), 4)})
-        bf.append({"t": round(t, 4), "b": round(0.3 + 0.25 * abs(math.sin(t * math.pi * 2.0)), 4)})
-        mf.append({"t": round(t, 4), "bands": [round(0.2 + 0.2 * math.sin(t * (0.4 + k * 0.15) + k), 4) for k in range(8)]})
-    return {"tempo": tempo, "beats": beats, "loudness": lf, "spectral": sf, "melbands": mf, "bass": bf}
-
-# ─────────────────────────────────────────────────────────────
-# STARTUP [D4]
+# STARTUP
 # ─────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     print("=" * 55)
-    print(f"  OneSong API v4.8 — startup")
+    print("  OneSong API v5.0 — startup")
     print("=" * 55)
-
-    # [D4] Print yt-dlp version — old versions fail silently on new YouTube formats
-    ytdlp_ver = "NOT IN PATH ⚠"
-    if _has_ytdlp():
-        try:
-            r = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=5)
-            ytdlp_ver = r.stdout.strip() or "unknown"
-        except Exception:
-            ytdlp_ver = "error getting version"
-
+    audio_count = len(list(AUDIO_DIR.glob("*"))) if AUDIO_DIR.exists() else 0
     for label, val in [
-        ("ffmpeg",      shutil.which("ffmpeg") or "NOT IN PATH ⚠"),
-        ("yt-dlp",      ytdlp_ver),
+        ("audio dir",   str(AUDIO_DIR)),
+        ("audio files", audio_count),
+        ("max upload",  f"{MAX_UPLOAD_MB}MB"),
         ("essentia",    ESSENTIA_AVAILABLE),
         ("numpy",       NUMPY_AVAILABLE),
         ("psycopg2",    PSYCOPG2_AVAILABLE),
-        ("db url",      "set" if DATABASE_URL else "NOT SET"),
-        ("jwt",         "CUSTOM ✓" if JWT_SECRET != "change-me-in-production" else "DEFAULT"),
+        ("db url",      "set" if DATABASE_URL else "NOT SET ⚠"),
+        ("jwt",         "CUSTOM ✓" if JWT_SECRET != "change-me-in-production" else "DEFAULT ⚠"),
+        ("lastfm",      "set" if LASTFM_KEY else "not set"),
     ]:
-        print(f"  {label:<12}{val}")
+        print(f"  {label:<14}{val}")
     print("=" * 55)
-
     try:
         conn = get_db(); cur = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id               SERIAL PRIMARY KEY,
-                email            VARCHAR(255) UNIQUE NOT NULL,
-                username         VARCHAR(100) NOT NULL,
-                password_hash    VARCHAR(255) NOT NULL,
-                song_name        VARCHAR(255),
-                artist_name      VARCHAR(255),
-                youtube_url      TEXT,
-                youtube_video_id VARCHAR(20),
-                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id             SERIAL PRIMARY KEY,
+                email          VARCHAR(255) UNIQUE NOT NULL,
+                username       VARCHAR(100) NOT NULL,
+                password_hash  VARCHAR(255) NOT NULL,
+                song_name      VARCHAR(255),
+                artist_name    VARCHAR(255),
+                audio_filename VARCHAR(255),
+                audio_mime     VARCHAR(100),
+                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Non-destructive migration for existing deployments
+        for col, defn in [
+            ("audio_filename", "VARCHAR(255)"),
+            ("audio_mime",     "VARCHAR(100)"),
+        ]:
+            try:
+                cur.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {defn}")
+            except Exception:
+                pass
         conn.commit(); cur.close(); conn.close()
         print("[startup] DB schema OK ✓")
     except Exception as e:
         print(f"[startup] DB init skipped (non-fatal): {e}")
 
 # ─────────────────────────────────────────────────────────────
-# UTILITY ROUTES
+# UTILITY
 # ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.8.0",
-            "essentia": ESSENTIA_AVAILABLE, "yt_dlp": _has_ytdlp(), "ffmpeg": _has_ffmpeg()}
+    return {"status": "ok", "version": "5.0.0",
+            "audio_dir": str(AUDIO_DIR),
+            "essentia": ESSENTIA_AVAILABLE}
 
 @app.get("/health")
 def health():
@@ -433,64 +224,16 @@ def health():
         conn = get_db(); conn.close(); db_ok = True
     except Exception:
         pass
+    audio_count = len(list(AUDIO_DIR.glob("*"))) if AUDIO_DIR.exists() else 0
     return {
-        "status": "healthy" if db_ok else "degraded",
-        "database": "healthy" if db_ok else "unavailable",
-        "essentia": ESSENTIA_AVAILABLE, "numpy": NUMPY_AVAILABLE,
-        "yt_dlp": _has_ytdlp(), "ffmpeg": _has_ffmpeg(),
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-
-# ─────────────────────────────────────────────────────────────
-# [D1] DIAGNOSTIC ENDPOINT — open in browser to see exact yt-dlp error
-# https://onesong.onrender.com/diag/ytdlp?youtube_id=uLHqpjW3aDs
-# ─────────────────────────────────────────────────────────────
-@app.get("/diag/ytdlp")
-async def diag_ytdlp(youtube_id: str = "uLHqpjW3aDs"):
-    """Runs yt-dlp --simulate and --list-formats, returns full output for debugging."""
-    if not _has_ytdlp():
-        return {"error": "yt-dlp not found", "PATH": os.environ.get("PATH", "")}
-
-    results = {}
-
-    # Get yt-dlp version
-    try:
-        vp = await asyncio.create_subprocess_exec(
-            "yt-dlp", "--version",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        vout, _ = await asyncio.wait_for(vp.communicate(), timeout=5.0)
-        results["ytdlp_version"] = vout.decode().strip()
-    except Exception as e:
-        results["ytdlp_version"] = f"error: {e}"
-
-    # Simulate download (fastest check — shows if video is accessible)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "yt-dlp", *_YTDLP_BASE_FLAGS,
-            "--simulate",
-            "--print", "id:%(id)s ext:%(ext)s format:%(format_id)s",
-            f"https://www.youtube.com/watch?v={youtube_id}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-        results["simulate"] = {
-            "returncode": proc.returncode,
-            "stdout": stdout.decode(errors="replace")[:2000],
-            "stderr": stderr.decode(errors="replace")[:3000],  # <-- this is where the error will be
-        }
-    except asyncio.TimeoutError:
-        results["simulate"] = {"error": "timeout after 30s — YouTube likely blocking this IP"}
-    except Exception as e:
-        results["simulate"] = {"error": str(e)}
-
-    return {
-        "youtube_id": youtube_id,
-        "ytdlp_path": shutil.which("yt-dlp"),
-        "ffmpeg_path": shutil.which("ffmpeg") or "NOT FOUND",
-        "results": results,
-        "tip": "Check simulate.stderr for the real error message from YouTube/yt-dlp",
+        "status":        "healthy" if db_ok else "degraded",
+        "database":      "healthy" if db_ok else "unavailable",
+        "audio_dir":     str(AUDIO_DIR),
+        "audio_files":   audio_count,
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "essentia":      ESSENTIA_AVAILABLE,
+        "numpy":         NUMPY_AVAILABLE,
+        "timestamp":     datetime.utcnow().isoformat(),
     }
 
 @app.get("/diag")
@@ -501,18 +244,13 @@ def diag():
     except Exception as e:
         db_err = str(e)
     return {
-        "status": "ok", "version": "4.8.0",
-        "deps": {
-            "psycopg2": PSYCOPG2_AVAILABLE, "numpy": NUMPY_AVAILABLE,
-            "essentia": ESSENTIA_AVAILABLE,
-            "yt_dlp": shutil.which("yt-dlp"),
-            "ffmpeg":  shutil.which("ffmpeg"),
-        },
-        "env": {
-            "DATABASE_URL":   "set" if DATABASE_URL else "NOT SET",
-            "JWT_SECRET":     "custom" if JWT_SECRET != "change-me-in-production" else "DEFAULT",
-            "LASTFM_API_KEY": "set" if LASTFM_KEY else "not set",
-        },
+        "status": "ok", "version": "5.0.0",
+        "deps": {"psycopg2": PSYCOPG2_AVAILABLE, "numpy": NUMPY_AVAILABLE,
+                 "essentia": ESSENTIA_AVAILABLE},
+        "env":  {"DATABASE_URL": "set" if DATABASE_URL else "NOT SET",
+                 "JWT_SECRET": "custom" if JWT_SECRET != "change-me-in-production" else "DEFAULT",
+                 "LASTFM_API_KEY": "set" if LASTFM_KEY else "not set",
+                 "AUDIO_DIR": str(AUDIO_DIR)},
         "database": {"ok": db_ok, "error": db_err},
         "ts": datetime.utcnow().isoformat() + "Z",
     }
@@ -520,7 +258,7 @@ def diag():
 # ─────────────────────────────────────────────────────────────
 # AUTH
 # ─────────────────────────────────────────────────────────────
-@app.post("/auth/signup", status_code=200)
+@app.post("/auth/signup")
 def signup(user: UserSignup):
     if len(user.password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
@@ -540,87 +278,283 @@ def signup(user: UserSignup):
         conn.commit()
     finally:
         cur.close(); conn.close()
-    return {
-        "token": make_token(uid, user.email.lower()),
-        "user":  {"id": uid, "email": user.email.lower(), "username": user.username.strip()},
-    }
+    return {"token": make_token(uid, user.email.lower()),
+            "user":  {"id": uid, "email": user.email.lower(), "username": user.username.strip()}}
 
-@app.post("/auth/login", status_code=200)
+@app.post("/auth/login")
 def login(user: UserLogin):
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute(
             "SELECT id, email, username, password_hash FROM users WHERE email = %s",
-            (user.email.lower(),),
-        )
+            (user.email.lower(),))
         row = cur.fetchone()
     finally:
         cur.close(); conn.close()
     if not row or not bcrypt.checkpw(user.password.encode(), row["password_hash"].encode()):
         raise HTTPException(401, "Invalid email or password")
-    return {
-        "token": make_token(row["id"], row["email"]),
-        "user":  {"id": row["id"], "email": row["email"], "username": row["username"]},
-    }
+    return {"token": make_token(row["id"], row["email"]),
+            "user":  {"id": row["id"], "email": row["email"], "username": row["username"]}}
 
-@app.get("/auth/verify", status_code=200)
+@app.get("/auth/verify")
 def verify(payload: dict = Depends(auth)):
     return {"valid": True, "user_id": payload["user_id"]}
 
 # ─────────────────────────────────────────────────────────────
-# USER SONG
+# USER SONG — GET
 # ─────────────────────────────────────────────────────────────
 @app.get("/user/song")
 def get_song(payload: dict = Depends(auth)):
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute(
-            "SELECT song_name, artist_name, youtube_url, youtube_video_id FROM users WHERE id = %s",
-            (payload["user_id"],),
-        )
+            "SELECT song_name, artist_name, audio_filename, audio_mime FROM users WHERE id = %s",
+            (payload["user_id"],))
         row = cur.fetchone()
     finally:
         cur.close(); conn.close()
-    if not row or not row["youtube_url"]:
+    if not row or not row["song_name"]:
         return {"has_song": False, "song": None}
-    return {"has_song": True, "song": dict(row)}
+    audio_path = _audio_path_for(payload["user_id"])
+    return {
+        "has_song": True,
+        "song": {
+            "song_name":      row["song_name"],
+            "artist_name":    row["artist_name"],
+            "audio_filename": row["audio_filename"],
+            "audio_mime":     row["audio_mime"],
+            "has_audio":      audio_path is not None,
+            "stream_url":     f"/stream/{payload['user_id']}",
+        }
+    }
 
-@app.put("/user/song")
-def save_song(song: SongData, payload: dict = Depends(auth)):
-    vid = extract_youtube_id(song.youtube_url)
-    if not vid:
-        raise HTTPException(400, "Invalid YouTube URL")
+# ─────────────────────────────────────────────────────────────
+# UPLOAD
+# ─────────────────────────────────────────────────────────────
+@app.post("/user/song/upload")
+async def upload_song(
+    payload:     dict      = Depends(auth),
+    song_name:   str       = Form(...),
+    artist_name: str       = Form(...),
+    file:        UploadFile = File(...),
+):
+    filename = file.filename or ""
+    ext      = Path(filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"Unsupported type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}")
+
+    # Stream-read with size cap
+    chunks, total = [], 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, f"File too large. Max {MAX_UPLOAD_MB} MB.")
+        chunks.append(chunk)
+
+    audio_bytes = b"".join(chunks)
+    if len(audio_bytes) < 1024:
+        raise HTTPException(400, "File is too small to be valid audio")
+
+    user_id = payload["user_id"]
+    mime    = MIME_MAP.get(ext, "audio/mpeg")
+
+    _delete_audio_for(user_id)
+    dest = AUDIO_DIR / f"{user_id}{ext}"
+    dest.write_bytes(audio_bytes)
+
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute(
-            """UPDATE users SET song_name=%s, artist_name=%s, youtube_url=%s,
-               youtube_video_id=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s""",
-            (song.song_name, song.artist_name, song.youtube_url, vid, payload["user_id"]),
+            """UPDATE users SET song_name=%s, artist_name=%s,
+               audio_filename=%s, audio_mime=%s, updated_at=CURRENT_TIMESTAMP
+               WHERE id=%s""",
+            (song_name.strip(), artist_name.strip(), filename, mime, user_id),
         )
         conn.commit()
     finally:
         cur.close(); conn.close()
-    d = song.model_dump() if hasattr(song, "model_dump") else song.dict()
-    return {"message": "Saved!", "song": {**d, "youtube_video_id": vid}}
 
-@app.get("/user/profile")
-def profile(payload: dict = Depends(auth)):
-    conn = get_db(); cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT id, email, username, created_at FROM users WHERE id = %s",
-            (payload["user_id"],),
-        )
-        row = cur.fetchone()
-    finally:
-        cur.close(); conn.close()
-    if not row:
-        raise HTTPException(404, "User not found")
-    return {**dict(row),
-            "created_at": row["created_at"].isoformat() if row["created_at"] else None}
+    # Clear stale analysis cache
+    _analysis_cache.pop(str(user_id), None)
+
+    print(f"[upload] user={user_id} file={filename} size={len(audio_bytes)//1024}KB mime={mime}")
+    return {
+        "message": "Uploaded!",
+        "song": {
+            "song_name":    song_name.strip(),
+            "artist_name":  artist_name.strip(),
+            "audio_mime":   mime,
+            "has_audio":    True,
+            "stream_url":   f"/stream/{user_id}",
+            "size_kb":      len(audio_bytes) // 1024,
+        }
+    }
 
 # ─────────────────────────────────────────────────────────────
-# LAST.FM
+# STREAM — Range-aware so browser seeking works
+# ─────────────────────────────────────────────────────────────
+@app.get("/stream/{user_id}")
+async def stream_audio(
+    user_id: int,
+    request: Request,
+    token:   Optional[str] = None,
+):
+    if not token:
+        raise HTTPException(401, "Token required")
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"], leeway=10)
+    except Exception:
+        raise HTTPException(401, "Invalid token")
+
+    audio_path = _audio_path_for(user_id)
+    if not audio_path:
+        raise HTTPException(404, "No audio file found. Please upload a song first.")
+
+    ext  = audio_path.suffix.lower()
+    mime = MIME_MAP.get(ext, "audio/mpeg")
+    size = audio_path.stat().st_size
+
+    # Parse Range header
+    range_header = request.headers.get("range")
+    if range_header:
+        try:
+            range_val         = range_header.replace("bytes=", "")
+            start_str, end_str = range_val.split("-")
+            start = int(start_str) if start_str else 0
+            end   = int(end_str)   if end_str   else size - 1
+        except Exception:
+            start, end = 0, size - 1
+    else:
+        start, end = 0, size - 1
+
+    start  = max(0, start)
+    end    = min(end, size - 1)
+    length = end - start + 1
+
+    def iter_file(path: Path, s: int, e: int, chunk: int = 65536):
+        with open(path, "rb") as f:
+            f.seek(s)
+            remaining = e - s + 1
+            while remaining > 0:
+                data = f.read(min(chunk, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+
+    headers = {
+        "Content-Range":               f"bytes {start}-{end}/{size}",
+        "Accept-Ranges":               "bytes",
+        "Content-Length":              str(length),
+        "Cache-Control":               "no-cache",
+        "Access-Control-Allow-Origin": "*",
+    }
+    return StreamingResponse(
+        iter_file(audio_path, start, end),
+        status_code=206 if range_header else 200,
+        media_type=mime,
+        headers=headers,
+    )
+
+# ─────────────────────────────────────────────────────────────
+# AUDIO ANALYSIS
+# ─────────────────────────────────────────────────────────────
+def _analyze_wav(wav_path: str) -> dict:
+    loader = es.MonoLoader(filename=wav_path, sampleRate=22050)
+    audio  = loader()
+    bpm, beats, _, _, _ = es.RhythmExtractor2013(method="multifeature")(audio)
+    sr, frame_size, hop_size = 22050, 1024, int(22050 / 60)
+    w              = es.Windowing(type="hann")
+    spectrum_algo  = es.Spectrum()
+    centroid_algo  = es.SpectralCentroidNormalized()
+    mel_bands_algo = es.MelBands(numberBands=8, sampleRate=sr,
+                                  lowFrequencyBound=20, highFrequencyBound=8000)
+    loudness_algo  = es.Loudness()
+    lf, cf, mf, bf = [], [], [], []
+    for i, frame in enumerate(es.FrameGenerator(audio, frameSize=frame_size, hopSize=hop_size)):
+        t         = i * hop_size / sr
+        loud_norm = float(np.tanh(max(0.0, (float(loudness_algo(frame)) + 60) / 60)))
+        spec      = spectrum_algo(w(frame))
+        cent_norm = float(centroid_algo(spec))
+        mels      = [float(np.tanh(max(0.0, (v + 80) / 80))) for v in mel_bands_algo(spec)]
+        lf.append({"t": round(t, 4), "v": round(loud_norm, 4)})
+        cf.append({"t": round(t, 4), "c": round(cent_norm, 4)})
+        mf.append({"t": round(t, 4), "bands": [round(m, 4) for m in mels]})
+        bf.append({"t": round(t, 4), "b": round(float(np.mean(mels[:2])), 4)})
+    return {
+        "tempo": round(float(bpm), 2),
+        "beats": [{"t": round(float(b), 4)} for b in beats],
+        "loudness": lf, "spectral": cf, "melbands": mf, "bass": bf,
+    }
+
+def _convert_to_wav(src: Path, dst: Path) -> bool:
+    """Use ffmpeg to convert any uploaded format to 22050Hz mono WAV for Essentia."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(src),
+             "-ar", "22050", "-ac", "1", "-f", "wav", str(dst)],
+            capture_output=True, timeout=120,
+        )
+        return r.returncode == 0 and dst.exists()
+    except Exception as e:
+        print(f"[analysis] ffmpeg convert failed: {e}")
+        return False
+
+def _fallback_analysis(duration: float = 240.0) -> dict:
+    tempo  = 120.0; beat_t = 60.0 / tempo
+    beats  = [{"t": round(i * beat_t, 4)} for i in range(int(duration / beat_t))]
+    lf, sf, mf, bf = [], [], [], []
+    for i in range(int(duration * 60)):
+        t = i / 60.0
+        lf.append({"t": round(t,4), "v": round(0.5+0.35*math.sin(t*0.8)+0.15*math.sin(t*3.1),4)})
+        sf.append({"t": round(t,4), "c": round(0.4+0.3*math.sin(t*0.5+1.2),4)})
+        bf.append({"t": round(t,4), "b": round(0.3+0.25*abs(math.sin(t*math.pi*2.0)),4)})
+        mf.append({"t": round(t,4), "bands": [round(0.2+0.2*math.sin(t*(0.4+k*0.15)+k),4) for k in range(8)]})
+    return {"tempo": tempo, "beats": beats, "loudness": lf, "spectral": sf, "melbands": mf, "bass": bf}
+
+@app.get("/audio_analysis")
+async def audio_analysis(
+    track:  str,
+    artist: str,
+    payload: dict = Depends(auth),
+):
+    user_id   = payload["user_id"]
+    cache_key = str(user_id)
+    if cache_key in _analysis_cache:
+        return _analysis_cache[cache_key]
+
+    audio_path = _audio_path_for(user_id)
+    if audio_path and ESSENTIA_AVAILABLE and NUMPY_AVAILABLE:
+        loop = asyncio.get_running_loop()
+        import tempfile
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                wav_path = Path(tmp) / "audio.wav"
+                # Convert to WAV if not already
+                if audio_path.suffix.lower() == ".wav":
+                    import shutil as _sh
+                    _sh.copy(audio_path, wav_path)
+                    converted = True
+                else:
+                    converted = await loop.run_in_executor(
+                        None, _convert_to_wav, audio_path, wav_path)
+                if converted:
+                    result = await loop.run_in_executor(None, _analyze_wav, str(wav_path))
+                    _analysis_cache[cache_key] = result
+                    print(f"[analysis] user={user_id} tempo={result['tempo']} beats={len(result['beats'])}")
+                    return result
+        except Exception as e:
+            print(f"[analysis] Essentia failed: {e}")
+
+    result = _fallback_analysis()
+    _analysis_cache[cache_key] = result
+    return result
+
+# ─────────────────────────────────────────────────────────────
+# LAST.FM mood
 # ─────────────────────────────────────────────────────────────
 @app.get("/mood")
 async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
@@ -647,88 +581,6 @@ async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
     except Exception as e:
         print(f"[mood] Last.fm failed: {e}")
     return {"tags": tags[:20]}
-
-# ─────────────────────────────────────────────────────────────
-# AUDIO ANALYSIS
-# ─────────────────────────────────────────────────────────────
-@app.get("/audio_analysis")
-async def audio_analysis(
-    track: str, artist: str,
-    payload: dict = Depends(auth),
-    youtube_id: Optional[str] = None,
-):
-    vid = youtube_id
-    if not vid:
-        try:
-            conn = get_db(); cur = conn.cursor()
-            try:
-                cur.execute("SELECT youtube_video_id FROM users WHERE id = %s", (payload["user_id"],))
-                row = cur.fetchone()
-                if row: vid = row["youtube_video_id"]
-            finally:
-                cur.close(); conn.close()
-        except Exception as e:
-            print(f"[audio_analysis] DB lookup failed: {e}")
-    if not vid:
-        return _fallback_analysis()
-    if vid in _analysis_cache:
-        return _analysis_cache[vid]
-    loop = asyncio.get_running_loop()
-    if ESSENTIA_AVAILABLE and NUMPY_AVAILABLE and _has_ytdlp():
-        with tempfile.TemporaryDirectory() as tmp:
-            wav_path   = os.path.join(tmp, f"{vid}.wav")
-            downloaded = await loop.run_in_executor(None, _download_audio, vid, wav_path)
-            if downloaded:
-                try:
-                    result = await loop.run_in_executor(None, _analyze_with_essentia, wav_path)
-                    _analysis_cache[vid] = result
-                    return result
-                except Exception as e:
-                    print(f"[audio_analysis] Essentia failed: {e}")
-    result = _fallback_analysis()
-    _analysis_cache[vid] = result
-    return result
-
-# ─────────────────────────────────────────────────────────────
-# AUDIO STREAM
-# ─────────────────────────────────────────────────────────────
-@app.get("/stream")
-async def stream_audio(
-    request: Request,
-    youtube_id: str,
-    token: Optional[str] = None,
-):
-    if not token:
-        raise HTTPException(401, "Token required")
-    try:
-        jwt.decode(token, JWT_SECRET, algorithms=["HS256"], leeway=10)
-    except Exception:
-        raise HTTPException(401, "Invalid token")
-    if not re.match(r'^[a-zA-Z0-9_\-]{11}$', youtube_id):
-        raise HTTPException(400, "Invalid youtube_id format")
-    if not _has_ytdlp():
-        return RedirectResponse(f"https://www.youtube.com/watch?v={youtube_id}", status_code=302)
-
-    if _has_ffmpeg():
-        print(f"[stream] {youtube_id} → mp3 via yt-dlp|ffmpeg")
-        generator = _stream_via_ytdlp_ffmpeg(youtube_id)
-    else:
-        print(f"[stream] {youtube_id} → raw (no ffmpeg)")
-        generator = _stream_via_ytdlp_only(youtube_id)
-
-    return StreamingResponse(
-        generator,
-        media_type="audio/mpeg",
-        headers={
-            "Cache-Control": "no-cache, no-store",
-            "Accept-Ranges": "none",
-            "X-Content-Type-Options": "nosniff",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization",
-        },
-    )
-
 
 if __name__ == "__main__":
     import uvicorn

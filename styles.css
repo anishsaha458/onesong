@@ -1,19 +1,11 @@
-/* OneSong — Zen Mode Styles v1.2 */
+/* OneSong — Styles v5.0 */
 /*
- * FIX [F1] TRANSPARENT BACKGROUNDS:
- *   - html/body background is #000 but NOT opaque over the canvas because
- *     the canvas is position:fixed at z-index:-1 — body background is behind it.
- *   - .layer had no explicit background, which was fine, but on some browsers
- *     a transparent root layer can trigger a white flash. Added explicit
- *     background: transparent to .layer and auth-container to be safe.
- *   - .glass-card already used rgba — retained.
- *   - The veil uses rgba(0,0,0,0.80) so particles bleed through intentionally.
- *
- * FIX [F2] CANVAS VISIBILITY:
- *   - Removed any chance of the canvas being obscured: explicit z-index:-1,
- *     pointer-events:none, display:block enforced in both CSS and JS (ambient.js).
- *   - Added isolation: isolate to #app-container and #auth-container so their
- *     stacking contexts don't accidentally cover z-index:-1 siblings.
+ * CHANGES vs v1.2:
+ *  [S1] Added .file-drop — click-to-browse dropzone with dashed border + hover glow
+ *  [S2] Added .upload-icon color to match accent
+ *  [S3] Added .upload-bar-wrap + .upload-bar — animated progress bar during upload
+ *  [S4] .file-hint — small format list text below the dropzone
+ *  All previous fixes [F1][F2] preserved unchanged.
  */
 
 /* Reset */
@@ -39,9 +31,6 @@
 
 html, body {
   width: 100%; min-height: 100vh;
-  /* FIX [F1]: Pure black background — canvas at z-index:-1 renders ON TOP
-     of the body background (fixed positioning lifts it above the normal flow).
-     This is correct and intentional. */
   background: var(--c-bg);
   color: var(--c-text);
   font-family: var(--font-mono); font-size: 14px; font-weight: 300;
@@ -50,12 +39,7 @@ html, body {
 }
 
 /* ─────────────────────────────────────────────────────────
-   GPGPU CANVAS — CRITICAL RULES
-   • NEVER display:none  — WebGL context is destroyed
-   • NEVER visibility:hidden — same issue
-   • NEVER z-index > -1 here — would cover UI
-   • position:fixed + inset:0 makes it fill viewport always
-   ambient.js also enforces these via JS as belt-and-braces
+   GPGPU CANVAS — DO NOT TOUCH THESE RULES
    ───────────────────────────────────────────────────────── */
 #ambient-canvas {
   position: fixed !important;
@@ -68,13 +52,12 @@ html, body {
 }
 
 /* ─────────────────────────────────────────────────────────
-   VEIL — translucent overlay, 80% black so particles bleed through
+   VEIL
    ───────────────────────────────────────────────────────── */
 .veil {
   position: fixed; inset: 0; z-index: 9998;
   display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 16px;
-  /* FIX [F1]: 0.80 opacity — particles glow through from canvas below */
   background: rgba(0, 0, 0, 0.80);
   backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
 }
@@ -90,9 +73,7 @@ html, body {
 .hidden { display: none !important; }
 
 /* ─────────────────────────────────────────────────────────
-   LAYER — transparent so canvas shows through
-   z-index:2 keeps UI above canvas at z-index:-1
-   FIX [F1]: background: transparent (was implicit, now explicit)
+   LAYER
    ───────────────────────────────────────────────────────── */
 .layer {
   position: relative; z-index: 2;
@@ -100,12 +81,11 @@ html, body {
   display: flex; flex-direction: column;
   align-items: center; justify-content: center;
   padding: 24px 16px 40px;
-  background: transparent;  /* FIX [F1]: explicit transparent — canvas shows through */
+  background: transparent;
 }
 
 /* ─────────────────────────────────────────────────────────
-   GLASS CARD — semi-transparent, backdrop blur
-   The glass effect lets canvas particles be dimly visible behind it
+   GLASS CARD
    ───────────────────────────────────────────────────────── */
 .glass-card {
   background: var(--c-glass);
@@ -132,14 +112,18 @@ html, body {
   font-family: var(--font-display); font-size: 2.3em;
   font-weight: 400; letter-spacing: -0.02em; color: var(--c-text);
 }
-.sub-text { text-align: center; color: var(--c-text3); font-size: 0.82em; letter-spacing: 0.05em; margin-bottom: 34px; }
+.sub-text {
+  text-align: center; color: var(--c-text3);
+  font-size: 0.82em; letter-spacing: 0.05em; margin-bottom: 34px;
+}
 .auth-form h2 {
   font-family: var(--font-display); font-weight: 400;
   font-size: 1.25em; color: var(--c-text2); text-align: center; margin-bottom: 18px;
 }
 
 /* Inputs */
-.auth-card input, .sel-card input, .song-selection input {
+.auth-card input, .sel-card input, .song-selection input[type="text"],
+.song-selection input[type="url"], .song-selection input[type="email"] {
   display: block; width: 100%; padding: 12px 15px; margin-bottom: 9px;
   background: rgba(10,10,18,0.75); border: 1px solid var(--c-border);
   border-radius: var(--r-sm); font-size: 13px;
@@ -147,11 +131,9 @@ html, body {
   outline: none; transition: border-color 0.2s, box-shadow 0.2s;
 }
 .auth-card input::placeholder,
-.sel-card input::placeholder,
-.song-selection input::placeholder { color: var(--c-text3); }
+.sel-card input::placeholder { color: var(--c-text3); }
 .auth-card input:focus,
-.sel-card input:focus,
-.song-selection input:focus {
+.sel-card input:focus {
   border-color: rgba(200,169,110,0.40);
   box-shadow: 0 0 0 3px rgba(200,169,110,0.06);
 }
@@ -195,7 +177,6 @@ html, body {
   position: fixed; top: 0; left: 0; right: 0; z-index: 100;
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 22px;
-  /* FIX [F1]: 45% opacity — particles show through topbar too */
   background: rgba(0, 0, 0, 0.45);
   backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
   border-bottom: 1px solid var(--c-border);
@@ -205,18 +186,14 @@ html, body {
   font-weight: 400; color: var(--c-accent); letter-spacing: -0.01em;
 }
 .topbar-right { display: flex; align-items: center; gap: 12px; }
-.topbar-user { color: var(--c-text2); font-size: 11px; letter-spacing: 0.04em; }
+.topbar-user  { color: var(--c-text2); font-size: 11px; letter-spacing: 0.04em; }
 
 /* ─────────────────────────────────────────────────────────
-   NOW PLAYING — full-screen transparent overlay
-   pointer-events:none on container so clicks reach canvas controls
-   pointer-events:auto re-enabled on direct children
+   NOW PLAYING
    ───────────────────────────────────────────────────────── */
 .now-playing {
   position: fixed; inset: 0;
-  pointer-events: none;
-  z-index: 10;
-  /* FIX [F1]: NO background here — fully transparent so canvas shows */
+  pointer-events: none; z-index: 10;
   background: transparent;
 }
 .now-playing > * { pointer-events: auto; }
@@ -277,7 +254,6 @@ html, body {
 
 .controls-row { display: flex; align-items: center; gap: 14px; }
 
-/* Play/Pause button */
 .play-btn {
   width: 38px; height: 38px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
@@ -311,24 +287,21 @@ html, body {
   text-align: center; font-size: 10px; letter-spacing: 0.07em;
   color: var(--c-text3); margin-top: 8px; min-height: 14px;
 }
-.sync-hint { text-align: center; font-size: 10px; color: var(--c-text3); letter-spacing: 0.04em; margin-top: 6px; }
+.sync-hint {
+  text-align: center; font-size: 10px; color: var(--c-text3);
+  letter-spacing: 0.04em; margin-top: 6px;
+}
 .sync-hint kbd {
   background: rgba(200,169,110,0.10); color: var(--c-accent);
   border: 1px solid rgba(200,169,110,0.20); border-radius: 4px;
   padding: 1px 6px; font-family: inherit; font-size: 0.9em;
 }
 
-/* Change Song button — ALWAYS visible, top-right, high z-index */
 .btn-change-song {
-  position: fixed;
-  top: 62px;
-  right: 22px;
-  z-index: 200;
+  position: fixed; top: 62px; right: 22px; z-index: 200;
   padding: 10px 18px;
-  background: var(--c-glass);
-  color: var(--c-text2);
-  border: 1px solid var(--c-border);
-  border-radius: 20px;
+  background: var(--c-glass); color: var(--c-text2);
+  border: 1px solid var(--c-border); border-radius: 20px;
   font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em;
   cursor: pointer;
   backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
@@ -344,12 +317,10 @@ html, body {
 
 /* ─────────────────────────────────────────────────────────
    SONG SELECTION OVERLAY
-   FIX [F1]: rgba(0,0,0,0.60) — semi-transparent so canvas glows through
    ───────────────────────────────────────────────────────── */
 .song-selection {
   position: fixed; inset: 0; z-index: 200;
   display: flex; align-items: center; justify-content: center; padding: 24px 16px;
-  /* FIX [F1]: 60% opacity so the particle field shows behind the form */
   background: rgba(0, 0, 0, 0.60);
   backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
 }
@@ -361,6 +332,70 @@ html, body {
 }
 .cancel-btn { display: block; margin: 12px auto 0; }
 
+/* ─────────────────────────────────────────────────────────
+   FILE UPLOAD — [S1] [S2] [S3] [S4]
+   ───────────────────────────────────────────────────────── */
+
+/* [S1] Dropzone */
+.file-drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 20px 16px 16px;
+  margin-bottom: 10px;
+  border: 1px dashed rgba(200, 169, 110, 0.22);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s, box-shadow 0.2s;
+  background: rgba(10, 10, 18, 0.60);
+  text-align: center;
+  user-select: none;
+}
+.file-drop:hover {
+  border-color: rgba(200, 169, 110, 0.50);
+  background: rgba(200, 169, 110, 0.04);
+  box-shadow: 0 0 0 3px rgba(200, 169, 110, 0.05);
+}
+
+/* [S2] Upload icon */
+.upload-icon {
+  width: 26px; height: 26px;
+  color: var(--c-accent);
+  flex-shrink: 0;
+}
+
+/* File label — updates to show filename after selection */
+#file-label {
+  font-size: 12px;
+  color: var(--c-text);
+  word-break: break-all;
+  line-height: 1.4;
+}
+
+/* [S4] Format hint */
+.file-hint {
+  font-size: 10px;
+  color: var(--c-text3);
+  letter-spacing: 0.05em;
+}
+
+/* [S3] Progress bar */
+.upload-bar-wrap {
+  height: 3px;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 2px;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.upload-bar {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--c-accent), var(--c-accent2));
+  border-radius: 2px;
+  transition: width 0.12s linear;
+}
+
 /* Responsive */
 @media (max-width: 540px) {
   .auth-card { padding: 30px 20px; }
@@ -368,4 +403,5 @@ html, body {
   .transport { width: calc(100vw - 32px); bottom: 16px; padding: 12px 14px; }
   .btn-change-song { right: 16px; }
   .song-title { font-size: 1.35em; }
+  .sel-card { padding: 28px 20px 24px; }
 }
