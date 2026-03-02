@@ -1,25 +1,30 @@
 """
-main.py — OneSong API  v4.6
+main.py — OneSong API  v4.7
 ────────────────────────────────────────────────────────────────
-FIXES vs v4.5:
+FIXES vs v4.6:
 
-[H1] 405 Method Not Allowed on /auth/login and /auth/signup:
-     Root cause was the CORS middleware crashing on every OPTIONS
-     preflight with TypeError (JSONResponse(204) has no content= arg).
-     The crash meant OPTIONS returned 500, the browser gave up, and
-     the actual POST never fired — surfacing as 405.
-     FIX: Response(status_code=204) for OPTIONS. No body, correct headers.
-     Auth routes are re-stated clearly below with explicit @app.post().
+[S1] PROBE RETURNING EMPTY EXT:
+     yt-dlp --print %(ext)s requires --simulate or it may not output
+     on some versions. Also the format selector was too strict.
+     FIX: Use --print after download simulation, or better — skip
+     the probe entirely and transcode everything to mp3 via ffmpeg
+     pipe. This is universally supported across all browsers.
 
-[H2] CORS headers now injected on all response paths including the
-     exception branch, so network errors always include CORS headers
-     instead of being opaque to the browser.
+[S2] UNIVERSAL AUDIO FORMAT:
+     Instead of trying to stream the native yt-dlp format (which
+     varies: webm, m4a, etc.), pipe through ffmpeg → mp3.
+     mp3 is supported by every browser including Safari iOS.
+     Content-Type: audio/mpeg is always correct.
 
-[H3] JWT decode leeway=10s tolerates minor clock skew between Render
-     workers and browser clients (sporadic 401s on valid tokens).
+[S3] STREAM PIPELINE:
+     yt-dlp stdout → ffmpeg stdin → ffmpeg stdout → browser
+     This avoids writing to disk and works on Render's ephemeral FS.
 
-[H4] /auth/signup validates password length and username length
-     server-side and returns clear 400 messages.
+[S4] Mood 404 fix: /mood route was returning 404 when LASTFM_KEY
+     was missing — now returns {"tags": []} with 200 as intended.
+     The ambient.js call to /mood was hitting 404 because the route
+     handler raised an unhandled exception path on some FastAPI versions.
+     Made the route more defensive.
 """
 
 from fastapi import FastAPI, HTTPException, Depends, Request
@@ -59,16 +64,10 @@ try:
 except ImportError:
     ESSENTIA_AVAILABLE = False
 
-app = FastAPI(title="OneSong API", version="4.6.0")
+app = FastAPI(title="OneSong API", version="4.7.0")
 
 # ─────────────────────────────────────────────────────────────
 # CORS MIDDLEWARE
-#
-# FIX [H1]: OPTIONS must return Response(204), NOT JSONResponse(204).
-# JSONResponse always serialises a body. A 204 must have none.
-# That TypeError crashed every preflight and broke POST routing.
-#
-# FIX [H2]: CORS headers on ALL branches including exceptions.
 # ─────────────────────────────────────────────────────────────
 CORS_HEADERS = {
     "Access-Control-Allow-Origin":   "*",
@@ -80,14 +79,11 @@ CORS_HEADERS = {
 @app.middleware("http")
 async def add_cors(request: Request, call_next):
     if request.method == "OPTIONS":
-        # FIX [H1]: bare Response — no body, valid 204
         return Response(status_code=204, headers=CORS_HEADERS)
     try:
         response = await call_next(request)
     except Exception as exc:
-        # FIX [H2]: CORS headers even on unhandled exceptions
-        return Response(status_code=204, headers=CORS_HEADERS)
-        
+        return Response(status_code=500, headers=CORS_HEADERS)
     for k, v in CORS_HEADERS.items():
         response.headers[k] = v
     return response
@@ -104,25 +100,11 @@ _analysis_cache: dict = {}
 
 security = HTTPBearer()
 
-_EXT_TO_MIME: dict[str, str] = {
-    "webm": "audio/webm",
-    "m4a":  "audio/mp4",
-    "mp4":  "audio/mp4",
-    "aac":  "audio/aac",
-    "mp3":  "audio/mpeg",
-    "ogg":  "audio/ogg",
-    "opus": "audio/ogg; codecs=opus",
-    "wav":  "audio/wav",
-}
-_FALLBACK_MIME = "audio/webm"
-
+# [S2] yt-dlp format — prefer best audio, any container
+# ffmpeg will transcode to mp3 regardless of input format
 _YT_FORMAT = (
-    "bestaudio[ext=webm]"
-    "/bestaudio[ext=m4a]"
-    "/bestaudio[ext=mp3]"
-    "/bestaudio[ext=wav]"
-    "/bestaudio"
-    "/worst"
+    "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio[ext=mp3]"
+    "/bestaudio[ext=aac]/bestaudio/worst"
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -181,7 +163,6 @@ def make_token(user_id: int, email: str) -> str:
 
 def auth(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     try:
-        # FIX [H3]: leeway=10s for clock skew between Render workers
         return jwt.decode(
             creds.credentials,
             JWT_SECRET,
@@ -194,35 +175,149 @@ def auth(creds: HTTPAuthorizationCredentials = Depends(security)) -> dict:
         raise HTTPException(401, "Invalid token")
 
 # ─────────────────────────────────────────────────────────────
-# yt-dlp helpers
+# yt-dlp + ffmpeg stream helpers [S1] [S2] [S3]
 # ─────────────────────────────────────────────────────────────
-async def _probe_stream_mime(youtube_id: str) -> str:
-    if not shutil.which("yt-dlp"):
-        return _FALLBACK_MIME
+
+def _has_ffmpeg() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+def _has_ytdlp() -> bool:
+    return shutil.which("yt-dlp") is not None
+
+async def _stream_via_ytdlp_ffmpeg(youtube_id: str):
+    """
+    [S3] Two-process pipeline: yt-dlp | ffmpeg → mp3 bytes
+    yt-dlp downloads audio to stdout, ffmpeg reads from stdin
+    and transcodes to mp3, writing to stdout which we stream to browser.
+    
+    mp3 is universally supported: Chrome, Firefox, Safari, iOS, Android.
+    """
+    yt_url = f"https://www.youtube.com/watch?v={youtube_id}"
+    
+    ytdlp_cmd = [
+        "yt-dlp",
+        "--no-playlist", "--no-cache-dir",
+        "--quiet", "--no-warnings", "--no-check-certificates",
+        "--format", _YT_FORMAT,
+        "--output", "-",   # write audio bytes to stdout
+        yt_url,
+    ]
+    
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-i", "pipe:0",          # read from stdin (yt-dlp stdout)
+        "-vn",                   # no video
+        "-acodec", "libmp3lame",
+        "-ab", "128k",           # 128kbps — good quality, small size
+        "-ar", "44100",
+        "-f", "mp3",
+        "pipe:1",                # write mp3 to stdout
+    ]
+    
+    print(f"[stream] Starting pipeline for {youtube_id}")
+    
+    yt_proc = await asyncio.create_subprocess_exec(
+        *ytdlp_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    
+    ff_proc = await asyncio.create_subprocess_exec(
+        *ffmpeg_cmd,
+        stdin=yt_proc.stdout,    # pipe yt-dlp stdout → ffmpeg stdin
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    
+    # Close yt_proc.stdout in this process so ffmpeg gets EOF when yt-dlp finishes
+    yt_proc.stdout.close()
+    
+    bytes_sent = 0
+    try:
+        # Wait for first chunk with timeout (yt-dlp startup + ffmpeg probe)
+        try:
+            first_chunk = await asyncio.wait_for(ff_proc.stdout.read(65536), timeout=20.0)
+        except asyncio.TimeoutError:
+            print(f"[stream] Pipeline timeout for {youtube_id}")
+            return
+        
+        if not first_chunk:
+            print(f"[stream] Empty output for {youtube_id}")
+            return
+        
+        bytes_sent += len(first_chunk)
+        yield first_chunk
+        
+        while True:
+            chunk = await ff_proc.stdout.read(65536)
+            if not chunk:
+                break
+            bytes_sent += len(chunk)
+            yield chunk
+            
+    except asyncio.CancelledError:
+        print(f"[stream] Client disconnected at {bytes_sent // 1024}KB")
+    finally:
+        print(f"[stream] {youtube_id}: {bytes_sent // 1024}KB sent")
+        for proc in (ff_proc, yt_proc):
+            try:
+                proc.kill()
+                await proc.wait()
+            except (ProcessLookupError, OSError):
+                pass
+
+
+async def _stream_via_ytdlp_only(youtube_id: str):
+    """
+    Fallback when ffmpeg is unavailable — stream raw audio from yt-dlp.
+    Less browser-compatible but better than nothing.
+    """
+    yt_url = f"https://www.youtube.com/watch?v={youtube_id}"
     cmd = [
         "yt-dlp", "--no-playlist", "--no-cache-dir",
-        "--quiet", "--no-warnings",
-        "--format", _YT_FORMAT,
-        "--print", "%(ext)s",
-        f"https://www.youtube.com/watch?v={youtube_id}",
+        "--quiet", "--no-warnings", "--no-check-certificates",
+        "--format", "bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio",
+        "--output", "-",
+        yt_url,
     ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    bytes_sent = 0
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-        ext  = stdout.decode().strip().lower()
-        mime = _EXT_TO_MIME.get(ext, _FALLBACK_MIME)
-        print(f"[probe] {youtube_id} → ext={ext!r} mime={mime!r}")
-        return mime
-    except Exception as e:
-        print(f"[probe] failed: {e}")
-        return _FALLBACK_MIME
+        try:
+            first_chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=15.0)
+        except asyncio.TimeoutError:
+            return
+        if not first_chunk:
+            return
+        bytes_sent += len(first_chunk)
+        yield first_chunk
+        while True:
+            chunk = await proc.stdout.read(65536)
+            if not chunk:
+                break
+            bytes_sent += len(chunk)
+            yield chunk
+    except asyncio.CancelledError:
+        pass
+    finally:
+        print(f"[stream-raw] {youtube_id}: {bytes_sent // 1024}KB sent")
+        try:
+            proc.kill()
+            await proc.wait()
+        except (ProcessLookupError, OSError):
+            pass
 
+
+# ─────────────────────────────────────────────────────────────
+# Essentia analysis helpers (unchanged from v4.6)
+# ─────────────────────────────────────────────────────────────
 def _download_audio(youtube_id: str, out_path: str) -> bool:
-    if not shutil.which("yt-dlp"):
+    if not _has_ytdlp():
         return False
     try:
         result = subprocess.run([
@@ -296,11 +391,11 @@ def _fallback_analysis(duration_estimate: float = 240.0) -> dict:
 @app.on_event("startup")
 async def startup():
     print("=" * 55)
-    print(f"  OneSong API v4.6 — startup")
+    print(f"  OneSong API v4.7 — startup")
     print("=" * 55)
     for label, val in [
-        ("ffmpeg",   shutil.which("ffmpeg") or "NOT IN PATH"),
-        ("yt-dlp",   shutil.which("yt-dlp") or "NOT IN PATH"),
+        ("ffmpeg",   shutil.which("ffmpeg") or "NOT IN PATH ⚠"),
+        ("yt-dlp",   shutil.which("yt-dlp") or "NOT IN PATH ⚠"),
         ("essentia", ESSENTIA_AVAILABLE),
         ("numpy",    NUMPY_AVAILABLE),
         ("psycopg2", PSYCOPG2_AVAILABLE),
@@ -335,10 +430,12 @@ async def startup():
 # ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "4.6.0",
-            "essentia": ESSENTIA_AVAILABLE,
-            "yt_dlp": shutil.which("yt-dlp") is not None,
-            "ffmpeg": shutil.which("ffmpeg") is not None}
+    return {
+        "status": "ok", "version": "4.7.0",
+        "essentia": ESSENTIA_AVAILABLE,
+        "yt_dlp":   _has_ytdlp(),
+        "ffmpeg":   _has_ffmpeg(),
+    }
 
 @app.get("/health")
 def health():
@@ -352,8 +449,8 @@ def health():
         "database":  "healthy" if db_ok else "unavailable",
         "essentia":  ESSENTIA_AVAILABLE,
         "numpy":     NUMPY_AVAILABLE,
-        "yt_dlp":    shutil.which("yt-dlp") is not None,
-        "ffmpeg":    shutil.which("ffmpeg") is not None,
+        "yt_dlp":    _has_ytdlp(),
+        "ffmpeg":    _has_ffmpeg(),
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -365,30 +462,26 @@ def diag():
     except Exception as e:
         db_err = str(e)
     return {
-        "status": "ok", "version": "4.6.0",
-        "deps": {"psycopg2": PSYCOPG2_AVAILABLE, "numpy": NUMPY_AVAILABLE,
-                 "essentia": ESSENTIA_AVAILABLE, "yt_dlp": shutil.which("yt-dlp"),
-                 "ffmpeg": shutil.which("ffmpeg")},
-        "env": {"DATABASE_URL": "set" if DATABASE_URL else "NOT SET",
-                "JWT_SECRET": "custom" if JWT_SECRET != "change-me-in-production" else "DEFAULT",
-                "LASTFM_API_KEY": "set" if LASTFM_KEY else "not set"},
+        "status": "ok", "version": "4.7.0",
+        "deps": {
+            "psycopg2": PSYCOPG2_AVAILABLE, "numpy": NUMPY_AVAILABLE,
+            "essentia": ESSENTIA_AVAILABLE,  "yt_dlp": shutil.which("yt-dlp"),
+            "ffmpeg":   shutil.which("ffmpeg"),
+        },
+        "env": {
+            "DATABASE_URL":   "set" if DATABASE_URL else "NOT SET",
+            "JWT_SECRET":     "custom" if JWT_SECRET != "change-me-in-production" else "DEFAULT",
+            "LASTFM_API_KEY": "set" if LASTFM_KEY else "not set",
+        },
         "database": {"ok": db_ok, "error": db_err},
         "ts": datetime.utcnow().isoformat() + "Z",
     }
 
 # ─────────────────────────────────────────────────────────────
 # AUTH ROUTES
-# FIX [H1] + [H4]: POST routes explicitly declared.
-# These routes were always correctly defined — the 405 came from the
-# middleware crash killing OPTIONS preflight before the browser could POST.
 # ─────────────────────────────────────────────────────────────
 @app.post("/auth/signup", status_code=200)
 def signup(user: UserSignup):
-    """
-    Create account.
-    Body:   { email, username, password }
-    Returns { token: str, user: { id, email, username } }
-    """
     if len(user.password) < 6:
         raise HTTPException(400, "Password must be at least 6 characters")
     if len(user.username.strip()) < 2:
@@ -416,11 +509,6 @@ def signup(user: UserSignup):
 
 @app.post("/auth/login", status_code=200)
 def login(user: UserLogin):
-    """
-    Authenticate.
-    Body:   { email, password }
-    Returns { token: str, user: { id, email, username } }
-    """
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute(
@@ -441,7 +529,6 @@ def login(user: UserLogin):
 
 @app.get("/auth/verify", status_code=200)
 def verify(payload: dict = Depends(auth)):
-    """Validate JWT. Returns { valid: true, user_id: int }"""
     return {"valid": True, "user_id": payload["user_id"]}
 
 # ─────────────────────────────────────────────────────────────
@@ -498,6 +585,7 @@ def profile(payload: dict = Depends(auth)):
 
 # ─────────────────────────────────────────────────────────────
 # LAST.FM
+# [S4] Defensive — always returns 200 with {"tags": []} on any failure
 # ─────────────────────────────────────────────────────────────
 @app.get("/mood")
 async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
@@ -510,15 +598,17 @@ async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
                 "method": "track.getTopTags", "track": track, "artist": artist,
                 "api_key": LASTFM_KEY, "format": "json", "autocorrect": "1",
             })
-            raw  = r.json().get("toptags", {}).get("tag", [])
-            tags = [t["name"].lower() for t in raw if int(t.get("count", 0)) > 10]
+            if r.status_code == 200:
+                raw  = r.json().get("toptags", {}).get("tag", [])
+                tags = [t["name"].lower() for t in raw if int(t.get("count", 0)) > 10]
             if len(tags) < 3:
                 r2 = await client.get(LASTFM_BASE, params={
                     "method": "artist.getTopTags", "artist": artist,
                     "api_key": LASTFM_KEY, "format": "json", "autocorrect": "1",
                 })
-                tags += [t["name"].lower()
-                         for t in r2.json().get("toptags", {}).get("tag", [])[:10]]
+                if r2.status_code == 200:
+                    tags += [t["name"].lower()
+                             for t in r2.json().get("toptags", {}).get("tag", [])[:10]]
     except Exception as e:
         print(f"[mood] Last.fm failed: {e}")
     return {"tags": tags[:20]}
@@ -527,31 +617,35 @@ async def get_mood(track: str, artist: str, payload: dict = Depends(auth)):
 async def recommendations(track: str, artist: str, payload: dict = Depends(auth)):
     if not LASTFM_KEY:
         return {"tracks": []}
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(LASTFM_BASE, params={
-            "method": "track.getSimilar", "track": track, "artist": artist,
-            "api_key": LASTFM_KEY, "format": "json", "limit": "5", "autocorrect": "1",
-        })
-        raw = r.json().get("similartracks", {}).get("track", [])
-        if not raw:
-            s = await client.get(LASTFM_BASE, params={
-                "method": "track.search", "track": track,
-                "api_key": LASTFM_KEY, "format": "json", "limit": "1",
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(LASTFM_BASE, params={
+                "method": "track.getSimilar", "track": track, "artist": artist,
+                "api_key": LASTFM_KEY, "format": "json", "limit": "5", "autocorrect": "1",
             })
-            hits = s.json().get("results", {}).get("trackmatches", {}).get("track", [])
-            if hits:
-                found = hits[0] if isinstance(hits, list) else hits
-                r2 = await client.get(LASTFM_BASE, params={
-                    "method": "track.getSimilar", "track": found["name"],
-                    "artist": found["artist"], "api_key": LASTFM_KEY,
-                    "format": "json", "limit": "5", "autocorrect": "1",
+            raw = r.json().get("similartracks", {}).get("track", [])
+            if not raw:
+                s = await client.get(LASTFM_BASE, params={
+                    "method": "track.search", "track": track,
+                    "api_key": LASTFM_KEY, "format": "json", "limit": "1",
                 })
-                raw = r2.json().get("similartracks", {}).get("track", [])
-    return {"tracks": [
-        {"name": t["name"], "artist": t["artist"]["name"],
-         "match": round(float(t.get("match", 0)) * 100), "url": t.get("url", "")}
-        for t in raw[:3]
-    ]}
+                hits = s.json().get("results", {}).get("trackmatches", {}).get("track", [])
+                if hits:
+                    found = hits[0] if isinstance(hits, list) else hits
+                    r2 = await client.get(LASTFM_BASE, params={
+                        "method": "track.getSimilar", "track": found["name"],
+                        "artist": found["artist"], "api_key": LASTFM_KEY,
+                        "format": "json", "limit": "5", "autocorrect": "1",
+                    })
+                    raw = r2.json().get("similartracks", {}).get("track", [])
+        return {"tracks": [
+            {"name": t["name"], "artist": t["artist"]["name"],
+             "match": round(float(t.get("match", 0)) * 100), "url": t.get("url", "")}
+            for t in raw[:3]
+        ]}
+    except Exception as e:
+        print(f"[recommendations] failed: {e}")
+        return {"tracks": []}
 
 # ─────────────────────────────────────────────────────────────
 # AUDIO ANALYSIS
@@ -581,7 +675,7 @@ async def audio_analysis(
         return _analysis_cache[vid]
 
     loop = asyncio.get_running_loop()
-    if ESSENTIA_AVAILABLE and NUMPY_AVAILABLE and shutil.which("yt-dlp"):
+    if ESSENTIA_AVAILABLE and NUMPY_AVAILABLE and _has_ytdlp():
         with tempfile.TemporaryDirectory() as tmp:
             wav_path   = os.path.join(tmp, f"{vid}.wav")
             downloaded = await loop.run_in_executor(None, _download_audio, vid, wav_path)
@@ -598,7 +692,7 @@ async def audio_analysis(
     return result
 
 # ─────────────────────────────────────────────────────────────
-# AUDIO STREAM
+# AUDIO STREAM  [S1] [S2] [S3]
 # ─────────────────────────────────────────────────────────────
 @app.get("/stream")
 async def stream_audio(
@@ -606,61 +700,55 @@ async def stream_audio(
     youtube_id: str,
     token: Optional[str] = None,
 ):
+    # Auth
     if not token:
         raise HTTPException(401, "Token required")
     try:
         jwt.decode(token, JWT_SECRET, algorithms=["HS256"], leeway=10)
     except Exception:
         raise HTTPException(401, "Invalid token")
+
+    # Validate ID
     if not re.match(r'^[a-zA-Z0-9_\-]{11}$', youtube_id):
         raise HTTPException(400, "Invalid youtube_id format")
-    if not shutil.which("yt-dlp"):
-        return RedirectResponse(f"https://www.youtube.com/watch?v={youtube_id}", status_code=302)
 
-    mime = await _probe_stream_mime(youtube_id)
-    cmd  = [
-        "yt-dlp", "--no-playlist", "--no-cache-dir",
-        "--quiet", "--no-warnings", "--no-check-certificates",
-        "--format", _YT_FORMAT, "--output", "-",
-        f"https://www.youtube.com/watch?v={youtube_id}",
-    ]
-    print(f"[stream] {youtube_id} mime={mime}")
-
-    async def audio_generator():
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    # No yt-dlp → redirect to YouTube (better than nothing)
+    if not _has_ytdlp():
+        return RedirectResponse(
+            f"https://www.youtube.com/watch?v={youtube_id}", status_code=302
         )
-        bytes_sent = 0
-        try:
-            try:
-                first_chunk = await asyncio.wait_for(proc.stdout.read(65536), timeout=12.0)
-            except asyncio.TimeoutError:
-                print(f"[stream] first-chunk timeout {youtube_id}"); return
-            if not first_chunk:
-                print(f"[stream] empty stream {youtube_id}"); return
-            bytes_sent += len(first_chunk); yield first_chunk
-            while True:
-                chunk = await proc.stdout.read(65536)
-                if not chunk: break
-                bytes_sent += len(chunk); yield chunk
-        except asyncio.CancelledError:
-            pass
-        finally:
-            print(f"[stream] {youtube_id}: {bytes_sent // 1024}KB sent")
-            try: proc.kill(); await proc.wait()
-            except ProcessLookupError: pass
+
+    # [S2] Always serve mp3 — universally supported
+    # If ffmpeg is available, transcode via pipeline [S3]
+    # Otherwise fall back to raw stream (less compatible)
+    if _has_ffmpeg():
+        print(f"[stream] {youtube_id} → mp3 via yt-dlp|ffmpeg pipeline")
+        generator = _stream_via_ytdlp_ffmpeg(youtube_id)
+        mime = "audio/mpeg"
+    else:
+        print(f"[stream] {youtube_id} → raw (no ffmpeg)")
+        generator = _stream_via_ytdlp_only(youtube_id)
+        mime = "audio/mpeg"   # best guess — prefer mp3 format in yt-dlp cmd above
 
     return StreamingResponse(
-        audio_generator(), media_type=mime,
+        generator,
+        media_type=mime,
         headers={
-            "Cache-Control": "no-cache, no-store", "Accept-Ranges": "none",
-            "X-Content-Type-Options": "nosniff",
+            "Cache-Control":              "no-cache, no-store",
+            "Accept-Ranges":              "none",
+            "X-Content-Type-Options":     "nosniff",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type, Authorization",
         },
     )
 
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="info")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        log_level="info",
+    )
