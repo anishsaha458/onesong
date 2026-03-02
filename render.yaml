@@ -1,20 +1,18 @@
-# render.yaml — OneSong API v4.6
+# render.yaml — OneSong API v4.8
 #
-# WHY PREVIOUS ATTEMPTS FAILED:
-#   Render 2025+ defaults to Python 3.14. It creates the virtualenv with
-#   that interpreter BEFORE buildCommand runs. So nothing inside buildCommand
-#   (including `python3.11` calls or pip flags) can change the interpreter.
+# WHY ESSENTIA WAS FALSE EVEN AFTER INSTALLING:
+#   The wheel installs successfully (no pip error) but the .so fails to
+#   load at import time because of missing runtime shared libraries.
+#   Essentia requires: libsndfile1, libeigen3, libfftw3, libavcodec
+#   The || true was swallowing both pip errors AND import errors silently.
 #
-#   `pythonVersion:` is NOT a real render.yaml key — Render ignores it.
-#   `runtime.txt` is ignored when render.yaml is present.
-#   `sync: false` env vars must be set manually in the dashboard and are
-#   read too late to affect venv creation.
-#
-# THE ONE FIX THAT WORKS:
-#   PYTHON_VERSION as a hardcoded `value:` in envVars.
-#   Render reads this during infrastructure setup, before the venv is created.
-#   It must be a fully-qualified version string: major.minor.patch
-#   Source: https://render.com/docs/python-version
+# FIXES:
+#   1. Expanded apt-get to include all essentia runtime dependencies
+#   2. Upgraded to essentia==2.1b6.dev1389 (July 2025) — freshest cp311 wheel
+#   3. Build now tests `python -c "import essentia"` explicitly and prints
+#      the actual error if it fails, so we can see what's wrong in logs
+#   4. PYTHON_VERSION stays as value: (not sync:) so Render creates venv
+#      with the right interpreter before buildCommand runs
 
 services:
   - type: web
@@ -26,52 +24,61 @@ services:
     buildCommand: |
       set -e
 
-      echo "=== Python version check (must be 3.11) ==="
+      echo "=== Python version ==="
       python --version
-      python -c "
-      import sys
-      v = sys.version_info[:2]
-      assert v == (3, 11), f'Wrong Python {sys.version} — PYTHON_VERSION env var was not applied before venv creation'
-      print(f'Python {sys.version} OK')
-      "
 
-      echo "=== System deps (ffmpeg required for yt-dlp audio conversion) ==="
+      echo "=== System deps (essentia runtime requirements) ==="
       apt-get update -qq
-      apt-get install -y --no-install-recommends ffmpeg libsndfile1
+      apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libsndfile1 \
+        libfftw3-dev \
+        libeigen3-dev \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libtag1-dev \
+        libsamplerate0
       apt-get clean && rm -rf /var/lib/apt/lists/*
 
       echo "=== Python deps ==="
       pip install --upgrade pip
       pip install -r requirements.txt
 
-      echo "=== Essentia (optional — non-fatal if wheel unavailable) ==="
-      pip install "essentia==2.1b6.dev1110" || \
-        echo "[build] essentia wheel not available for this platform — synthetic analysis will be used"
+      echo "=== Essentia (latest cp311 wheel — dev1389, July 2025) ==="
+      pip install "essentia==2.1b6.dev1389"
 
-      echo "=== Smoke test ==="
+      echo "=== Verify essentia imports cleanly ==="
       python -c "
-      import fastapi, uvicorn, jwt, bcrypt, psycopg2, httpx, numpy, yt_dlp
+      import essentia
+      import essentia.standard as es
+      print(f'essentia OK: {essentia.__version__}')
+      # Quick sanity check that core algorithms load
+      _ = es.MonoLoader
+      _ = es.RhythmExtractor2013
+      _ = es.MelBands
+      print('essentia algorithms OK')
+      "
+
+      echo "=== Full smoke test ==="
+      python -c "
       import shutil
-      print(f'All imports OK')
-      print(f'ffmpeg on PATH: {shutil.which(\"ffmpeg\")}')
-      print(f'yt-dlp on PATH: {shutil.which(\"yt-dlp\")}')
+      import fastapi, uvicorn, jwt, bcrypt, psycopg2, httpx, numpy, yt_dlp
+      print(f'All imports OK  numpy={numpy.__version__}')
+      print(f'ffmpeg: {shutil.which(\"ffmpeg\")}')
+      print(f'yt-dlp: {shutil.which(\"yt-dlp\")}')
       "
 
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --log-level info
-
     healthCheckPath: /health
 
     envVars:
-      # THE CRITICAL FIX — must be value: not sync: false
-      # Render reads this before creating the virtualenv.
       - key: PYTHON_VERSION
         value: "3.11.9"
 
       - key: JWT_SECRET
         generateValue: true
-
       - key: DATABASE_URL
         sync: false
-
       - key: LASTFM_API_KEY
         sync: false

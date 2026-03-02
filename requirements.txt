@@ -1,15 +1,7 @@
-# requirements.txt — OneSong API v4.6
-#
-# Every package here has a pre-built binary wheel for Python 3.11 (cp311)
-# on Linux x86_64. None require Rust, Cargo, or C compilation.
-#
-# pydantic-core is the package that was failing — it's written in Rust and
-# has no wheel for Python 3.14 yet, so pip tried to compile from source
-# and hit Render's read-only /usr/local/cargo filesystem.
-# Pinned to 2.18.2 which has a confirmed cp311 manylinux wheel on PyPI.
-#
-# essentia is intentionally absent — installed separately in render.yaml
-# buildCommand with || true so a missing wheel doesn't abort the build.
+# requirements.txt — OneSong API v4.8
+# essentia is NOT here — it's installed separately in render.yaml after
+# all system libs are in place. Installing it via requirements.txt runs
+# before apt-get, so the .so loads but immediately fails on missing libsndfile.
 
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
