@@ -1,9 +1,23 @@
 /**
- * ambient.js — GPGPU Flow Field Visualizer  v3.3
+ * ambient.js — GPGPU Flow Field Visualizer  v3.4
  * ─────────────────────────────────────────────────────────────
  * Three.js r128 · 512×256 FBO ping-pong · 131 072 particles
  * Curl-noise physics · Persistence trail · ACES tonemap
- * UNCHANGED from v3.3 — no YouTube/streaming dependencies here.
+ *
+ * FIX vs v3.3 — [G1] HalfFloatType everywhere:
+ *   _detectCapability() previously used FloatType for sim FBOs on WebGL1
+ *   with OES_texture_float. On Mali/Adreno/PowerVR mobile GPUs, full-float
+ *   render targets silently produce black output — OES_texture_float_linear
+ *   is present but render-to-float-texture is not actually supported.
+ *   HalfFloatType has universal render-target support across WebGL1/2 and
+ *   all GPU vendors. The simulation precision loss is imperceptible at this
+ *   particle count with these physics scales.
+ *
+ *   Changes:
+ *     • _detectCapability() — sType always set to HalfFloatType
+ *     • prime() — DataTexture seeded with Float32Array (full precision for
+ *       initial positions), but FBOs use HalfFloat for rendering
+ *     • All mkFBO() calls use the unified halfType from cap
  */
 
 const Ambient = (() => {
@@ -247,14 +261,19 @@ const Ambient = (() => {
     return sc;
   }
 
-  function prime(fboTarget, data, texType) {
-    const tex = new THREE.DataTexture(data, FBO_W, FBO_H, THREE.RGBAFormat, texType);
+  function prime(fboTarget, data, orthoCamera) {
+    // Seed an FBO from a Float32Array via a DataTexture.
+    // We always use FloatType for the DataTexture source (CPU data is full precision);
+    // the FBO itself uses HalfFloat for the render target — that's set at mkFBO time.
+    const tex = new THREE.DataTexture(data, FBO_W, FBO_H, THREE.RGBAFormat, THREE.FloatType);
     tex.needsUpdate = true;
     const sc = new THREE.Scene();
     sc.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2),
       new THREE.MeshBasicMaterial({ map: tex })));
-    renderer.setRenderTarget(fboTarget); renderer.clear();
-    renderer.render(sc, ortho); renderer.setRenderTarget(null);
+    renderer.setRenderTarget(fboTarget);
+    renderer.clear();
+    renderer.render(sc, orthoCamera);
+    renderer.setRenderTarget(null);
   }
 
   function _cssFallback(canvas) {
@@ -263,30 +282,61 @@ const Ambient = (() => {
     const shimmer = setInterval(() => {
       hue = (hue + 0.15) % 360;
       const h2 = (hue + 40) % 360;
-      canvas.style.background = `radial-gradient(ellipse at 50% 55%, hsl(${hue},60%,10%) 0%, hsl(${h2},40%,3%) 60%, #000 100%)`;
+      canvas.style.background =
+        `radial-gradient(ellipse at 50% 55%, hsl(${hue},60%,10%) 0%, hsl(${h2},40%,3%) 60%, #000 100%)`;
     }, 50);
     canvas._shimmerTimer = shimmer;
   }
 
+  // [G1] _detectCapability — HalfFloatType for ALL render targets.
+  //
+  // Previous behaviour:
+  //   WebGL2          → FloatType sim,  HalfFloat trail   ← black on some mobile WebGL2
+  //   WebGL1+full-f   → FloatType sim,  HalfFloat trail   ← BLACK on Mali/Adreno/PowerVR
+  //   WebGL1+half-f   → HalfFloat sim,  HalfFloat trail
+  //
+  // New behaviour (this version):
+  //   WebGL2          → HalfFloat sim,  HalfFloat trail   ← works everywhere
+  //   WebGL1+half-f   → HalfFloat sim,  HalfFloat trail   ← works everywhere
+  //   neither         → CSS fallback
+  //
+  // Why HalfFloat is safe here:
+  //   • Particle positions live in [-1.65, 1.65] — well within half-float range (~±65504)
+  //   • Velocity magnitudes are tiny (< 2.0 typically) — no precision issue
+  //   • The simulation runs at 60fps so accumulated error per step is negligible
   function _detectCapability(gl) {
     const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined')
       && (gl instanceof WebGL2RenderingContext);
+
     if (isWebGL2) {
-      console.info('[Ambient] WebGL2 ✓ — full float textures');
-      return { sType: THREE.FloatType, halfType: THREE.HalfFloatType, fboW: 512, fboH: 256, ok: true };
+      console.info('[Ambient] WebGL2 ✓ — HalfFloat FBOs (universal render-target support)');
+      return {
+        sType: THREE.HalfFloatType,      // [G1] was FloatType — black on mobile WebGL2
+        halfType: THREE.HalfFloatType,
+        fboW: 512, fboH: 256,
+        ok: true,
+      };
     }
-    const hasF  = !!gl.getExtension('OES_texture_float');
+
+    // WebGL1 — need the half-float extension for render targets
     const hasHF = !!gl.getExtension('OES_texture_half_float');
+    // Also probe full-float (we log it but no longer USE it for FBOs)
+    const hasF  = !!gl.getExtension('OES_texture_float');
     console.info('[Ambient] WebGL1 extensions:', { hasF, hasHF });
-    if (hasF) {
-      console.info('[Ambient] Full float ✓ (512×256)');
-      return { sType: THREE.FloatType, halfType: THREE.HalfFloatType, fboW: 512, fboH: 256, ok: true };
-    }
+
     if (hasHF) {
-      console.info('[Ambient] Half-float ✓ (256×128)');
-      return { sType: THREE.HalfFloatType, halfType: THREE.HalfFloatType, fboW: 256, fboH: 128, ok: true };
+      console.info('[Ambient] HalfFloat ✓ (512×256) — render-target safe on all vendors');
+      return {
+        sType: THREE.HalfFloatType,      // [G1] was FloatType — black on Mali/Adreno
+        halfType: THREE.HalfFloatType,
+        fboW: 512, fboH: 256,
+        ok: true,
+      };
     }
-    console.warn('[Ambient] No float texture support — CSS fallback');
+
+    // Full-float only (no half-float) — extremely rare; still black on many GPUs.
+    // Degrade to CSS rather than ship a broken experience.
+    console.warn('[Ambient] No half-float texture support — CSS fallback');
     return { ok: false };
   }
 
@@ -322,7 +372,9 @@ const Ambient = (() => {
     if (!cap.ok) { _cssFallback(canvas); return false; }
 
     FBO_W = cap.fboW; FBO_H = cap.fboH;
-    const sType = cap.sType;
+
+    // [G1] sType is now HalfFloatType in all code paths — no FloatType FBOs anywhere
+    const sType = cap.sType;   // THREE.HalfFloatType
 
     clock = new THREE.Clock();
     ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -335,6 +387,7 @@ const Ambient = (() => {
     trailB     = mkFBO(innerWidth, innerHeight, cap.halfType);
     particleRT = mkFBO(innerWidth, innerHeight, cap.halfType);
 
+    // Seed initial particle positions (full Float32 precision at init time)
     const posData = new Float32Array(FBO_W * FBO_H * 4);
     for (let i = 0; i < FBO_W * FBO_H; i++) {
       const th = Math.random() * Math.PI * 2;
@@ -345,10 +398,10 @@ const Ambient = (() => {
       posData[i*4+2] = Math.cos(ph)*r;
       posData[i*4+3] = 0.001;
     }
-    prime(posA, posData, THREE.FloatType);
-    prime(posB, posData, THREE.FloatType);
-    prime(velA, new Float32Array(FBO_W * FBO_H * 4), THREE.FloatType);
-    prime(velB, new Float32Array(FBO_W * FBO_H * 4), THREE.FloatType);
+    prime(posA, posData, ortho);
+    prime(posB, posData, ortho);
+    prime(velA, new Float32Array(FBO_W * FBO_H * 4), ortho);
+    prime(velB, new Float32Array(FBO_W * FBO_H * 4), ortho);
 
     U.uPos.value = posA.texture;
     U.uVel.value = velA.texture;
@@ -388,7 +441,11 @@ const Ambient = (() => {
     particleCam.position.z = 2.2;
 
     trailMat = new THREE.ShaderMaterial({
-      uniforms: { uPart: { value: null }, uTrail: { value: null }, uDecay: { value: TRAIL_DECAY } },
+      uniforms: {
+        uPart:  { value: null },
+        uTrail: { value: null },
+        uDecay: { value: TRAIL_DECAY },
+      },
       vertexShader: NDC_V, fragmentShader: TRAIL_F,
     });
     trailSc = mkNDCScene(trailMat);
@@ -407,7 +464,7 @@ const Ambient = (() => {
     });
 
     initialized = true;
-    console.info(`[Ambient] Init OK — ${FBO_W}×${FBO_H} FBO (${FBO_W * FBO_H} particles)`);
+    console.info(`[Ambient] Init OK — ${FBO_W}×${FBO_H} FBO (${FBO_W * FBO_H} particles) HalfFloat`);
     _startLoop();
     return true;
   }

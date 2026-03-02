@@ -1,20 +1,33 @@
 """
-main.py — OneSong API  v5.1
+main.py — OneSong API  v5.2
 ────────────────────────────────────────────────────────────────
-File-upload + range-aware streaming. No yt-dlp.
+FIXES vs v5.1
+─────────────
+[R1] CRASH FIX — confirmed PermissionError on Render startup:
+     AUDIO_DIR defaulted to '/audio' and AUDIO_DIR.mkdir() was called at
+     MODULE LEVEL (line 58 in v5.1). Render's non-root container user cannot
+     create directories at the filesystem root.
+     Stack trace from Render logs:
+       File "main.py", line 58, in <module>
+         AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+       PermissionError: [Errno 13] Permission denied: '/audio'
+       ==> Exited with status 1
+     Fix: default to '/tmp/onesong_audio' (always writable) and move ALL
+     mkdir() calls inside lifespan() where failures are caught and logged.
 
-FIXES vs v5.0:
-  [F1] @app.on_event("startup") → lifespan() — avoids FastAPI deprecation warning
-       that causes Uvicorn to swallow the error and refuse to start on newer FastAPI
-  [F2] /audio_analysis — moved `payload: dict = Depends(auth)` BEFORE query params
-       so FastAPI's dependency injection resolves correctly (query params after deps)
-  [F3] _analyze_wav — es.SpectralCentroidNormalized() does not exist in Essentia
-       standard; replaced with es.SpectralCentroid() + manual normalisation
-  [F4] /stream/{user_id} — token also accepted via Authorization header so the
-       <audio> element (which sends the token as a query param) AND fetch() calls
-       with headers both work
-  [F5] startup DB migration wrapped per-column so one failing ALTER TABLE does not
-       abort the whole migration and prevent the server from starting
+[R2] UPLOAD PIPELINE — shutil streaming to /tmp scratch file:
+     upload_song() now streams UploadFile to /tmp/uploads/<uid>.<ext>
+     in 1 MB chunks (no full-file RAM buffer), then shutil.move() to
+     AUDIO_DIR. Matches the emergency brief exactly.
+
+[R3] AUTH 405 FIX — explicit @app.options() handlers for auth routes:
+     Registered before any middleware can shadow them. The global CORS
+     middleware handles OPTIONS, but Render's reverse proxy can forward
+     OPTIONS to the router for known paths. Explicit handlers guarantee
+     204 at the route layer regardless of proxy behaviour.
+
+[R4] CORS middleware uses Response (not JSONResponse) for 204 — correct,
+     no body, includes Content-Type header for strict preflight clients.
 """
 
 from contextlib import asynccontextmanager
@@ -23,7 +36,7 @@ from fastapi.responses import StreamingResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from typing import Optional
-import jwt, bcrypt, os, re, httpx, asyncio, shutil, math, subprocess
+import jwt, bcrypt, os, httpx, asyncio, shutil, math, subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -54,11 +67,19 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 LASTFM_KEY   = os.getenv("LASTFM_API_KEY")
 LASTFM_BASE  = "https://ws.audioscrobbler.com/2.0/"
 
-AUDIO_DIR = Path(os.getenv("AUDIO_DIR", "/audio"))
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-
 MAX_UPLOAD_MB    = int(os.getenv("MAX_UPLOAD_MB", "50"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+# [R1] /tmp is ALWAYS writable on Render (free tier, paid tier, any region).
+#      Attach a Render Disk and set AUDIO_DIR=/mnt/audio for persistence
+#      across deploys. Without a disk the uploads live in /tmp (ephemeral)
+#      but the process STARTS instead of crashing with PermissionError.
+#
+#      CRITICAL: Do NOT call .mkdir() here at module level.
+#      Module-level code that raises kills the process before uvicorn binds.
+#      All directory creation is inside lifespan() below.
+AUDIO_DIR   = Path(os.getenv("AUDIO_DIR", "/tmp/onesong_audio"))
+TMP_UPLOADS = Path("/tmp/uploads")          # [R2] scratch space during streaming
 
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".weba"}
 MIME_MAP = {
@@ -86,17 +107,30 @@ CORS_HEADERS = {
 }
 
 # ─────────────────────────────────────────────────────────────
-# [F1] LIFESPAN — replaces deprecated @app.on_event("startup")
+# [R1] LIFESPAN — ALL directory creation lives here, never at module level
 # ─────────────────────────────────────────────────────────────
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     # ── startup ──────────────────────────────────────────────
     print("=" * 55)
-    print("  OneSong API v5.1 — startup")
+    print("  OneSong API v5.2 — startup")
     print("=" * 55)
+
+    # Create working dirs here. If this fails it's logged, not fatal.
+    # A crash here still lets the server start (lifespan errors are non-fatal
+    # to uvicorn's bind step), whereas module-level crashes are always fatal.
+    for d in (AUDIO_DIR, TMP_UPLOADS):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            print(f"  dir ready      {d}")
+        except PermissionError as e:
+            print(f"  dir WARNING    cannot create {d}: {e}")
+            print(f"  hint: set AUDIO_DIR env var to a writable path, e.g. /tmp/audio")
+
     audio_count = len(list(AUDIO_DIR.glob("*"))) if AUDIO_DIR.exists() else 0
     for label, val in [
         ("audio dir",   str(AUDIO_DIR)),
+        ("tmp uploads", str(TMP_UPLOADS)),
         ("audio files", audio_count),
         ("max upload",  f"{MAX_UPLOAD_MB}MB"),
         ("essentia",    ESSENTIA_AVAILABLE),
@@ -109,6 +143,7 @@ async def lifespan(app: FastAPI):
         print(f"  {label:<14}{val}")
     print("=" * 55)
 
+    # DB schema init — wrapped so missing DATABASE_URL doesn't abort startup
     try:
         conn = get_db()
         cur  = conn.cursor()
@@ -127,8 +162,7 @@ async def lifespan(app: FastAPI):
             )
         """)
         conn.commit()
-
-        # [F5] Non-destructive migration — each column isolated
+        # Non-destructive column migration — each column isolated
         for col, defn in [
             ("audio_filename", "VARCHAR(255)"),
             ("audio_mime",     "VARCHAR(100)"),
@@ -139,7 +173,6 @@ async def lifespan(app: FastAPI):
             except Exception as col_err:
                 conn.rollback()
                 print(f"[startup] migration note for {col}: {col_err}")
-
         cur.close()
         conn.close()
         print("[startup] DB schema OK ✓")
@@ -147,16 +180,26 @@ async def lifespan(app: FastAPI):
         print(f"[startup] DB init skipped (non-fatal): {e}")
 
     yield
-    # ── shutdown (nothing to clean up) ───────────────────────
+    # ── shutdown ─────────────────────────────────────────────
+    # Nothing to clean up — /tmp is wiped by the OS on container stop
 
 
-app = FastAPI(title="OneSong API", version="5.1.0", lifespan=lifespan)
+# ─────────────────────────────────────────────────────────────
+# APP — constructed AFTER lifespan is defined
+# ─────────────────────────────────────────────────────────────
+app = FastAPI(title="OneSong API", version="5.2.0", lifespan=lifespan)
 
 
+# ─────────────────────────────────────────────────────────────
+# CORS MIDDLEWARE — [R4] Response (not JSONResponse) for OPTIONS
+# ─────────────────────────────────────────────────────────────
 @app.middleware("http")
 async def add_cors(request: Request, call_next):
     if request.method == "OPTIONS":
-        return Response(status_code=204, headers=CORS_HEADERS)
+        return Response(
+            status_code=204,
+            headers={**CORS_HEADERS, "Content-Type": "text/plain"},
+        )
     try:
         response = await call_next(request)
     except Exception:
@@ -164,6 +207,7 @@ async def add_cors(request: Request, call_next):
     for k, v in CORS_HEADERS.items():
         response.headers[k] = v
     return response
+
 
 # ─────────────────────────────────────────────────────────────
 # MODELS
@@ -176,6 +220,7 @@ class UserSignup(BaseModel):
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+
 
 # ─────────────────────────────────────────────────────────────
 # HELPERS
@@ -221,14 +266,14 @@ def _delete_audio_for(user_id: int):
         if p.exists():
             p.unlink()
 
+
 # ─────────────────────────────────────────────────────────────
-# UTILITY
+# UTILITY ROUTES
 # ─────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "5.1.0",
-            "audio_dir": str(AUDIO_DIR),
-            "essentia": ESSENTIA_AVAILABLE}
+    return {"status": "ok", "version": "5.2.0",
+            "audio_dir": str(AUDIO_DIR), "essentia": ESSENTIA_AVAILABLE}
 
 @app.get("/health")
 def health():
@@ -257,20 +302,32 @@ def diag():
     except Exception as e:
         db_err = str(e)
     return {
-        "status": "ok", "version": "5.1.0",
-        "deps": {"psycopg2": PSYCOPG2_AVAILABLE, "numpy": NUMPY_AVAILABLE,
-                 "essentia": ESSENTIA_AVAILABLE},
-        "env":  {"DATABASE_URL": "set" if DATABASE_URL else "NOT SET",
-                 "JWT_SECRET": "custom" if JWT_SECRET != "change-me-in-production" else "DEFAULT",
-                 "LASTFM_API_KEY": "set" if LASTFM_KEY else "not set",
-                 "AUDIO_DIR": str(AUDIO_DIR)},
+        "status": "ok", "version": "5.2.0",
+        "deps":  {"psycopg2": PSYCOPG2_AVAILABLE, "numpy": NUMPY_AVAILABLE,
+                  "essentia": ESSENTIA_AVAILABLE},
+        "env":   {"DATABASE_URL":   "set" if DATABASE_URL else "NOT SET",
+                  "JWT_SECRET":     "custom" if JWT_SECRET != "change-me-in-production" else "DEFAULT",
+                  "LASTFM_API_KEY": "set" if LASTFM_KEY else "not set",
+                  "AUDIO_DIR":      str(AUDIO_DIR)},
         "database": {"ok": db_ok, "error": db_err},
         "ts": datetime.utcnow().isoformat() + "Z",
     }
 
+
 # ─────────────────────────────────────────────────────────────
 # AUTH
+# [R3] Explicit OPTIONS handlers for every auth path.
+#      FastAPI's middleware handles OPTIONS globally, but Render's proxy
+#      sometimes forwards OPTIONS to the router for registered paths.
+#      These handlers guarantee a 204 at the route layer so POST routes
+#      are never accidentally shadowed or blocked.
 # ─────────────────────────────────────────────────────────────
+@app.options("/auth/signup")
+@app.options("/auth/login")
+@app.options("/auth/verify")
+async def auth_options():
+    return Response(status_code=204, headers=CORS_HEADERS)
+
 @app.post("/auth/signup")
 def signup(user: UserSignup):
     if len(user.password) < 6:
@@ -291,8 +348,10 @@ def signup(user: UserSignup):
         conn.commit()
     finally:
         cur.close(); conn.close()
-    return {"token": make_token(uid, user.email.lower()),
-            "user":  {"id": uid, "email": user.email.lower(), "username": user.username.strip()}}
+    return {
+        "token": make_token(uid, user.email.lower()),
+        "user":  {"id": uid, "email": user.email.lower(), "username": user.username.strip()},
+    }
 
 @app.post("/auth/login")
 def login(user: UserLogin):
@@ -306,12 +365,15 @@ def login(user: UserLogin):
         cur.close(); conn.close()
     if not row or not bcrypt.checkpw(user.password.encode(), row["password_hash"].encode()):
         raise HTTPException(401, "Invalid email or password")
-    return {"token": make_token(row["id"], row["email"]),
-            "user":  {"id": row["id"], "email": row["email"], "username": row["username"]}}
+    return {
+        "token": make_token(row["id"], row["email"]),
+        "user":  {"id": row["id"], "email": row["email"], "username": row["username"]},
+    }
 
 @app.get("/auth/verify")
 def verify(payload: dict = Depends(auth)):
     return {"valid": True, "user_id": payload["user_id"]}
+
 
 # ─────────────────────────────────────────────────────────────
 # USER SONG — GET
@@ -341,9 +403,16 @@ def get_song(payload: dict = Depends(auth)):
         }
     }
 
+
 # ─────────────────────────────────────────────────────────────
 # UPLOAD
+# [R2] Streams UploadFile to /tmp/uploads/<uid>.<ext> in 1 MB chunks
+#      (never holds entire file in RAM), then shutil.move() to AUDIO_DIR.
 # ─────────────────────────────────────────────────────────────
+@app.options("/user/song/upload")
+async def upload_options():
+    return Response(status_code=204, headers=CORS_HEADERS)
+
 @app.post("/user/song/upload")
 async def upload_song(
     payload:     dict       = Depends(auth),
@@ -354,34 +423,54 @@ async def upload_song(
     filename = file.filename or ""
     ext      = Path(filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(400, f"Unsupported type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}")
-
-    chunks, total = [], 0
-    while True:
-        chunk = await file.read(1024 * 1024)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > MAX_UPLOAD_BYTES:
-            raise HTTPException(413, f"File too large. Max {MAX_UPLOAD_MB} MB.")
-        chunks.append(chunk)
-
-    audio_bytes = b"".join(chunks)
-    if len(audio_bytes) < 1024:
-        raise HTTPException(400, "File is too small to be valid audio")
+        raise HTTPException(
+            400,
+            f"Unsupported type '{ext}'. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+        )
 
     user_id = payload["user_id"]
     mime    = MIME_MAP.get(ext, "audio/mpeg")
 
-    _delete_audio_for(user_id)
-    dest = AUDIO_DIR / f"{user_id}{ext}"
-    dest.write_bytes(audio_bytes)
+    # Ensure dirs exist — /tmp can be cleared between requests on some Render
+    # instances; recreating them here is cheap and defensive.
+    TMP_UPLOADS.mkdir(parents=True, exist_ok=True)
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+    # [R2] Stream to /tmp scratch file — never hold the whole file in RAM
+    scratch = TMP_UPLOADS / f"upload_{user_id}{ext}"
+    total   = 0
+    try:
+        with open(scratch, "wb") as out_f:
+            while True:
+                chunk = await file.read(1024 * 1024)   # 1 MB at a time
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"File too large. Max {MAX_UPLOAD_MB} MB.")
+                out_f.write(chunk)
+
+        if total < 1024:
+            raise HTTPException(400, "File is too small to be valid audio")
+
+        # Atomic move from scratch → permanent location
+        _delete_audio_for(user_id)
+        dest = AUDIO_DIR / f"{user_id}{ext}"
+        shutil.move(str(scratch), str(dest))
+
+    except HTTPException:
+        scratch.unlink(missing_ok=True)
+        raise
+    except Exception as e:
+        scratch.unlink(missing_ok=True)
+        raise HTTPException(500, f"Upload failed: {e}")
 
     conn = get_db(); cur = conn.cursor()
     try:
         cur.execute(
-            """UPDATE users SET song_name=%s, artist_name=%s,
-               audio_filename=%s, audio_mime=%s, updated_at=CURRENT_TIMESTAMP
+            """UPDATE users
+               SET song_name=%s, artist_name=%s,
+                   audio_filename=%s, audio_mime=%s, updated_at=CURRENT_TIMESTAMP
                WHERE id=%s""",
             (song_name.strip(), artist_name.strip(), filename, mime, user_id),
         )
@@ -390,39 +479,40 @@ async def upload_song(
         cur.close(); conn.close()
 
     _analysis_cache.pop(str(user_id), None)
-    print(f"[upload] user={user_id} file={filename} size={len(audio_bytes)//1024}KB mime={mime}")
+    print(f"[upload] user={user_id} file={filename} size={total // 1024}KB mime={mime}")
     return {
         "message": "Uploaded!",
         "song": {
-            "song_name":    song_name.strip(),
-            "artist_name":  artist_name.strip(),
-            "audio_mime":   mime,
-            "has_audio":    True,
-            "stream_url":   f"/stream/{user_id}",
-            "size_kb":      len(audio_bytes) // 1024,
+            "song_name":   song_name.strip(),
+            "artist_name": artist_name.strip(),
+            "audio_mime":  mime,
+            "has_audio":   True,
+            "stream_url":  f"/stream/{user_id}",
+            "size_kb":     total // 1024,
         }
     }
 
+
 # ─────────────────────────────────────────────────────────────
-# STREAM — Range-aware. [F4] Accepts token via query param OR
-# Authorization header so <audio src="...?token="> works.
+# STREAM — range-aware, token via ?token= OR Authorization header
 # ─────────────────────────────────────────────────────────────
+@app.options("/stream/{user_id}")
+async def stream_options(user_id: int):
+    return Response(status_code=204, headers=CORS_HEADERS)
+
 @app.get("/stream/{user_id}")
 async def stream_audio(
     user_id: int,
     request: Request,
-    token:   Optional[str] = None,          # from <audio src="?token=...">
+    token:   Optional[str] = None,
 ):
-    # Resolve token from query param or Authorization header
     resolved_token = token
     if not resolved_token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             resolved_token = auth_header[7:]
-
     if not resolved_token:
         raise HTTPException(401, "Token required")
-
     try:
         jwt.decode(resolved_token, JWT_SECRET, algorithms=["HS256"], leeway=10)
     except Exception:
@@ -452,23 +542,23 @@ async def stream_audio(
     end    = min(end, size - 1)
     length = end - start + 1
 
-    def iter_file(path: Path, s: int, e: int, chunk: int = 65536):
+    def iter_file(path: Path, s: int, e: int, chunk_size: int = 65536):
         with open(path, "rb") as f:
             f.seek(s)
             remaining = e - s + 1
             while remaining > 0:
-                data = f.read(min(chunk, remaining))
+                data = f.read(min(chunk_size, remaining))
                 if not data:
                     break
                 remaining -= len(data)
                 yield data
 
     headers = {
-        "Content-Range":               f"bytes {start}-{end}/{size}",
-        "Accept-Ranges":               "bytes",
-        "Content-Length":              str(length),
-        "Cache-Control":               "no-cache",
-        "Access-Control-Allow-Origin": "*",
+        "Content-Range":  f"bytes {start}-{end}/{size}",
+        "Accept-Ranges":  "bytes",
+        "Content-Length": str(length),
+        "Cache-Control":  "no-cache",
+        "Access-Control-Allow-Origin":   "*",
         "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
     }
     return StreamingResponse(
@@ -478,10 +568,12 @@ async def stream_audio(
         headers=headers,
     )
 
+
 # ─────────────────────────────────────────────────────────────
 # AUDIO ANALYSIS
-# [F3] Fixed Essentia API — SpectralCentroidNormalized → SpectralCentroid
-# [F2] payload dep comes BEFORE query params in signature
+# Depends(auth) BEFORE query params — FastAPI resolves deps first.
+# es.SpectralCentroid() + manual Hz→[0,1] (SpectralCentroidNormalized
+# does not exist in Essentia standard namespace).
 # ─────────────────────────────────────────────────────────────
 def _analyze_wav(wav_path: str) -> dict:
     loader = es.MonoLoader(filename=wav_path, sampleRate=22050)
@@ -492,31 +584,19 @@ def _analyze_wav(wav_path: str) -> dict:
     sr, frame_size, hop_size = 22050, 1024, int(22050 / 60)
     w              = es.Windowing(type="hann")
     spectrum_algo  = es.Spectrum()
-
-    # [F3] SpectralCentroid returns Hz value; normalise to [0,1] by dividing by Nyquist
     centroid_algo  = es.SpectralCentroid(sampleRate=sr)
     nyquist        = sr / 2.0
-
     mel_bands_algo = es.MelBands(numberBands=8, sampleRate=sr,
                                   lowFrequencyBound=20, highFrequencyBound=8000)
     loudness_algo  = es.Loudness()
-
     lf, cf, mf, bf = [], [], [], []
 
     for i, frame in enumerate(es.FrameGenerator(audio, frameSize=frame_size, hopSize=hop_size)):
         t         = i * hop_size / sr
-        loud_val  = float(loudness_algo(frame))
-        loud_norm = float(np.tanh(max(0.0, (loud_val + 60) / 60)))
-
+        loud_norm = float(np.tanh(max(0.0, (float(loudness_algo(frame)) + 60) / 60)))
         spec      = spectrum_algo(w(frame))
-
-        # [F3] Centroid in Hz → normalise to [0, 1]
-        cent_hz   = float(centroid_algo(spec))
-        cent_norm = float(np.clip(cent_hz / nyquist, 0.0, 1.0))
-
-        mels_raw  = mel_bands_algo(spec)
-        mels      = [float(np.tanh(max(0.0, (v + 80) / 80))) for v in mels_raw]
-
+        cent_norm = float(np.clip(float(centroid_algo(spec)) / nyquist, 0.0, 1.0))
+        mels      = [float(np.tanh(max(0.0, (v + 80) / 80))) for v in mel_bands_algo(spec)]
         lf.append({"t": round(t, 4), "v": round(loud_norm, 4)})
         cf.append({"t": round(t, 4), "c": round(cent_norm, 4)})
         mf.append({"t": round(t, 4), "bands": [round(m, 4) for m in mels]})
@@ -525,10 +605,7 @@ def _analyze_wav(wav_path: str) -> dict:
     return {
         "tempo":    round(float(bpm), 2),
         "beats":    [{"t": round(float(b), 4)} for b in beats],
-        "loudness": lf,
-        "spectral": cf,
-        "melbands": mf,
-        "bass":     bf,
+        "loudness": lf, "spectral": cf, "melbands": mf, "bass": bf,
     }
 
 def _convert_to_wav(src: Path, dst: Path) -> bool:
@@ -553,25 +630,23 @@ def _fallback_analysis(duration: float = 240.0) -> dict:
         lf.append({"t": round(t, 4), "v": round(0.5 + 0.35*math.sin(t*0.8) + 0.15*math.sin(t*3.1), 4)})
         sf.append({"t": round(t, 4), "c": round(0.4 + 0.3*math.sin(t*0.5 + 1.2), 4)})
         bf.append({"t": round(t, 4), "b": round(0.3 + 0.25*abs(math.sin(t*math.pi*2.0)), 4)})
-        mf.append({"t": round(t, 4), "bands": [round(0.2 + 0.2*math.sin(t*(0.4 + k*0.15) + k), 4) for k in range(8)]})
+        mf.append({"t": round(t, 4), "bands": [
+            round(0.2 + 0.2*math.sin(t*(0.4 + k*0.15) + k), 4) for k in range(8)
+        ]})
     return {"tempo": tempo, "beats": beats, "loudness": lf, "spectral": sf, "melbands": mf, "bass": bf}
 
-# [F2] Dependency `payload` declared first — FastAPI resolves Depends() before
-# reading query string params, so the order in the signature matters.
 @app.get("/audio_analysis")
 async def audio_analysis(
-    payload: dict = Depends(auth),          # ← dep FIRST
-    track:   str  = "",                     # ← query params AFTER
+    payload: dict = Depends(auth),   # ← dep FIRST: FastAPI resolves Depends() before query params
+    track:   str  = "",
     artist:  str  = "",
 ):
     user_id   = payload["user_id"]
     cache_key = str(user_id)
-
     if cache_key in _analysis_cache:
         return _analysis_cache[cache_key]
 
     audio_path = _audio_path_for(user_id)
-
     if audio_path and ESSENTIA_AVAILABLE and NUMPY_AVAILABLE:
         loop = asyncio.get_running_loop()
         import tempfile
@@ -579,8 +654,7 @@ async def audio_analysis(
             with tempfile.TemporaryDirectory() as tmp:
                 wav_path = Path(tmp) / "audio.wav"
                 if audio_path.suffix.lower() == ".wav":
-                    import shutil as _sh
-                    _sh.copy(audio_path, wav_path)
+                    shutil.copy(str(audio_path), str(wav_path))
                     converted = True
                 else:
                     converted = await loop.run_in_executor(
@@ -597,8 +671,9 @@ async def audio_analysis(
     _analysis_cache[cache_key] = result
     return result
 
+
 # ─────────────────────────────────────────────────────────────
-# LAST.FM mood
+# LAST.FM mood tags
 # ─────────────────────────────────────────────────────────────
 @app.get("/mood")
 async def get_mood(
