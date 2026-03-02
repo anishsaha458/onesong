@@ -1,200 +1,274 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OneSong</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,600;1,400&family=DM+Mono:ital,wght@0,300;0,400;1,300&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
 
-  <!--
-    GPGPU CANVAS — MUST be first in body.
-    ambient.js enforces: position:fixed; inset:0; z-index:-1; pointer-events:none
-    NEVER wrap in a div. NEVER display:none — WebGL context is destroyed.
-  -->
+  <!-- ═══════════════════════════════════════════════════════
+       GPGPU CANVAS — sits at z-index:-1, behind everything.
+       Must exist in DOM before any scripts run.
+       ═══════════════════════════════════════════════════════ -->
   <canvas id="ambient-canvas"></canvas>
 
-  <!-- Loading veil — translucent, particles glow through -->
-  <div id="loading-veil" class="veil hidden">
+  <!-- Headless audio element — drives Web Audio API -->
+  <audio id="headless-audio" preload="metadata"></audio>
+
+  <!-- ═══════════════════════════════════════════════════════
+       LOADING VEIL
+       ═══════════════════════════════════════════════════════ -->
+  <div id="loading-veil" class="veil">
     <div class="veil-ring"></div>
-    <p id="loading-msg">Starting…</p>
+    <p id="loading-msg">Connecting…</p>
   </div>
 
-  <!-- ════════════════ AUTH ════════════════ -->
-  <div id="auth-container" class="layer">
-    <div class="glass-card auth-card">
+  <!-- ═══════════════════════════════════════════════════════
+       AUTH CONTAINER
+       ═══════════════════════════════════════════════════════ -->
+  <div id="auth-container" class="panel-wrap">
+    <div class="panel auth-panel">
 
       <div class="brand">
-        <span class="brand-mark">◈</span>
-        <h1 class="brand-name">OneSong</h1>
-      </div>
-      <p class="sub-text">the one track that is closest to who you are</p>
-
-      <div id="login-form" class="auth-form">
-        <h2>Sign in</h2>
-        <input id="login-email"    type="email"    placeholder="Email"    autocomplete="email">
-        <input id="login-password" type="password" placeholder="Password" autocomplete="current-password">
-        <button class="btn-primary" onclick="login()">Continue</button>
-        <p class="auth-switch">No account? <a href="#" onclick="showSignup(event)">Create one</a></p>
+        <svg class="brand-mark" viewBox="0 0 40 40" fill="none">
+          <circle cx="20" cy="20" r="18" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M13 14 L13 26 L28 20 Z" fill="currentColor"/>
+        </svg>
+        <span class="brand-name">OneSong</span>
       </div>
 
-      <div id="signup-form" class="auth-form hidden">
-        <h2>Create account</h2>
-        <input id="signup-username" type="text"     placeholder="Username"         autocomplete="username">
-        <input id="signup-email"    type="email"    placeholder="Email"            autocomplete="email">
-        <input id="signup-password" type="password" placeholder="Password (min 6)" autocomplete="new-password">
-        <button class="btn-primary" onclick="signup()">Create account</button>
-        <p class="auth-switch">Have one? <a href="#" onclick="showLogin(event)">Sign in</a></p>
+      <!-- Login form -->
+      <div id="login-form">
+        <h2 class="panel-heading">Sign in</h2>
+        <p class="panel-sub">Your one song. Always playing.</p>
+        <div class="field-group">
+          <label class="field-label">Email</label>
+          <input id="login-email" type="email" class="field-input" placeholder="you@example.com" autocomplete="email" />
+        </div>
+        <div class="field-group">
+          <label class="field-label">Password</label>
+          <input id="login-password" type="password" class="field-input" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter') login()" />
+        </div>
+        <p id="auth-error" class="form-err hidden"></p>
+        <button class="btn btn-primary" onclick="login()">Sign in</button>
+        <p class="auth-switch">No account? <a href="#" onclick="showSignup(event)">Create one →</a></p>
       </div>
 
-      <p id="auth-error" class="err-msg hidden"></p>
+      <!-- Signup form -->
+      <div id="signup-form" class="hidden">
+        <h2 class="panel-heading">Create account</h2>
+        <p class="panel-sub">Pick your one song. Own it forever.</p>
+        <div class="field-group">
+          <label class="field-label">Username</label>
+          <input id="signup-username" type="text" class="field-input" placeholder="yourname" autocomplete="username" />
+        </div>
+        <div class="field-group">
+          <label class="field-label">Email</label>
+          <input id="signup-email" type="email" class="field-input" placeholder="you@example.com" autocomplete="email" />
+        </div>
+        <div class="field-group">
+          <label class="field-label">Password</label>
+          <input id="signup-password" type="password" class="field-input" placeholder="6+ characters" autocomplete="new-password" onkeydown="if(event.key==='Enter') signup()" />
+        </div>
+        <button class="btn btn-primary" onclick="signup()">Create account</button>
+        <p class="auth-switch">Have an account? <a href="#" onclick="showLogin(event)">Sign in →</a></p>
+      </div>
+
     </div>
   </div>
 
-  <!-- ════════════════ APP ════════════════ -->
-  <div id="app-container" class="layer hidden">
+  <!-- ═══════════════════════════════════════════════════════
+       APP CONTAINER
+       ═══════════════════════════════════════════════════════ -->
+  <div id="app-container" class="hidden">
 
-    <!-- Minimal topbar -->
-    <nav class="topbar">
-      <span class="topbar-brand">◈</span>
+    <!-- Top bar -->
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 40 40" fill="none">
+          <circle cx="20" cy="20" r="18" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M13 14 L13 26 L28 20 Z" fill="currentColor"/>
+        </svg>
+        <span class="brand-name">OneSong</span>
+      </div>
       <div class="topbar-right">
-        <span id="user-label" class="topbar-user"></span>
-        <button class="btn-ghost-sm" onclick="logout()">out</button>
+        <span class="user-chip">
+          <svg viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6"/></svg>
+          <span id="user-label"></span>
+        </span>
+        <button class="btn btn-ghost btn-sm" onclick="logout()">Sign out</button>
       </div>
-    </nav>
+    </header>
 
-    <!-- ── ZEN / NOW PLAYING ── -->
-    <main id="now-playing" class="now-playing hidden">
+    <!-- ── NOW PLAYING ────────────────────────────────── -->
+    <div id="now-playing" class="content-wrap hidden">
 
-      <!-- Song identity — bottom-left glass pill -->
-      <div class="identity-block" id="identity-block">
-        <p class="eyebrow">YOUR SIGNATURE TRACK</p>
-        <h2 id="song-title"  class="song-title">—</h2>
-        <p  id="song-artist" class="song-artist"></p>
-      </div>
+      <div class="now-playing-card">
 
-      <!--
-        HEADLESS AUDIO
-        No crossorigin attr needed — streaming from same origin server.
-        AudioContext.createMediaElementSource() will work fine.
-      -->
-      <audio id="headless-audio" preload="metadata"></audio>
-
-      <!-- Transport -->
-      <div class="transport" id="transport">
-
-        <div class="progress-wrap" id="progress-wrap">
-          <div class="progress-bg">
-            <div class="progress-fill" id="progress-fill"></div>
+        <!-- Song info -->
+        <div class="song-info">
+          <div class="vinyl-ring">
+            <div class="vinyl-groove"></div>
+            <div class="vinyl-center"></div>
           </div>
-          <input id="seek-slider"
-                 class="seek-input"
-                 type="range"
-                 min="0" max="100" step="0.1" value="0"
-                 aria-label="Seek"
-                 oninput="seekTo(this.value)">
+          <div class="song-text">
+            <h1 id="song-title" class="song-title">—</h1>
+            <p  id="song-artist" class="song-artist">—</p>
+          </div>
         </div>
 
-        <div class="time-row">
-          <span id="time-cur">0:00</span>
-          <span id="time-tot">0:00</span>
+        <!-- Waveform bars (decorative, audio-reactive via CSS) -->
+        <div class="waveform" id="waveform-bars" aria-hidden="true">
+          <span></span><span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span><span></span><span></span>
+          <span></span><span></span><span></span><span></span><span></span>
         </div>
 
+        <!-- Seek bar -->
+        <div class="seek-wrap">
+          <span id="time-cur" class="time-label">0:00</span>
+          <div class="progress-track" onclick="seekTo(event.offsetX / this.offsetWidth * parseFloat(document.getElementById('seek-slider').max))">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+          <span id="time-tot" class="time-label">—:——</span>
+        </div>
+        <!-- Hidden range input for seek logic -->
+        <input id="seek-slider" type="range" min="0" max="300" step="0.1" value="0"
+               class="sr-only" oninput="seekTo(this.value)" />
+
+        <!-- Transport controls -->
         <div class="controls-row">
-          <button id="play-btn"
-                  class="play-btn"
-                  onclick="togglePlay()"
-                  aria-label="Play / Pause"
-                  disabled
-                  style="opacity:0.45;cursor:wait;">
-            <svg id="ico-play"  viewBox="0 0 24 24"><polygon points="6,3 20,12 6,21"/></svg>
-            <svg id="ico-pause" viewBox="0 0 24 24" class="hidden">
-              <rect x="5" y="3" width="4" height="18"/>
-              <rect x="15" y="3" width="4" height="18"/>
+          <button class="btn-icon" title="Change song" onclick="showSongSelection()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 5v14M5 12l7-7 7 7"/>
             </svg>
           </button>
 
-          <div class="vol-wrap">
-            <svg viewBox="0 0 24 24" class="vol-icon">
+          <button id="play-btn" class="btn-play" onclick="togglePlay()" disabled title="Play / Pause">
+            <span id="ico-play">
+              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 3l14 9-14 9V3z"/></svg>
+            </span>
+            <span id="ico-pause" class="hidden">
+              <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+            </span>
+          </button>
+
+          <div class="vol-wrap" title="Volume">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M11 5L6 9H2v6h4l5 4V5z"/>
-              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" stroke-linecap="round"/>
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+              <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
             </svg>
-            <input id="vol-slider"
-                   class="vol-slider"
-                   type="range"
-                   min="0" max="1" step="0.01" value="0.85"
-                   aria-label="Volume"
-                   oninput="setVolume(this.value)">
+            <input id="vol-slider" type="range" min="0" max="1" step="0.01" value="0.85"
+                   class="vol-slider" oninput="setVolume(this.value)" />
           </div>
         </div>
 
+        <!-- Analysis status badge -->
         <p id="analysis-status" class="analysis-status"></p>
-        <p class="sync-hint">Hold <kbd>Space</kbd> on the beat to lock sync</p>
-      </div>
 
-      <!-- Change song button -->
-      <button class="btn-change-song" onclick="showSongSelection()">
-        ✦ Change song
-      </button>
+      </div><!-- /.now-playing-card -->
 
-    </main>
+    </div><!-- /#now-playing -->
 
-    <!-- ── SONG SELECTION / UPLOAD OVERLAY ── -->
-    <div id="song-selection" class="song-selection hidden">
-      <div class="glass-card sel-card">
-        <div class="sel-header">
-          <p class="eyebrow">CHOOSE WISELY</p>
-          <h2>Your One Song</h2>
-          <p class="sub-text">the track that defines you, rendered as a living field</p>
+    <!-- ── SONG SELECTION ─────────────────────────────── -->
+    <div id="song-selection" class="content-wrap hidden">
+
+      <div class="panel upload-panel">
+        <h2 class="panel-heading">Your Song</h2>
+        <p class="panel-sub">Upload an audio file. One song. Make it count.</p>
+
+        <div class="field-group">
+          <label class="field-label">Song name</label>
+          <input id="inp-song" type="text" class="field-input" placeholder="Song title" />
+        </div>
+        <div class="field-group">
+          <label class="field-label">Artist</label>
+          <input id="inp-artist" type="text" class="field-input" placeholder="Artist name" />
         </div>
 
-        <input id="inp-song"   type="text" placeholder="Song name">
-        <input id="inp-artist" type="text" placeholder="Artist">
-
-        <!-- File drop zone -->
-        <label class="file-drop" for="inp-file">
-          <svg viewBox="0 0 24 24" class="upload-icon" fill="none"
-               stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="17 8 12 3 7 8"/>
-            <line x1="12" y1="3" x2="12" y2="15"/>
-          </svg>
-          <span id="file-label">Choose audio file…</span>
-          <span class="file-hint">mp3 · wav · flac · ogg · m4a · aac — max 50 MB</span>
-        </label>
-        <input id="inp-file"
-               type="file"
-               accept=".mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.weba,audio/*"
-               style="display:none"
-               onchange="onFileSelected(this)">
+        <div class="field-group">
+          <label class="field-label">Audio file</label>
+          <label class="file-drop" for="inp-file">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <span id="file-label">Choose audio file…</span>
+            <small>MP3, WAV, FLAC, OGG, M4A · Max 50 MB</small>
+          </label>
+          <input id="inp-file" type="file"
+                 accept=".mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.weba"
+                 class="sr-only"
+                 onchange="onFileSelected(this)" />
+        </div>
 
         <!-- Upload progress bar -->
         <div id="upload-bar-wrap" class="upload-bar-wrap hidden">
           <div id="upload-bar" class="upload-bar"></div>
         </div>
 
-        <p id="form-err" class="err-msg hidden"></p>
-        <button class="btn-primary" onclick="saveSong()">Upload my song</button>
-        <button class="btn-ghost-sm cancel-btn hidden" id="cancel-btn" onclick="cancelSongSelection()">Cancel</button>
+        <p id="form-err" class="form-err hidden"></p>
+
+        <div class="btn-row">
+          <button id="cancel-btn" class="btn btn-ghost hidden" onclick="cancelSongSelection()">Cancel</button>
+          <button class="btn btn-primary" onclick="saveSong()">Save &amp; Visualize</button>
+        </div>
+
       </div>
-    </div>
+
+    </div><!-- /#song-selection -->
 
   </div><!-- /#app-container -->
 
-  <!--
-    SCRIPT ORDER:
-      1. three.js            — must exist before ambient.js parses ShaderMaterial
-      2. gradientController.js — GradientController global before ambient.js loop
-      3. ambient.js          — registers Ambient global, does NOT call init() yet
-      4. app.js              — DOMContentLoaded calls Ambient.init() synchronously
-  -->
+
+  <!-- ═══════════════════════════════════════════════════════
+       SCRIPTS — ORDER IS CRITICAL
+       ═══════════════════════════════════════════════════════
+
+    Load order:
+      1. Three.js r128 core (defines THREE namespace)
+      2. GPUComputationRenderer (extends THREE)
+      3. Post-processing shaders (CopyShader, LuminosityHighPassShader)
+      4. EffectComposer + passes (depend on shaders)
+      5. gradientController.js (optional Essentia timeline reader)
+      6. ambient.js (depends on THREE + GPUComputationRenderer + EffectComposer)
+      7. app.js (depends on ambient.js + DOM)
+
+       The GPUComputationRenderer and EffectComposer are in Three.js'
+       examples/js directory — they extend the THREE namespace so they
+       must load AFTER Three.js core and BEFORE ambient.js.
+       ═══════════════════════════════════════════════════════ -->
+
+  <!-- 1. Three.js r128 core -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <!-- 2. GPUComputationRenderer — GPGPU ping-pong simulation -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/misc/GPUComputationRenderer.js"></script>
+
+  <!-- 3. Shaders required by post-processing passes -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+
+  <!-- 4. EffectComposer + render/bloom passes -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+
+  <!-- 5. Essentia timeline → gradient controller (optional, degrades gracefully) -->
   <script src="gradientController.js"></script>
+
+  <!-- 6. GPGPU visual engine — starts loop on init() -->
   <script src="ambient.js"></script>
+
+  <!-- 7. App logic — calls Ambient.init() on DOMContentLoaded -->
   <script src="app.js"></script>
 
 </body>

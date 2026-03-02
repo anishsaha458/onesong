@@ -1,23 +1,16 @@
 /**
- * app.js — OneSong  v5.1
+ * app.js — OneSong  v5.2
  * ─────────────────────────────────────────────────────────────
- * Direct file upload → server streams back → Web Audio + GPGPU visualizer.
+ * Direct file upload → server streams → Web Audio API → GPGPU visualizer.
  *
- * FIXES vs v5.0:
- *  [F1] _resumeContext() — AudioContext re-entrancy guard fixed.
- *       audioSrc creation moved OUTSIDE the `if (!audioCtx)` block so that
- *       if the context already exists but audioSrc is null (e.g. after
- *       _teardownAudio + re-display) it is correctly reconnected.
- *  [F2] file-drop label click — <label for="inp-file"> already forwards
- *       clicks to the hidden <input> natively in HTML, but the JS
- *       onFileSelected handler was missing the guard for empty file list
- *       (user opens dialog and cancels). Guard added.
- *  [F3] _setupAudio() stream URL — token is passed as a query param because
- *       <audio> elements cannot send custom headers. The server (v5.1) now
- *       accepts token via both query param and Authorization header.
- *  [F4] togglePlay() AbortError retry — prevented infinite retry loop by
- *       adding a _playRetrying flag.
- *  [F5] _feedRealTimeFeatures() — added null-guard for freqData before loop.
+ * Key changes vs v5.1:
+ *  [A1] Ambient.init() fires on DOMContentLoaded — BEFORE auth/login check.
+ *       Particles are visible and flowing immediately on page load.
+ *  [A2] AudioContext.resume() called directly in togglePlay() (user gesture).
+ *       No separate gesture interceptor needed.
+ *  [A3] Clock poller runs at 16ms (was 250ms) for smooth real-time reactivity.
+ *       Essentia data is interpolated by GradientController; Web Audio runs raw.
+ *  [A4] _feedRealTimeFeatures: bass/treble split fed correctly to Ambient v4.0.
  */
 
 const API = 'https://onesong.onrender.com';
@@ -31,7 +24,7 @@ let serverReady  = false;
 
 // ── Audio state ───────────────────────────────────────────
 let audioCtx       = null;
-let audioSrc       = null;       // MediaElementSourceNode
+let audioSrc       = null;
 let analyserNode   = null;
 let gainNode       = null;
 let audioEl        = null;
@@ -39,10 +32,11 @@ let clockPoller    = null;
 let analysisLoaded = false;
 let _audioReady    = false;
 let _audioRetried  = false;
-let _playRetrying  = false;      // [F4] prevents infinite AbortError loop
+let _playRetrying  = false;
 let _playEnableTimer = null;
 
-const FFT_SIZE = 256;
+// Larger FFT for better frequency resolution
+const FFT_SIZE = 512;
 let freqData   = null;
 
 // ── DOM refs ──────────────────────────────────────────────
@@ -50,7 +44,7 @@ let elPlayBtn, elPlayIco, elPauseIco, elProgress, elTimeCur, elTimeTot;
 let elSeekSlider, elAnalysisStatus;
 
 // ─────────────────────────────────────────────────────────
-// BOOT
+// BOOT — [A1] GPGPU starts IMMEDIATELY before auth
 // ─────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   audioEl          = document.getElementById('headless-audio');
@@ -63,6 +57,8 @@ document.addEventListener('DOMContentLoaded', () => {
   elSeekSlider     = document.getElementById('seek-slider');
   elAnalysisStatus = document.getElementById('analysis-status');
 
+  // [A1] Init GPGPU immediately — particles flow before user even logs in.
+  // This ensures the visual environment is alive on first load.
   try {
     const ok = Ambient.init();
     if (!ok) console.warn('[Boot] GPGPU init returned false — CSS fallback active');
@@ -104,11 +100,11 @@ async function _pingServer() {
     if (r.ok) {
       serverReady = true;
       const h = await r.json().catch(() => ({}));
-      console.info('[Boot] Server ready ✓', { essentia: h.essentia, db: h.database, files: h.audio_files });
+      console.info('[Boot] Server ready ✓', { essentia: h.essentia, db: h.database });
     }
   } catch (e) {
     console.warn('[Boot] Server ping failed:', e.message);
-    _showVeil('⚠ Server slow to start — trying anyway…', true);
+    _showVeil('⚠ Server waking up — one moment…', true);
     await new Promise(res => setTimeout(res, 2500));
   }
 }
@@ -260,7 +256,6 @@ function _resetUploadUI() {
   if (barWrap)   barWrap.classList.add('hidden');
 }
 
-// [F2] Guard against empty file list (user cancels the dialog)
 function onFileSelected(input) {
   const file  = input.files?.[0];
   if (!file) return;
@@ -340,13 +335,12 @@ async function saveSong() {
 function _displaySong(song) {
   document.getElementById('song-selection').classList.add('hidden');
   document.getElementById('now-playing').classList.remove('hidden');
-
   document.getElementById('song-title').textContent  = song.song_name;
   document.getElementById('song-artist').textContent = song.artist_name;
 
-  _audioReady    = false;
-  _audioRetried  = false;
-  _playRetrying  = false;
+  _audioReady   = false;
+  _audioRetried = false;
+  _playRetrying = false;
   _setPlayState(false);
   _setPlayBtnEnabled(false);
   _setAnalysisStatus('⏳ Loading audio…');
@@ -363,8 +357,7 @@ function _displaySong(song) {
 
 // ─────────────────────────────────────────────────────────
 // AUDIO SETUP
-// [F3] Token passed as query param — <audio> can't send headers.
-//      Server v5.1 accepts token via ?token= OR Authorization header.
+// Token passed as query param — <audio> elements cannot send custom headers.
 // ─────────────────────────────────────────────────────────
 function _setupAudio(song) {
   if (_playEnableTimer) { clearTimeout(_playEnableTimer); _playEnableTimer = null; }
@@ -378,7 +371,6 @@ function _setupAudio(song) {
   audioEl.src = '';
   audioEl.load();
 
-  // [F3] <audio> needs the token in the URL since it can't set headers
   const uid       = currentUser?.id;
   const streamUrl = `${API}/stream/${uid}?token=${encodeURIComponent(authToken)}`;
 
@@ -393,16 +385,15 @@ function _setupAudio(song) {
   audioEl.addEventListener('ended',          _onAudioEnded);
   audioEl.addEventListener('error',          _onAudioError);
 
-  // Safety valve — if loadeddata hasn't fired in 12s, allow play anyway
   _playEnableTimer = setTimeout(() => {
     if (!_audioReady) {
       _audioReady = true;
       _setPlayBtnEnabled(true);
-      _setAnalysisStatus('⏳ Stream loading — tap Play');
+      _setAnalysisStatus('⏳ Tap Play to start');
     }
   }, 12000);
 
-  console.info('[Audio] Stream URL set (token omitted from log)');
+  console.info('[Audio] Stream URL set');
 }
 
 function _onLoadedData() {
@@ -411,7 +402,7 @@ function _onLoadedData() {
     _setPlayBtnEnabled(true);
     _setAnalysisStatus('');
     if (_playEnableTimer) { clearTimeout(_playEnableTimer); _playEnableTimer = null; }
-    console.info('[Audio] loadeddata ✓ — play enabled');
+    console.info('[Audio] loadeddata ✓');
   }
 }
 
@@ -438,7 +429,8 @@ function _onTimeUpdate() {
 
 function _onAudioEnded() {
   if (window.GradientController) GradientController.updatePlayhead(0, false);
-  Ambient.stopBeat(); _setPlayState(false);
+  Ambient.stopBeat();
+  _setPlayState(false);
 }
 
 function _onAudioError() {
@@ -447,7 +439,7 @@ function _onAudioError() {
     1: '⚠ Playback aborted',
     2: '⚠ Network error',
     3: '⚠ Audio decode error',
-    4: '⚠ Format not supported by this browser',
+    4: '⚠ Format not supported',
   };
   console.error('[Audio] MediaError:', code, audioEl.error?.message);
 
@@ -457,7 +449,6 @@ function _onAudioError() {
     setTimeout(() => { if (currentSong) _setupAudio(currentSong); }, 2000);
     return;
   }
-
   _setAnalysisStatus(msgs[code] || `⚠ Audio error (${code})`);
   _setPlayBtnEnabled(true);
 }
@@ -477,16 +468,13 @@ function _teardownAudio() {
   if (audioCtx && audioCtx.state !== 'closed') {
     audioCtx.close().catch(() => {});
   }
-  // [F1] Always reset ALL audio graph references together
   audioCtx = null; audioSrc = null; analyserNode = null; gainNode = null;
   _audioReady = false; _audioRetried = false; _playRetrying = false;
   _setPlayState(false); _setPlayBtnEnabled(false);
 }
 
 // ─────────────────────────────────────────────────────────
-// AudioContext — created on first user gesture only
-// [F1] audioSrc wiring moved out of the `if (!audioCtx)` guard so it
-//      reconnects correctly after teardown + re-display of a song.
+// AudioContext — [A2] created and resumed on user gesture (togglePlay click)
 // ─────────────────────────────────────────────────────────
 async function _resumeContext() {
   if (!audioCtx) {
@@ -494,7 +482,8 @@ async function _resumeContext() {
       audioCtx     = new (window.AudioContext || window.webkitAudioContext)();
       gainNode     = audioCtx.createGain();
       analyserNode = audioCtx.createAnalyser();
-      analyserNode.fftSize = FFT_SIZE;
+      analyserNode.fftSize       = FFT_SIZE;
+      analyserNode.smoothingTimeConstant = 0.75;
       freqData = new Uint8Array(analyserNode.frequencyBinCount);
 
       const volEl = document.getElementById('vol-slider');
@@ -509,7 +498,7 @@ async function _resumeContext() {
     }
   }
 
-  // [F1] Wire audioSrc any time it's missing (new context OR after teardown)
+  // Wire audio element → gain → analyser → speakers
   if (audioCtx && !audioSrc) {
     try {
       audioSrc = audioCtx.createMediaElementSource(audioEl);
@@ -517,19 +506,19 @@ async function _resumeContext() {
       gainNode.connect(analyserNode);
       analyserNode.connect(audioCtx.destination);
     } catch (e) {
-      // createMediaElementSource throws if the element is already captured —
-      // this can happen on some browsers; safe to ignore, audio still plays.
       console.warn('[AudioContext] createMediaElementSource:', e.message);
     }
   }
 
+  // [A2] Resume on every user gesture — browser may suspend after inactivity
   if (audioCtx?.state === 'suspended') {
-    try { await audioCtx.resume(); } catch (e) {}
+    await audioCtx.resume();
   }
 }
 
 // ─────────────────────────────────────────────────────────
-// CLOCK POLLER — feeds GradientController + GPGPU
+// CLOCK POLLER — [A3] 16ms for smooth reactivity
+// Feeds both GradientController (Essentia timeline) and Ambient (real-time)
 // ─────────────────────────────────────────────────────────
 function _startClockPoller() {
   _stopClockPoller();
@@ -537,52 +526,83 @@ function _startClockPoller() {
     if (!audioEl) return;
     const t       = audioEl.currentTime;
     const playing = !audioEl.paused && !audioEl.ended && audioEl.readyState >= 2;
+
+    // Feed Essentia timeline interpolation to GradientController
     if (window.GradientController) GradientController.updatePlayhead(t, playing);
+
+    // Feed real-time Web Audio frequency data to GPGPU
     if (analyserNode && freqData && playing) {
       analyserNode.getByteFrequencyData(freqData);
       _feedRealTimeFeatures();
     }
-  }, 250);
+  }, 16);   // [A3] 16ms ≈ 60fps update rate (was 250ms)
 }
 
 function _stopClockPoller() {
   if (clockPoller) { clearInterval(clockPoller); clockPoller = null; }
 }
 
-// [F5] null-guard on freqData
+// ─────────────────────────────────────────────────────────
+// AUDIO FEATURE EXTRACTION — [A4] proper bass/treble split
+// Maps Web Audio frequency bins to Ambient's audio parameters.
+//
+// Frequency bin layout (FFT_SIZE=512, sr≈44100Hz, 256 bins):
+//   bin 0-5   ≈ 0–860 Hz    → sub bass / kick
+//   bin 6-20  ≈ 860–3440 Hz → bass / low mids
+//   bin 21-60 ≈ 3.4–10 kHz  → presence / hats
+//   bin 61+   ≈ 10kHz+      → treble / air
+// ─────────────────────────────────────────────────────────
 function _feedRealTimeFeatures() {
   if (!freqData || freqData.length === 0) return;
-  const len = freqData.length;
+  const len = freqData.length;   // FFT_SIZE / 2 = 256 bins
 
+  // Sub-bass: bins 0–5 (kicks, 808s) → camera shake, bloom
   let bassSum = 0;
-  for (let i = 0; i < 10; i++) bassSum += freqData[i];
-  const bass = bassSum / (10 * 255);
+  for (let i = 0; i < 6; i++) bassSum += freqData[i];
+  const bass = bassSum / (6 * 255);
 
+  // Full-band RMS loudness → flow strength
   let sq = 0;
   for (let i = 0; i < len; i++) sq += freqData[i] * freqData[i];
   const loud = Math.sqrt(sq / len) / 255;
 
+  // Spectral centroid → color hue
   let wSum = 0, total = 0;
   for (let i = 0; i < len; i++) { wSum += i * freqData[i]; total += freqData[i]; }
   const centroid = total > 0 ? wSum / (total * len) : 0;
 
-  const melbands    = new Float32Array(8);
-  const binsPerBand = Math.floor(len / 8);
+  // Treble: top quarter of bins → jitter
+  let trebleSum = 0;
+  const trebleStart = Math.floor(len * 0.75);
+  for (let i = trebleStart; i < len; i++) trebleSum += freqData[i];
+  const treble = trebleSum / ((len - trebleStart) * 255);
+
+  // 8-band mel approximation (log-spaced)
+  const melbands = new Float32Array(8);
+  const logStart = Math.log(1);
+  const logEnd   = Math.log(len);
   for (let b = 0; b < 8; b++) {
-    let s = 0;
-    const start = b * binsPerBand;
-    for (let i = start; i < start + binsPerBand; i++) s += freqData[i];
-    melbands[b] = s / (binsPerBand * 255);
+    const lo = Math.floor(Math.exp(logStart + (logEnd - logStart) * (b / 8)));
+    const hi = Math.floor(Math.exp(logStart + (logEnd - logStart) * ((b + 1) / 8)));
+    let s = 0, count = 0;
+    for (let i = lo; i <= Math.min(hi, len - 1); i++) { s += freqData[i]; count++; }
+    melbands[b] = count > 0 ? s / (count * 255) : 0;
   }
 
-  Ambient.setAudioFeatures({ loudness: loud, centroid, melbands, beat: bass > 0.55 ? bass : 0 });
+  // [A4] Feed Ambient with all extracted features
+  Ambient.setAudioFeatures({
+    loudness: loud,
+    centroid,
+    melbands,
+    beat: bass > 0.60 ? bass : 0,
+  });
 }
 
 // ─────────────────────────────────────────────────────────
-// AUDIO ANALYSIS
+// AUDIO ANALYSIS (Essentia JSON from server)
 // ─────────────────────────────────────────────────────────
 async function _fetchAudioAnalysis(song) {
-  _setAnalysisStatus('🔍 Analysing audio…');
+  _setAnalysisStatus('🔍 Analysing…');
   try {
     const params = new URLSearchParams({ track: song.song_name, artist: song.artist_name });
     const r = await fetch(`${API}/audio_analysis?${params}`, {
@@ -596,7 +616,7 @@ async function _fetchAudioAnalysis(song) {
       analysisLoaded = true;
       const bpm = data.tempo?.toFixed(0) ?? '?';
       _setAnalysisStatus(`✓ ${bpm} BPM · ${data.beats?.length ?? 0} beats`);
-      setTimeout(() => _setAnalysisStatus(''), 5000);
+      setTimeout(() => _setAnalysisStatus(''), 4000);
     } else {
       _setAnalysisStatus('');
     }
@@ -608,10 +628,11 @@ async function _fetchAudioAnalysis(song) {
 
 // ─────────────────────────────────────────────────────────
 // PLAYBACK CONTROLS
-// [F4] AbortError retry guarded by _playRetrying flag
 // ─────────────────────────────────────────────────────────
 async function togglePlay() {
   if (!audioEl?.src || elPlayBtn?.disabled) return;
+
+  // [A2] AudioContext MUST be created/resumed on direct user gesture
   await _resumeContext();
 
   if (audioEl.paused) {
@@ -620,7 +641,9 @@ async function togglePlay() {
       _setAnalysisStatus('⏳ Buffering…');
       await audioEl.play();
       _playRetrying = false;
-      _setPlayState(true); _setPlayBtnEnabled(true); _setAnalysisStatus('');
+      _setPlayState(true);
+      _setPlayBtnEnabled(true);
+      _setAnalysisStatus('');
       Ambient.startBeat();
     } catch (e) {
       _setPlayBtnEnabled(true);
@@ -629,19 +652,18 @@ async function togglePlay() {
       } else if (e.name === 'NotSupportedError') {
         _setAnalysisStatus('⚠ Format not supported');
       } else if (e.name === 'AbortError' && !_playRetrying) {
-        // [F4] Only retry once, not on every AbortError
         _playRetrying = true;
         _setAnalysisStatus('⏳ Stream starting…');
-        setTimeout(() => {
-          _playRetrying = false;
-          if (audioEl?.paused) togglePlay();
-        }, 1000);
+        setTimeout(() => { _playRetrying = false; if (audioEl?.paused) togglePlay(); }, 1000);
       } else {
-        _setAnalysisStatus('⚠ Playback failed: ' + e.message);
+        _setAnalysisStatus('⚠ ' + e.message);
       }
     }
   } else {
-    audioEl.pause(); _setPlayState(false); _setAnalysisStatus(''); Ambient.stopBeat();
+    audioEl.pause();
+    _setPlayState(false);
+    _setAnalysisStatus('');
+    Ambient.stopBeat();
   }
 }
 
@@ -661,6 +683,8 @@ function setVolume(val) {
 function _setPlayState(playing) {
   elPlayIco?.classList.toggle('hidden',  playing);
   elPauseIco?.classList.toggle('hidden', !playing);
+  // Drive CSS vinyl spin + waveform bars
+  document.body.classList.toggle('is-playing', playing);
 }
 
 function _setPlayBtnEnabled(enabled) {
@@ -671,7 +695,7 @@ function _setPlayBtnEnabled(enabled) {
 }
 
 // ─────────────────────────────────────────────────────────
-// SPACEBAR SYNC
+// SPACEBAR — manual beat sync
 // ─────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.code !== 'Space') return;
