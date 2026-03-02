@@ -1,16 +1,12 @@
 /**
- * app.js — OneSong  v5.2
+ * app.js — OneSong  v5.3
  * ─────────────────────────────────────────────────────────────
- * Direct file upload → server streams → Web Audio API → GPGPU visualizer.
- *
- * Key changes vs v5.1:
- *  [A1] Ambient.init() fires on DOMContentLoaded — BEFORE auth/login check.
- *       Particles are visible and flowing immediately on page load.
- *  [A2] AudioContext.resume() called directly in togglePlay() (user gesture).
- *       No separate gesture interceptor needed.
- *  [A3] Clock poller runs at 16ms (was 250ms) for smooth real-time reactivity.
- *       Essentia data is interpolated by GradientController; Web Audio runs raw.
- *  [A4] _feedRealTimeFeatures: bass/treble split fed correctly to Ambient v4.0.
+ * Changes vs v5.2:
+ *  [B1] _feedRealTimeFeatures passes raw freqData to Ambient for spectral flux [V5]
+ *  [B2] Mids band extracted (bins ~860Hz–3.4kHz) and fed to Ambient [V4]
+ *  [B3] Beat detector uses energy derivative (onset) instead of raw threshold
+ *       — fires more accurately on transients, misses fewer soft beats.
+ *  All other logic identical to v5.2.
  */
 
 const API = 'https://onesong.onrender.com';
@@ -35,16 +31,19 @@ let _audioRetried  = false;
 let _playRetrying  = false;
 let _playEnableTimer = null;
 
-// Larger FFT for better frequency resolution
 const FFT_SIZE = 512;
 let freqData   = null;
+
+// [B3] Onset / beat detection state
+let _prevBassEnergy  = 0;
+let _beatCooldown    = 0;   // frames since last beat fired
 
 // ── DOM refs ──────────────────────────────────────────────
 let elPlayBtn, elPlayIco, elPauseIco, elProgress, elTimeCur, elTimeTot;
 let elSeekSlider, elAnalysisStatus;
 
 // ─────────────────────────────────────────────────────────
-// BOOT — [A1] GPGPU starts IMMEDIATELY before auth
+// BOOT
 // ─────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   audioEl          = document.getElementById('headless-audio');
@@ -57,8 +56,6 @@ document.addEventListener('DOMContentLoaded', () => {
   elSeekSlider     = document.getElementById('seek-slider');
   elAnalysisStatus = document.getElementById('analysis-status');
 
-  // [A1] Init GPGPU immediately — particles flow before user even logs in.
-  // This ensures the visual environment is alive on first load.
   try {
     const ok = Ambient.init();
     if (!ok) console.warn('[Boot] GPGPU init returned false — CSS fallback active');
@@ -72,7 +69,7 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ─────────────────────────────────────────────────────────
-// Instant UI restore for returning users
+// Auth restore
 // ─────────────────────────────────────────────────────────
 function _checkAuthFromStorage() {
   authToken = localStorage.getItem('authToken');
@@ -230,7 +227,7 @@ async function _loadUserSong() {
 }
 
 // ─────────────────────────────────────────────────────────
-// SONG SELECTION — file upload form
+// SONG SELECTION
 // ─────────────────────────────────────────────────────────
 function showSongSelection() {
   document.getElementById('now-playing').classList.add('hidden');
@@ -357,7 +354,6 @@ function _displaySong(song) {
 
 // ─────────────────────────────────────────────────────────
 // AUDIO SETUP
-// Token passed as query param — <audio> elements cannot send custom headers.
 // ─────────────────────────────────────────────────────────
 function _setupAudio(song) {
   if (_playEnableTimer) { clearTimeout(_playEnableTimer); _playEnableTimer = null; }
@@ -374,7 +370,7 @@ function _setupAudio(song) {
   const uid       = currentUser?.id;
   const streamUrl = `${API}/stream/${uid}?token=${encodeURIComponent(authToken)}`;
 
-  audioEl.crossOrigin = 'anonymous';   // Required for AudioContext.createMediaElementSource()
+  audioEl.crossOrigin = 'anonymous';
   audioEl.src         = streamUrl;
   audioEl.preload     = 'metadata';
   audioEl.load();
@@ -392,8 +388,6 @@ function _setupAudio(song) {
       _setAnalysisStatus('⏳ Tap Play to start');
     }
   }, 12000);
-
-  console.info('[Audio] Stream URL set');
 }
 
 function _onLoadedData() {
@@ -402,7 +396,6 @@ function _onLoadedData() {
     _setPlayBtnEnabled(true);
     _setAnalysisStatus('');
     if (_playEnableTimer) { clearTimeout(_playEnableTimer); _playEnableTimer = null; }
-    console.info('[Audio] loadeddata ✓');
   }
 }
 
@@ -435,12 +428,7 @@ function _onAudioEnded() {
 
 function _onAudioError() {
   const code = audioEl.error?.code || 0;
-  const msgs = {
-    1: '⚠ Playback aborted',
-    2: '⚠ Network error',
-    3: '⚠ Audio decode error',
-    4: '⚠ Format not supported',
-  };
+  const msgs = { 1:'⚠ Playback aborted', 2:'⚠ Network error', 3:'⚠ Audio decode error', 4:'⚠ Format not supported' };
   console.error('[Audio] MediaError:', code, audioEl.error?.message);
 
   if (code === 2 && !_audioRetried && currentSong) {
@@ -465,16 +453,14 @@ function _teardownAudio() {
     audioEl.removeEventListener('error',          _onAudioError);
     audioEl.src = ''; audioEl.load();
   }
-  if (audioCtx && audioCtx.state !== 'closed') {
-    audioCtx.close().catch(() => {});
-  }
+  if (audioCtx && audioCtx.state !== 'closed') audioCtx.close().catch(() => {});
   audioCtx = null; audioSrc = null; analyserNode = null; gainNode = null;
   _audioReady = false; _audioRetried = false; _playRetrying = false;
   _setPlayState(false); _setPlayBtnEnabled(false);
 }
 
 // ─────────────────────────────────────────────────────────
-// AudioContext — [A2] created and resumed on user gesture (togglePlay click)
+// AudioContext
 // ─────────────────────────────────────────────────────────
 async function _resumeContext() {
   if (!audioCtx) {
@@ -482,7 +468,7 @@ async function _resumeContext() {
       audioCtx     = new (window.AudioContext || window.webkitAudioContext)();
       gainNode     = audioCtx.createGain();
       analyserNode = audioCtx.createAnalyser();
-      analyserNode.fftSize       = FFT_SIZE;
+      analyserNode.fftSize              = FFT_SIZE;
       analyserNode.smoothingTimeConstant = 0.75;
       freqData = new Uint8Array(analyserNode.frequencyBinCount);
 
@@ -490,15 +476,12 @@ async function _resumeContext() {
       gainNode.gain.value = parseFloat(volEl?.value ?? 0.85);
 
       _startClockPoller();
-      console.info('[AudioContext] Created ✓');
     } catch (e) {
       console.error('[AudioContext] Setup failed:', e);
-      audioCtx = null;
-      return;
+      audioCtx = null; return;
     }
   }
 
-  // Wire audio element → gain → analyser → speakers
   if (audioCtx && !audioSrc) {
     try {
       audioSrc = audioCtx.createMediaElementSource(audioEl);
@@ -510,15 +493,11 @@ async function _resumeContext() {
     }
   }
 
-  // [A2] Resume on every user gesture — browser may suspend after inactivity
-  if (audioCtx?.state === 'suspended') {
-    await audioCtx.resume();
-  }
+  if (audioCtx?.state === 'suspended') await audioCtx.resume();
 }
 
 // ─────────────────────────────────────────────────────────
-// CLOCK POLLER — [A3] 16ms for smooth reactivity
-// Feeds both GradientController (Essentia timeline) and Ambient (real-time)
+// CLOCK POLLER — 16ms
 // ─────────────────────────────────────────────────────────
 function _startClockPoller() {
   _stopClockPoller();
@@ -527,15 +506,13 @@ function _startClockPoller() {
     const t       = audioEl.currentTime;
     const playing = !audioEl.paused && !audioEl.ended && audioEl.readyState >= 2;
 
-    // Feed Essentia timeline interpolation to GradientController
     if (window.GradientController) GradientController.updatePlayhead(t, playing);
 
-    // Feed real-time Web Audio frequency data to GPGPU
     if (analyserNode && freqData && playing) {
       analyserNode.getByteFrequencyData(freqData);
       _feedRealTimeFeatures();
     }
-  }, 16);   // [A3] 16ms ≈ 60fps update rate (was 250ms)
+  }, 16);
 }
 
 function _stopClockPoller() {
@@ -543,44 +520,51 @@ function _stopClockPoller() {
 }
 
 // ─────────────────────────────────────────────────────────
-// AUDIO FEATURE EXTRACTION — [A4] proper bass/treble split
-// Maps Web Audio frequency bins to Ambient's audio parameters.
+// AUDIO FEATURE EXTRACTION
 //
 // Frequency bin layout (FFT_SIZE=512, sr≈44100Hz, 256 bins):
-//   bin 0-5   ≈ 0–860 Hz    → sub bass / kick
-//   bin 6-20  ≈ 860–3440 Hz → bass / low mids
-//   bin 21-60 ≈ 3.4–10 kHz  → presence / hats
-//   bin 61+   ≈ 10kHz+      → treble / air
+//   bin 0–5    ≈ 0–860 Hz     → sub bass / kick
+//   bin 6–20   ≈ 860–3440 Hz  → bass / low mids
+//   bin 21–60  ≈ 3.4–10 kHz   → presence / mids
+//   bin 61–127 ≈ 10–22 kHz    → treble / air
+//
+// [B1] Raw freqData passed to Ambient for spectral flux calculation [V5]
+// [B2] Mids band (bins 6-20) extracted separately [V4]
+// [B3] Beat uses energy derivative onset — fires on transients, not just level
 // ─────────────────────────────────────────────────────────
 function _feedRealTimeFeatures() {
   if (!freqData || freqData.length === 0) return;
-  const len = freqData.length;   // FFT_SIZE / 2 = 256 bins
+  const len = freqData.length;   // 256 bins
 
-  // Sub-bass: bins 0–5 (kicks, 808s) → camera shake, bloom
+  // Sub-bass: bins 0–5 (kicks, 808s)
   let bassSum = 0;
   for (let i = 0; i < 6; i++) bassSum += freqData[i];
   const bass = bassSum / (6 * 255);
 
-  // Full-band RMS loudness → flow strength
+  // [B2] Mids: bins 6–20 (~860Hz–3.4kHz)
+  let midsSum = 0;
+  for (let i = 6; i <= 20; i++) midsSum += freqData[i];
+  const mids = midsSum / (15 * 255);
+
+  // Full-band RMS loudness
   let sq = 0;
   for (let i = 0; i < len; i++) sq += freqData[i] * freqData[i];
   const loud = Math.sqrt(sq / len) / 255;
 
-  // Spectral centroid → color hue
+  // Spectral centroid
   let wSum = 0, total = 0;
   for (let i = 0; i < len; i++) { wSum += i * freqData[i]; total += freqData[i]; }
   const centroid = total > 0 ? wSum / (total * len) : 0;
 
-  // Treble: top quarter of bins → jitter
+  // Treble: top quarter of bins
   let trebleSum = 0;
   const trebleStart = Math.floor(len * 0.75);
   for (let i = trebleStart; i < len; i++) trebleSum += freqData[i];
   const treble = trebleSum / ((len - trebleStart) * 255);
 
-  // 8-band mel approximation (log-spaced)
+  // 8-band mel approximation
   const melbands = new Float32Array(8);
-  const logStart = Math.log(1);
-  const logEnd   = Math.log(len);
+  const logStart = Math.log(1), logEnd = Math.log(len);
   for (let b = 0; b < 8; b++) {
     const lo = Math.floor(Math.exp(logStart + (logEnd - logStart) * (b / 8)));
     const hi = Math.floor(Math.exp(logStart + (logEnd - logStart) * ((b + 1) / 8)));
@@ -589,17 +573,27 @@ function _feedRealTimeFeatures() {
     melbands[b] = count > 0 ? s / (count * 255) : 0;
   }
 
-  // [A4] Feed Ambient with all extracted features
+  // [B3] Onset-based beat detection — derivative of bass energy
+  // Fires on rising transients rather than sustained high levels.
+  // cooldown prevents double-triggers on a single kick.
+  _beatCooldown = Math.max(0, _beatCooldown - 1);
+  const bassRise = bass - _prevBassEnergy;
+  const beatFired = _beatCooldown === 0 && bassRise > 0.12 && bass > 0.20;
+  if (beatFired) _beatCooldown = 8;   // ~128ms at 16ms polling
+  _prevBassEnergy = bass;
+
+  // [B1] Pass raw freqData for spectral flux inside Ambient
   Ambient.setAudioFeatures({
     loudness: loud,
     centroid,
     melbands,
-    beat: bass > 0.60 ? bass : 0,
+    beat:     beatFired ? bass : 0,
+    freqData,   // [B1] raw array reference — Ambient reads it synchronously
   });
 }
 
 // ─────────────────────────────────────────────────────────
-// AUDIO ANALYSIS (Essentia JSON from server)
+// AUDIO ANALYSIS (Essentia JSON)
 // ─────────────────────────────────────────────────────────
 async function _fetchAudioAnalysis(song) {
   _setAnalysisStatus('🔍 Analysing…');
@@ -631,8 +625,6 @@ async function _fetchAudioAnalysis(song) {
 // ─────────────────────────────────────────────────────────
 async function togglePlay() {
   if (!audioEl?.src || elPlayBtn?.disabled) return;
-
-  // [A2] AudioContext MUST be created/resumed on direct user gesture
   await _resumeContext();
 
   if (audioEl.paused) {
@@ -683,7 +675,6 @@ function setVolume(val) {
 function _setPlayState(playing) {
   elPlayIco?.classList.toggle('hidden',  playing);
   elPauseIco?.classList.toggle('hidden', !playing);
-  // Drive CSS vinyl spin + waveform bars
   document.body.classList.toggle('is-playing', playing);
 }
 

@@ -1,59 +1,90 @@
 /**
- * ambient.js — GPGPU Flow Field Visualizer  v4.0
+ * ambient.js — GPGPU Flow Field Visualizer  v5.0
  * ─────────────────────────────────────────────────────────────
- * Three.js r128 + GPUComputationRenderer + EffectComposer + UnrealBloomPass
+ * Improvements over v4.0:
  *
- * Architecture:
- *   GPUComputationRenderer handles tPosition + tVelocity ping-pong internally.
- *   THREE.HalfFloatType for ALL textures — universal browser/GPU support.
- *   EffectComposer → RenderPass → UnrealBloomPass for neon glow.
+ * [V1] DUAL-LAYER CURL NOISE — two noise octaves at different frequencies
+ *      break up repeating vortex patterns; second layer animates at offset phase.
  *
- * Audio reactivity (two layers):
- *   ESSENTIA JSON timeline  → flow strength (loudness), color hue (spectral centroid)
- *   Web Audio API real-time → kick bass → camera shake + bloom, hats → jitter
+ * [V2] PARTICLE LIFETIME FADE — pos.w lifetime now drives per-particle
+ *      fade-in/out in fragment shader; particles born and die visibly.
+ *      Boundary wrap uses fade-out/respawn instead of hard toroidal pop.
  *
- * Black screen fixes vs v3.x:
- *   • renderer alpha:true so canvas is truly transparent (body/html CSS shows through)
- *   • GPGPU loop starts immediately on init(), not gated behind login
- *   • GPUComputationRenderer explicitly sets useHalfFloat on all vars
- *   • EffectComposer renders to screen — no manual final-composite shader needed
+ * [V3] CAMERA ORBIT — slow continuous figure-8 Lissajous path replaces
+ *      static camera. Bass shake replaced with smooth LFO-based oscillation.
+ *
+ * [V4] PER-BAND SPATIAL COLOR — bass drives center warmth, treble drives
+ *      edge coolness; center/edge hue separation gives two-tone depth.
+ *
+ * [V5] SPECTRAL FLUX — derivative of spectrum energy drives color shift
+ *      intensity. Verse→chorus transitions and instrument entries trigger
+ *      visible color responses that raw RMS misses.
+ *
+ * [V6] DENSITY BIAS — particles respawn toward high-curl regions rather
+ *      than uniformly; flow concentrates where visually interesting.
+ *
+ * [V7] IDLE HUE DRIFT — slow hue rotation when no audio, prevents dead look.
+ *
+ * [V8] HALF-RES BLOOM — bloom renders at 0.5× resolution, saves GPU budget.
+ *
+ * [V9] ADAPTIVE COMPUTE THROTTLE — GPGPU skips every other frame when
+ *      audio energy is very low; freed budget spent on visual quality.
+ *
+ * [V10] MOBILE SHAKE FIX — camera shake uses sin/cos LFO at 2–4 Hz,
+ *       scaled by bass, instead of Math.random() jitter.
+ *
+ * [C1] COLOR FIX — lightness clamped to 0.62 max, base saturation raised,
+ *      bloom threshold raised to 0.35, bloom radius tightened to 0.4.
  */
 
 const Ambient = (() => {
 
   // ── Constants ─────────────────────────────────────────────
-  const PARTICLE_TEXTURE_SIZE = 256;     // 256×256 = 65 536 particles
+  const PARTICLE_TEXTURE_SIZE = 256;
   const NUM_PARTICLES = PARTICLE_TEXTURE_SIZE * PARTICLE_TEXTURE_SIZE;
 
   // ── Module state ──────────────────────────────────────────
   let renderer, scene, camera, clock;
   let gpuCompute;
-  let posVar, velVar;                    // GPUComputationRenderer variables
+  let posVar, velVar;
   let particlesMesh;
   let composer, bloomPass;
   let initialized = false;
   let rafId = null;
 
-  // ── Palette ───────────────────────────────────────────────
-  let _palHue   = 220;                   // degrees, driven by spectral centroid
-  let _palShift = 0;
+  // [V3] Camera orbit state
+  let _orbitT      = 0;       // orbit phase time accumulator
+  let _shakeLFO_x  = 0;       // [V10] smooth LFO shake X
+  let _shakeLFO_y  = 0;       // [V10] smooth LFO shake Y
+  let _shakeAmt    = 0;
+  let _bloomStr    = 0;
 
-  // ── Audio uniforms (written by app.js via setAudioFeatures) ─
+  // [V9] Adaptive throttle state
+  let _skipFrame   = false;   // toggles each low-energy frame
+
+  // ── Palette ───────────────────────────────────────────────
+  let _palHue      = 220;     // primary hue, driven by centroid
+  let _palShift    = 0;
+  let _idleHue     = 0;       // [V7] idle drift accumulator
+
+  // [V5] Spectral flux
+  let _prevFreqSum = 0;
+  let _flux        = 0;
+
+  // ── Audio uniforms ────────────────────────────────────────
   const _audio = {
-    loudness:  0,    // 0-1 RMS loudness (Essentia + Web Audio)
-    centroid:  0,    // 0-1 spectral centroid → color hue
-    bass:      0,    // 0-1 low-freq energy → camera shake, bloom
-    treble:    0,    // 0-1 high-freq energy → particle jitter
-    beat:      0,    // 0-1 beat pulse
+    loudness:  0,
+    centroid:  0,
+    bass:      0,
+    treble:    0,
+    beat:      0,
+    // [V4] per-band spatial
+    mids:      0,
+    flux:      0,
   };
 
-  // ── Camera shake state ────────────────────────────────────
-  let _shakeAmt   = 0;
-  let _bloomStr   = 0;
-
-  // ── GLSL: 3D Simplex Noise (self-contained, no deps) ─────
+  // ── GLSL: 3D Simplex Noise ────────────────────────────────
   const GLSL_NOISE = /* glsl */`
-    //  Simplex 3D noise by Ashima Arts / Stefan Gustavson
     vec3 mod289v3(vec3 x){ return x - floor(x*(1./289.))*289.; }
     vec4 mod289v4(vec4 x){ return x - floor(x*(1./289.))*289.; }
     vec4 permute(vec4 x){ return mod289v4(((x*34.)+1.)*x); }
@@ -102,7 +133,7 @@ const Ambient = (() => {
       return 42. * dot(m*m, vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
     }
 
-    // 3D Curl Noise — divergence-free vector field
+    // Curl noise — divergence-free vector field
     vec3 curlNoise(vec3 p, float scale, float influence){
       float e = 0.0001;
       vec3 sp = p * scale;
@@ -118,34 +149,44 @@ const Ambient = (() => {
   `;
 
   // ── GLSL: Velocity shader ─────────────────────────────────
-  // Curl noise drives the flow field.
-  // u_audioIntensity (loudness) scales both noise frequency and influence.
-  // u_treble adds high-frequency jitter.
-  // u_beat fires a radial impulse.
+  // [V1] Two curl noise layers at different scales/phases
+  // [V6] Density bias: curl magnitude used to bias respawn (passed via vel.w)
   const VELOCITY_SHADER = /* glsl */`
     ${GLSL_NOISE}
 
     uniform float u_time;
     uniform float u_dt;
-    uniform float u_audioIntensity;  // 0-1 loudness → flow strength
-    uniform float u_beat;            // 0-1 beat pulse → radial impulse
-    uniform float u_treble;          // 0-1 high freq → jitter
-    uniform float u_bass;            // 0-1 low freq  → field expansion
+    uniform float u_audioIntensity;
+    uniform float u_beat;
+    uniform float u_treble;
+    uniform float u_bass;
+    uniform float u_mids;
+    uniform float u_flux;
 
     void main(){
       vec2 uv  = gl_FragCoord.xy / resolution.xy;
       vec4 pos = texture2D(tPosition, uv);
       vec4 vel = texture2D(tVelocity, uv);
 
-      float intensity = 0.18 + u_audioIntensity * 1.4 + u_bass * 0.6;
-      float scale     = 0.55 + u_audioIntensity * 1.2;
+      float intensity = 0.18 + u_audioIntensity * 1.2 + u_bass * 0.5;
+      float scale1    = 0.55 + u_audioIntensity * 0.9;
 
-      // Animated 3D curl noise field
-      vec3 p3 = vec3(pos.xy, pos.z + u_time * 0.08);
-      vec3 curl = curlNoise(p3, scale, intensity);
+      // [V1] PRIMARY curl layer — same as before but slightly tamed
+      vec3 p3  = vec3(pos.xy, pos.z + u_time * 0.08);
+      vec3 curl1 = curlNoise(p3, scale1, intensity);
+
+      // [V1] SECONDARY curl layer — higher frequency, offset phase, lower weight
+      // Uses a different time offset and scale to break up repeating patterns
+      float scale2 = scale1 * 2.3;
+      vec3 p3b = vec3(pos.xy * 1.1 + vec2(17.3, 31.7), pos.z - u_time * 0.05 + 5.4);
+      vec3 curl2 = curlNoise(p3b, scale2, intensity * 0.38);
+
+      // Blend layers — mids energy shifts weight toward secondary layer
+      float blend = 0.25 + u_mids * 0.35;
+      vec3 curl = mix(curl1, curl1 + curl2, blend);
 
       // High-frequency jitter (treble)
-      float jitter = u_treble * 0.35;
+      float jitter = u_treble * 0.30;
       curl.xy += vec2(
         snoise(p3 * 4.2 + vec3(u_time * 0.3, 0., 0.)),
         snoise(p3 * 4.2 + vec3(0., u_time * 0.3, 0.))
@@ -157,25 +198,28 @@ const Ambient = (() => {
 
       // Beat impulse — radial outward burst
       float dist = length(pos.xy);
-      vel.xy += normalize(pos.xy + 0.0001) * u_beat * 2.2 * exp(-dist * 1.8) * u_dt * 60.0;
+      vel.xy += normalize(pos.xy + 0.0001) * u_beat * 2.0 * exp(-dist * 1.8) * u_dt * 60.0;
 
       // Damping
       vel.xyz *= 0.982;
 
-      // Soft boundary spring — pull back if too far
+      // Soft boundary — smooth falloff (no hard spring wall)
       float r = length(pos.xyz);
-      if(r > 1.5) vel.xyz -= normalize(pos.xyz) * (r - 1.5) * 0.8 * u_dt * 60.0;
+      float boundaryFade = smoothstep(1.3, 1.7, r);
+      vel.xyz -= normalize(pos.xyz) * boundaryFade * 0.6 * u_dt * 60.0;
 
-      // Store speed in w for use in rendering
-      gl_FragColor = vec4(vel.xyz, length(vel.xyz));
+      // [V6] Store curl magnitude in w — used by position shader for density bias
+      gl_FragColor = vec4(vel.xyz, length(curl1));
     }
   `;
 
   // ── GLSL: Position shader ─────────────────────────────────
-  // Particles flow along velocity field and wrap around screen boundaries.
+  // [V2] Lifetime-based fade replaces hard toroidal wrap
+  // [V6] Density-biased respawn toward high-curl regions
   const POSITION_SHADER = /* glsl */`
     uniform float u_dt;
     uniform float u_time;
+    uniform float u_bass;
 
     void main(){
       vec2 uv  = gl_FragCoord.xy / resolution.xy;
@@ -185,88 +229,120 @@ const Ambient = (() => {
       // Integrate position
       pos.xyz += vel.xyz * u_dt;
 
-      // Toroidal wrap in XY — particles flow across screen boundaries
-      // Z wraps on a tighter range (depth)
-      if(pos.x >  1.8) pos.x -= 3.6;
-      if(pos.x < -1.8) pos.x += 3.6;
-      if(pos.y >  1.8) pos.y -= 3.6;
-      if(pos.y < -1.8) pos.y += 3.6;
-      if(pos.z >  1.2) pos.z -= 2.4;
-      if(pos.z < -1.2) pos.z += 2.4;
+      // [V2] Soft fade-out near boundary instead of hard wrap
+      // pos.w encodes: x = lifetime (0-1 normalized), wraps continuously
+      float age      = pos.w;
+      float lifetime = 8.0 + fract(sin(dot(uv, vec2(127.1, 311.7))) * 43758.5) * 12.0;
+      age += u_dt / lifetime;
 
-      // Respawn dead particles (stopped)
-      if(dot(vel.xyz, vel.xyz) < 1e-10){
-        // Hash-based pseudorandom respawn from UV
-        float rng1 = fract(sin(dot(uv, vec2(127.1, 311.7))) * 43758.5453);
-        float rng2 = fract(sin(dot(uv, vec2(269.5, 183.3))) * 43758.5453);
-        float rng3 = fract(sin(dot(uv, vec2(419.2, 371.9))) * 43758.5453);
-        float th = rng1 * 6.28318;
-        float ph = acos(2.0 * rng2 - 1.0);
-        float r  = 0.1 + rng3 * 0.9;
-        pos.xyz  = vec3(sin(ph)*cos(th)*r, sin(ph)*sin(th)*r, cos(ph)*r * 0.5);
+      // Out-of-bounds or old age → mark for respawn
+      float r     = length(pos.xyz);
+      bool oob    = r > 1.75;
+      bool old    = age > 1.0;
+      bool dead   = dot(vel.xyz, vel.xyz) < 1e-10;
+
+      if(oob || old || dead){
+        // [V6] Density-bias: use velocity curl magnitude (vel.w) to skew respawn
+        // High curl magnitude → respawn closer to center where field is rich
+        float curlMag = vel.w;
+        float bias    = mix(0.8, 0.3, clamp(curlMag * 0.4, 0.0, 1.0));
+
+        float rng1 = fract(sin(dot(uv + u_time * 0.001, vec2(127.1, 311.7))) * 43758.5453);
+        float rng2 = fract(sin(dot(uv + u_time * 0.001, vec2(269.5, 183.3))) * 43758.5453);
+        float rng3 = fract(sin(dot(uv + u_time * 0.001, vec2(419.2, 371.9))) * 43758.5453);
+        float th   = rng1 * 6.28318;
+        float ph   = acos(2.0 * rng2 - 1.0);
+        float rr   = bias * (0.15 + rng3 * 0.85);
+
+        // Bass energy → respawn burst slightly further out
+        rr = mix(rr, rr * 1.3, u_bass * 0.4);
+
+        pos.xyz  = vec3(sin(ph)*cos(th)*rr, sin(ph)*sin(th)*rr, cos(ph)*rr * 0.4);
+        age = 0.0;
       }
 
-      // Store lifetime in w
-      pos.w = mod(pos.w + u_dt, 100.0);
+      pos.w = age;
       gl_FragColor = pos;
     }
   `;
 
   // ── GLSL: Particle vertex shader ──────────────────────────
+  // [V4] Per-band spatial color: bass→center warmth, treble→edge cool
+  // [C1] Lightness clamped to 0.62, base saturation raised
   const PARTICLE_VERT = /* glsl */`
     uniform sampler2D tPosition;
     uniform sampler2D tVelocity;
     uniform float     u_audioIntensity;
     uniform float     u_bass;
+    uniform float     u_treble;
+    uniform float     u_mids;
     uniform float     u_beat;
-    uniform float     u_hue;          // 0-360 driven by spectral centroid
-    uniform float     u_saturation;   // driven by loudness
+    uniform float     u_hue;
+    uniform float     u_hueSecondary;   // [V4] contrasting hue for edges
+    uniform float     u_saturation;
+    uniform float     u_flux;           // [V5] spectral flux → color shift
     uniform float     u_time;
 
     varying vec3  vColor;
     varying float vAlpha;
 
-    // HSL → RGB (GLSL, fast)
     vec3 hsl2rgb(float h, float s, float l){
       h = mod(h, 360.0) / 360.0;
       float r, g, b;
       float q = l < 0.5 ? l*(1.+s) : l+s-l*s;
       float p = 2.*l - q;
-      float hk = h;
-      // Red
-      float t = hk + 1./3.; if(t<0.)t+=1.; if(t>1.)t-=1.;
+      float t;
+      t = h + 1./3.; if(t<0.)t+=1.; if(t>1.)t-=1.;
       r = t<1./6.?p+(q-p)*6.*t : t<.5?q : t<2./3.?p+(q-p)*(2./3.-t)*6. : p;
-      // Green
-      t = hk; if(t<0.)t+=1.; if(t>1.)t-=1.;
+      t = h;         if(t<0.)t+=1.; if(t>1.)t-=1.;
       g = t<1./6.?p+(q-p)*6.*t : t<.5?q : t<2./3.?p+(q-p)*(2./3.-t)*6. : p;
-      // Blue
-      t = hk - 1./3.; if(t<0.)t+=1.; if(t>1.)t-=1.;
+      t = h - 1./3.; if(t<0.)t+=1.; if(t>1.)t-=1.;
       b = t<1./6.?p+(q-p)*6.*t : t<.5?q : t<2./3.?p+(q-p)*(2./3.-t)*6. : p;
       return vec3(r, g, b);
     }
 
     void main(){
-      // UV into GPGPU texture
       vec2 gpuUV = position.xy;
       vec4 pos   = texture2D(tPosition, gpuUV);
       vec4 vel   = texture2D(tVelocity, gpuUV);
 
-      vec4 mvPos    = modelViewMatrix * vec4(pos.xyz, 1.0);
-      gl_Position   = projectionMatrix * mvPos;
+      vec4 mvPos  = modelViewMatrix * vec4(pos.xyz, 1.0);
+      gl_Position = projectionMatrix * mvPos;
 
-      // Point size — bass expands, beat pulses
-      float spd    = vel.w;
-      float sz     = 1.2 + spd * 2.8 + u_bass * 3.0 + u_beat * 2.5;
+      float spd = length(vel.xyz);
+      float sz  = 1.1 + spd * 2.4 + u_bass * 2.5 + u_beat * 2.0;
       gl_PointSize = sz * (300.0 / max(-mvPos.z, 0.5));
 
-      // Color — HSL driven by spectral centroid (hue) and loudness (saturation)
-      float hue  = u_hue + pos.z * 30.0 + spd * 40.0;   // depth + speed tint
-      float sat  = 0.6 + u_saturation * 0.4;
-      float lght = 0.35 + spd * 0.5 + u_audioIntensity * 0.3;
-      vColor = hsl2rgb(hue, sat, clamp(lght, 0.1, 0.9));
+      // [V2] Lifetime fade — age in pos.w [0,1]
+      float age   = pos.w;
+      float fadeIn  = smoothstep(0.0, 0.08, age);
+      float fadeOut = 1.0 - smoothstep(0.82, 1.0, age);
+      float lifeFade = fadeIn * fadeOut;
 
-      // Alpha — faster = more opaque
-      vAlpha = clamp(0.15 + spd * 0.6 + u_audioIntensity * 0.4, 0.04, 1.0);
+      // [V4] Radial distance from origin → blend center hue vs edge hue
+      float radial = clamp(length(pos.xy) / 1.4, 0.0, 1.0);
+
+      // Bass hue = warm (shifted toward red/orange)
+      float hueCenter = u_hue + u_flux * 25.0;
+      // Treble hue = cool (complementary offset)
+      float hueEdge   = u_hueSecondary + pos.z * 20.0;
+
+      // [V4] Blend hue by radial position + per-band energy
+      float bandBlend = clamp(radial + u_treble * 0.4 - u_bass * 0.3, 0.0, 1.0);
+      float hue = mix(hueCenter, hueEdge, bandBlend);
+      hue += spd * 30.0;  // speed tints within the band
+
+      // [C1] Saturation: higher base, smaller loudness range
+      float sat   = 0.75 + u_saturation * 0.20;
+      // [C1] Lightness: clamped to 0.62 max to preserve color
+      float lght  = 0.28 + spd * 0.30 + u_audioIntensity * 0.12 + u_mids * 0.08;
+      lght = clamp(lght, 0.10, 0.62);
+
+      vColor = hsl2rgb(hue, sat, lght);
+
+      // Alpha driven by speed, loudness, and lifetime fade
+      float rawAlpha = clamp(0.12 + spd * 0.55 + u_audioIntensity * 0.35, 0.03, 1.0);
+      vAlpha = rawAlpha * lifeFade;
     }
   `;
 
@@ -276,52 +352,47 @@ const Ambient = (() => {
     varying float vAlpha;
 
     void main(){
-      // Soft circular point
-      float d = length(gl_PointCoord - vec2(0.5));
+      float d    = length(gl_PointCoord - vec2(0.5));
       if(d > 0.5) discard;
       float edge = 1.0 - d * 2.0;
-      float glow = pow(edge, 1.4);
-      gl_FragColor = vec4(vColor * (1.0 + glow * 0.6), glow * glow * vAlpha);
+      float glow = pow(edge, 1.6);
+      gl_FragColor = vec4(vColor * (1.0 + glow * 0.5), glow * glow * vAlpha);
     }
   `;
 
-  // ── Helper: fill Float32Array with sphere distribution ───
+  // ── Helper: sphere distribution ───────────────────────────
   function _sphereData(n) {
     const data = new Float32Array(n * 4);
     for (let i = 0; i < n; i++) {
       const th = Math.random() * Math.PI * 2;
       const ph = Math.acos(2 * Math.random() - 1);
-      const r  = 0.1 + Math.random() * 1.0;
+      const r  = 0.1 + Math.random() * 0.9;
       data[i*4]   = Math.sin(ph) * Math.cos(th) * r;
       data[i*4+1] = Math.sin(ph) * Math.sin(th) * r;
       data[i*4+2] = Math.cos(ph) * r * 0.4;
-      data[i*4+3] = Math.random() * 100;   // random lifetime offset
+      data[i*4+3] = Math.random();   // random initial age [0,1]
     }
     return data;
   }
 
-  // ── Public API: init ─────────────────────────────────────
+  // ── Public API: init ──────────────────────────────────────
   function init() {
     if (initialized) return true;
 
     const canvas = document.getElementById('ambient-canvas');
     if (!canvas) { console.error('[Ambient] #ambient-canvas not found'); return false; }
 
-    // Canvas must sit behind all UI
     Object.assign(canvas.style, {
       position: 'fixed', inset: '0',
       width: '100vw', height: '100vh',
       zIndex: '-1', display: 'block', pointerEvents: 'none',
     });
 
-    // ── Renderer ─────────────────────────────────────────────
-    // alpha:true → canvas is transparent so body/html gradient shows through.
-    // This is the primary fix for the black screen when no particles are visible.
     try {
       renderer = new THREE.WebGLRenderer({
         canvas,
         antialias:        false,
-        alpha:            true,          // ← transparent canvas background
+        alpha:            true,
         powerPreference:  'high-performance',
         preserveDrawingBuffer: false,
       });
@@ -333,66 +404,51 @@ const Ambient = (() => {
 
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.setSize(innerWidth, innerHeight);
-    renderer.setClearColor(0x000000, 0);  // fully transparent clear
+    renderer.setClearColor(0x000000, 0);
 
-    // ── Check GPU capability ──────────────────────────────────
     const gl = renderer.getContext();
     const isWebGL2 = (typeof WebGL2RenderingContext !== 'undefined')
       && (gl instanceof WebGL2RenderingContext);
-    const hasHF  = isWebGL2 || !!gl.getExtension('OES_texture_half_float');
-    const hasF   = isWebGL2 || !!gl.getExtension('OES_texture_float');
+    const hasHF = isWebGL2 || !!gl.getExtension('OES_texture_half_float');
+    const hasF  = isWebGL2 || !!gl.getExtension('OES_texture_float');
 
     if (!hasHF && !hasF) {
       console.warn('[Ambient] No float texture support — CSS fallback');
       _cssFallback(canvas);
       return false;
     }
-    console.info(`[Ambient] WebGL${isWebGL2 ? '2' : '1'} ✓  HalfFloat:${hasHF}  Float:${hasF}`);
 
-    // ── Scene + Camera ────────────────────────────────────────
     scene  = new THREE.Scene();
     clock  = new THREE.Clock();
     camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100);
     camera.position.z = 2.8;
 
-    // ── GPUComputationRenderer ────────────────────────────────
-    // Library loaded from jsdelivr before this script.
-    // GPUComputationRenderer handles double-buffered FBO ping-pong internally.
     if (typeof THREE.GPUComputationRenderer === 'undefined') {
-      console.error('[Ambient] GPUComputationRenderer not loaded. Add the script tag.');
+      console.error('[Ambient] GPUComputationRenderer not loaded');
       _cssFallback(canvas);
       return false;
     }
 
     const SIZE = PARTICLE_TEXTURE_SIZE;
     gpuCompute = new THREE.GPUComputationRenderer(SIZE, SIZE, renderer);
-
-    // Force HalfFloat on all GPGPU textures — the only type with universal
-    // render-target support across WebGL1/2 and all GPU vendors.
     gpuCompute.setDataType(THREE.HalfFloatType);
 
-    // Seed textures
     const initPos = gpuCompute.createTexture();
     const initVel = gpuCompute.createTexture();
-    const posData = _sphereData(SIZE * SIZE);
-    initPos.image.data.set(posData);
-    // Velocity starts at zero — particles will be immediately driven by curl noise
+    initPos.image.data.set(_sphereData(SIZE * SIZE));
 
-    // Add variables (shaders)
     posVar = gpuCompute.addVariable('tPosition', POSITION_SHADER, initPos);
     velVar = gpuCompute.addVariable('tVelocity', VELOCITY_SHADER, initVel);
 
-    // Cross-dependencies (position reads velocity, velocity reads position)
     gpuCompute.setVariableDependencies(posVar, [posVar, velVar]);
     gpuCompute.setVariableDependencies(velVar, [posVar, velVar]);
 
-    // Uniforms for position shader
     Object.assign(posVar.material.uniforms, {
       u_dt:   { value: 0.016 },
       u_time: { value: 0 },
+      u_bass: { value: 0 },
     });
 
-    // Uniforms for velocity shader
     Object.assign(velVar.material.uniforms, {
       u_dt:             { value: 0.016 },
       u_time:           { value: 0 },
@@ -400,6 +456,8 @@ const Ambient = (() => {
       u_beat:           { value: 0 },
       u_treble:         { value: 0 },
       u_bass:           { value: 0 },
+      u_mids:           { value: 0 },
+      u_flux:           { value: 0 },
     });
 
     const err = gpuCompute.init();
@@ -409,8 +467,7 @@ const Ambient = (() => {
       return false;
     }
 
-    // ── Particle geometry + material ──────────────────────────
-    // UV coordinates into the GPGPU texture, stored as position attribute
+    // Particle geometry — UV coords into GPGPU texture
     const uvs = new Float32Array(NUM_PARTICLES * 3);
     for (let j = 0; j < SIZE; j++) {
       for (let i = 0; i < SIZE; i++) {
@@ -429,15 +486,19 @@ const Ambient = (() => {
         tVelocity:        { value: null },
         u_audioIntensity: { value: 0 },
         u_bass:           { value: 0 },
+        u_treble:         { value: 0 },
+        u_mids:           { value: 0 },
         u_beat:           { value: 0 },
         u_hue:            { value: 220 },
+        u_hueSecondary:   { value: 40 },    // [V4] complementary hue
         u_saturation:     { value: 0.5 },
+        u_flux:           { value: 0 },
         u_time:           { value: 0 },
       },
       vertexShader:   PARTICLE_VERT,
       fragmentShader: PARTICLE_FRAG,
       transparent:    true,
-      blending:       THREE.AdditiveBlending,   // neon/glow additive blend
+      blending:       THREE.AdditiveBlending,
       depthWrite:     false,
       depthTest:      false,
     });
@@ -445,22 +506,21 @@ const Ambient = (() => {
     particlesMesh = new THREE.Points(geo, mat);
     scene.add(particlesMesh);
 
-    // ── EffectComposer + UnrealBloomPass ──────────────────────
     _setupComposer();
 
-    // ── Resize handler ────────────────────────────────────────
     window.addEventListener('resize', _onResize);
 
     initialized = true;
-    console.info(`[Ambient] Init OK ✓ — ${NUM_PARTICLES.toLocaleString()} particles, Bloom active`);
+    console.info(`[Ambient] Init OK v5.0 ✓ — ${NUM_PARTICLES.toLocaleString()} particles`);
     _startLoop();
     return true;
   }
 
+  // [V8] Half-res bloom — renders at 0.5× to save GPU budget
   function _setupComposer() {
     if (typeof THREE.EffectComposer === 'undefined' ||
         typeof THREE.UnrealBloomPass === 'undefined') {
-      console.warn('[Ambient] EffectComposer/UnrealBloomPass not loaded — rendering without bloom');
+      console.warn('[Ambient] EffectComposer/UnrealBloomPass not loaded');
       composer = null;
       return;
     }
@@ -470,13 +530,14 @@ const Ambient = (() => {
     const renderPass = new THREE.RenderPass(scene, camera);
     composer.addPass(renderPass);
 
-    // UnrealBloomPass(resolution, strength, radius, threshold)
-    bloomPass = new THREE.UnrealBloomPass(
-      new THREE.Vector2(innerWidth, innerHeight),
-      0.7,    // strength  — boosted by bass at runtime
-      0.5,    // radius
-      0.2,    // threshold — low so dim particles still glow
+    // [V8] Half-resolution bloom — imperceptible quality loss, meaningful GPU saving
+    const bloomRes = new THREE.Vector2(
+      Math.floor(innerWidth  * 0.5),
+      Math.floor(innerHeight * 0.5),
     );
+
+    // [C1] Threshold raised to 0.35, radius tightened to 0.4
+    bloomPass = new THREE.UnrealBloomPass(bloomRes, 0.6, 0.4, 0.35);
     composer.addPass(bloomPass);
   }
 
@@ -486,10 +547,12 @@ const Ambient = (() => {
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     if (composer) composer.setSize(w, h);
-    if (bloomPass) bloomPass.resolution.set(w, h);
+    if (bloomPass) {
+      // [V8] Keep bloom at half res on resize too
+      bloomPass.resolution.set(Math.floor(w * 0.5), Math.floor(h * 0.5));
+    }
   }
 
-  // ── CSS fallback for no-WebGL environments ────────────────
   function _cssFallback(canvas) {
     let hue = 220;
     const shimmer = setInterval(() => {
@@ -511,87 +574,131 @@ const Ambient = (() => {
     ;(function loop() {
       rafId = requestAnimationFrame(loop);
 
-      const dt = Math.min(clock.getDelta(), 0.05);
-      const t  = clock.getElapsedTime();
+      const dt  = Math.min(clock.getDelta(), 0.05);
+      const t   = clock.getElapsedTime();
 
-      // Smooth audio values toward targets
       const targetLoud   = _audio.loudness;
       const targetBass   = _audio.bass;
       const targetTreble = _audio.treble;
+      const targetMids   = _audio.mids;
       const targetBeat   = _audio.beat;
+      const targetFlux   = _audio.flux;
 
-      // Lerp bloom strength toward bass-driven target
-      _bloomStr  += (0.6 + targetBass * 2.2 - _bloomStr)  * dt * 4;
-      _shakeAmt  += (targetBass * 0.012         - _shakeAmt) * dt * 8;
-      _palHue    += (_audio.centroid * 360 + _palShift - _palHue) * dt * 0.8;
+      // [V7] Idle hue drift — slow rotation when no audio
+      const isActive = targetLoud > 0.05;
+      if (!isActive) {
+        _idleHue = (_idleHue + dt * 4.0) % 360;   // ~4°/s idle drift
+      }
 
-      // ── Update GPGPU ────────────────────────────────────────
-      // Velocity shader uniforms
-      velVar.material.uniforms.u_dt.value             = dt;
-      velVar.material.uniforms.u_time.value           = t;
-      velVar.material.uniforms.u_audioIntensity.value = targetLoud;
-      velVar.material.uniforms.u_beat.value           = targetBeat;
-      velVar.material.uniforms.u_treble.value         = targetTreble;
-      velVar.material.uniforms.u_bass.value           = targetBass;
+      // Smooth bloom + shake toward targets
+      // [C1] Bass bloom multiplier halved
+      _bloomStr += (0.5 + targetBass * 1.1 - _bloomStr) * dt * 4;
+      _shakeAmt += (targetBass * 0.010       - _shakeAmt) * dt * 8;
 
-      // Position shader uniforms
-      posVar.material.uniforms.u_dt.value   = dt;
-      posVar.material.uniforms.u_time.value = t;
+      // Primary hue follows spectral centroid; flux adds momentary color kick
+      const hueTarget = isActive
+        ? _audio.centroid * 360 + _palShift + targetFlux * 30
+        : 220 + _idleHue;
+      _palHue += (hueTarget - _palHue) * dt * (isActive ? 1.2 : 0.3);
 
-      gpuCompute.compute();
+      // [V4] Secondary (edge) hue is complementary offset — shifts opposite direction
+      const secondaryHue = _palHue + 150 + targetBass * 40;
 
-      // ── Update particle material ────────────────────────────
+      // [V9] Adaptive compute throttle — skip every other frame at very low energy
+      const energy      = targetLoud + targetBass * 0.5;
+      const doCompute   = energy > 0.04 || !_skipFrame;
+      _skipFrame        = !_skipFrame;
+
+      if (doCompute) {
+        velVar.material.uniforms.u_dt.value             = dt;
+        velVar.material.uniforms.u_time.value           = t;
+        velVar.material.uniforms.u_audioIntensity.value = targetLoud;
+        velVar.material.uniforms.u_beat.value           = targetBeat;
+        velVar.material.uniforms.u_treble.value         = targetTreble;
+        velVar.material.uniforms.u_bass.value           = targetBass;
+        velVar.material.uniforms.u_mids.value           = targetMids;
+        velVar.material.uniforms.u_flux.value           = targetFlux;
+
+        posVar.material.uniforms.u_dt.value   = dt;
+        posVar.material.uniforms.u_time.value = t;
+        posVar.material.uniforms.u_bass.value = targetBass;
+
+        gpuCompute.compute();
+      }
+
+      // Update particle material
       const mat = particlesMesh.material;
       mat.uniforms.tPosition.value        = gpuCompute.getCurrentRenderTarget(posVar).texture;
       mat.uniforms.tVelocity.value        = gpuCompute.getCurrentRenderTarget(velVar).texture;
       mat.uniforms.u_audioIntensity.value = targetLoud;
       mat.uniforms.u_bass.value           = targetBass;
+      mat.uniforms.u_treble.value         = targetTreble;
+      mat.uniforms.u_mids.value           = targetMids;
       mat.uniforms.u_beat.value           = targetBeat;
       mat.uniforms.u_hue.value            = _palHue;
-      mat.uniforms.u_saturation.value     = 0.5 + targetLoud * 0.5;
+      mat.uniforms.u_hueSecondary.value   = secondaryHue;
+      mat.uniforms.u_saturation.value     = 0.5 + targetLoud * 0.45;
+      mat.uniforms.u_flux.value           = targetFlux;
       mat.uniforms.u_time.value           = t;
 
-      // ── Camera shake (bass-driven) ──────────────────────────
-      camera.position.x = (Math.random() - 0.5) * _shakeAmt;
-      camera.position.y = (Math.random() - 0.5) * _shakeAmt;
+      // [V3] Continuous camera orbit — Lissajous figure-8 path
+      _orbitT += dt * (0.06 + targetLoud * 0.04);   // speed up slightly with loudness
+      const orbitR = 0.18 + targetBass * 0.12;       // orbit radius grows with bass
+      const orbitX = Math.sin(_orbitT * 1.0) * orbitR;
+      const orbitY = Math.sin(_orbitT * 2.0) * orbitR * 0.55;  // figure-8 ratio
 
-      // ── Bloom intensity (bass-driven) ───────────────────────
+      // [V10] Smooth LFO shake — sin/cos at ~3 Hz scaled by bass, NOT random
+      const lfoFreq = 3.0 + targetBass * 2.0;
+      _shakeLFO_x = Math.sin(t * lfoFreq * 1.0) * _shakeAmt;
+      _shakeLFO_y = Math.cos(t * lfoFreq * 1.3) * _shakeAmt;
+
+      camera.position.x = orbitX + _shakeLFO_x;
+      camera.position.y = orbitY + _shakeLFO_y;
+      // Camera always looks toward origin so orbit feels intentional
+      camera.lookAt(0, 0, 0);
+
+      // [C1] Bloom strength — bass drives up but clamped
       if (bloomPass) {
-        bloomPass.strength = Math.max(0.3, _bloomStr);
+        bloomPass.strength = Math.max(0.25, Math.min(_bloomStr, 1.6));
       }
 
-      // ── Render ──────────────────────────────────────────────
+      // Render
       if (composer) {
         composer.render();
       } else {
         renderer.render(scene, camera);
       }
 
-      // Decay beat impulse
+      // Decay beat
       _audio.beat *= 0.88;
-
     })();
   }
 
   // ── Public: audio data feed ───────────────────────────────
-  // Called by app.js every 250ms (clockPoller) with real-time Web Audio data,
-  // and by GradientController integration with Essentia timeline data.
-  function setAudioFeatures({ loudness = 0, centroid = 0, melbands = null, beat = 0 } = {}) {
+  function setAudioFeatures({ loudness = 0, centroid = 0, melbands = null, beat = 0, freqData = null } = {}) {
     _audio.loudness = loudness;
     _audio.centroid = centroid;
-    _audio.beat     = Math.max(_audio.beat, beat);   // latch peak, decay in loop
+    _audio.beat     = Math.max(_audio.beat, beat);
 
     if (melbands && melbands.length >= 8) {
-      // Low 2 bands = bass (kicks)
       _audio.bass   = (melbands[0] + melbands[1]) * 0.5;
-      // High 2 bands = treble (hats, cymbals)
+      _audio.mids   = (melbands[2] + melbands[3] + melbands[4]) / 3;
       _audio.treble = (melbands[6] + melbands[7]) * 0.5;
+    }
+
+    // [V5] Spectral flux — magnitude of spectrum change frame-to-frame
+    if (freqData && freqData.length > 0) {
+      let sum = 0;
+      for (let i = 0; i < freqData.length; i++) sum += freqData[i];
+      const avgNorm = sum / (freqData.length * 255);
+      const rawFlux = Math.abs(avgNorm - _prevFreqSum);
+      _flux += (rawFlux * 8.0 - _flux) * 0.25;   // smooth, scale up to 0-1 range
+      _audio.flux   = Math.min(_flux, 1.0);
+      _prevFreqSum  = avgNorm;
     }
   }
 
-  // ── Public: GradientController integration ────────────────
-  // Called from the render loop if GradientController is available.
-  // Reads the Essentia JSON timeline data that GradientController interpolates.
+  // ── GradientController sync ───────────────────────────────
   function _syncFromGradientController() {
     if (!window.GradientController) return;
     try {
@@ -601,7 +708,7 @@ const Ambient = (() => {
         _audio.loudness = Math.max(0, g.intensity - 1.0);
         _audio.beat     = Math.max(_audio.beat, g.pulse);
         _audio.centroid = g.centroid || 0;
-        _palShift       = (g.centroid || 0) * 60;  // hue shift from Essentia
+        _palShift       = (g.centroid || 0) * 60;
       }
     } catch (e) {}
   }
@@ -618,7 +725,6 @@ const Ambient = (() => {
     )
       .then(r => r.ok ? r.json() : { tags: [] })
       .then(({ tags = [] }) => {
-        // Map mood tags to base hue
         const moodHues = {
           sad: 240, happy: 50, electronic: 280, chill: 160,
           rock: 10, pop: 320, jazz: 35, classical: 180,
@@ -655,13 +761,12 @@ const Ambient = (() => {
   }
 
   function reset() {
-    _audio.loudness = 0;
-    _audio.centroid = 0;
-    _audio.bass     = 0;
-    _audio.treble   = 0;
-    _audio.beat     = 0;
-    _bloomStr       = 0;
-    _shakeAmt       = 0;
+    _audio.loudness = 0; _audio.centroid = 0;
+    _audio.bass = 0; _audio.mids = 0;
+    _audio.treble = 0; _audio.beat = 0; _audio.flux = 0;
+    _bloomStr = 0; _shakeAmt = 0;
+    _orbitT = 0; _shakeLFO_x = 0; _shakeLFO_y = 0;
+    _flux = 0; _prevFreqSum = 0; _idleHue = 0;
     if (window.GradientController) GradientController.reset();
   }
 
