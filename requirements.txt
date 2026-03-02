@@ -1,42 +1,25 @@
-# requirements.txt — OneSong API v4.5
+# requirements.txt — OneSong API v4.6
 #
-# Every package here has a pre-built manylinux wheel for Python 3.11 (cp311)
-# on Linux x86_64. None require Rust, C compilation, or a writable cargo cache.
+# Every package here has a pre-built binary wheel for Python 3.11 (cp311)
+# on Linux x86_64. None require Rust, Cargo, or C compilation.
 #
-# Verified against PyPI wheel availability as of 2024-05:
-#   pydantic-core 2.18.2 → pydantic_core-2.18.2-cp311-cp311-manylinux_2_17_x86_64.whl  ✓
-#   orjson 3.10.3        → orjson-3.10.3-cp311-cp311-manylinux_2_17_x86_64.whl          ✓
-#   bcrypt 4.1.3         → bcrypt-4.1.3-cp39-abi3-manylinux_2_28_x86_64.whl             ✓
+# pydantic-core is the package that was failing — it's written in Rust and
+# has no wheel for Python 3.14 yet, so pip tried to compile from source
+# and hit Render's read-only /usr/local/cargo filesystem.
+# Pinned to 2.18.2 which has a confirmed cp311 manylinux wheel on PyPI.
 #
-# essentia is intentionally OMITTED — installed separately in render.yaml
-# with a || true fallback. Its wheel availability varies by Python patch version.
-# The server degrades gracefully to synthetic analysis when essentia is absent.
+# essentia is intentionally absent — installed separately in render.yaml
+# buildCommand with || true so a missing wheel doesn't abort the build.
 
-# ── Web framework ──────────────────────────────────────────────────────────────
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
-
-# ── Auth ───────────────────────────────────────────────────────────────────────
 PyJWT==2.8.0
 bcrypt==4.1.3
 python-multipart==0.0.9
-
-# ── HTTP client ────────────────────────────────────────────────────────────────
 httpx==0.27.0
-
-# ── Database ───────────────────────────────────────────────────────────────────
 psycopg2-binary==2.9.9
-
-# ── Data / audio ───────────────────────────────────────────────────────────────
-# numpy 1.x required — essentia 2.1b6 is not compatible with numpy 2.x
 numpy==1.26.4
-
-# yt-dlp: installs as both Python module and console-script on PATH
 yt-dlp==2024.5.27
-
-# ── Pydantic (pinned to versions with cp311 wheels — avoids Rust compilation) ──
-# pydantic 2.7.1 + pydantic-core 2.18.2 both have cp311 manylinux wheels.
-# DO NOT upgrade to pydantic 2.8+ without checking pydantic-core wheel availability.
+email-validator==2.1.1
 pydantic==2.7.1
 pydantic-core==2.18.2
-email-validator==2.1.1

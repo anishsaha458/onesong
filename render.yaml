@@ -1,51 +1,60 @@
-# render.yaml — OneSong API v4.5
-# ─────────────────────────────────────────────────────────────
-# ROOT CAUSE OF LATEST BUILD FAILURE:
-#   Render defaulted to Python 3.14. pydantic-core 2.18.2 has no wheel
-#   for 3.14 and tried to compile from Rust source — which fails because
-#   Render's build filesystem is read-only (/usr/local/cargo = EROFS).
+# render.yaml — OneSong API v4.6
 #
-# FIX: `pythonVersion: "3.11.9"` is the ONLY key Render's build system
-#   reliably reads to select the CPython version. runtime.txt and the
-#   PYTHON_VERSION env var are advisory only and were ignored.
+# WHY PREVIOUS ATTEMPTS FAILED:
+#   Render 2025+ defaults to Python 3.14. It creates the virtualenv with
+#   that interpreter BEFORE buildCommand runs. So nothing inside buildCommand
+#   (including `python3.11` calls or pip flags) can change the interpreter.
 #
-# All pinned versions below have confirmed manylinux wheels for cp311.
+#   `pythonVersion:` is NOT a real render.yaml key — Render ignores it.
+#   `runtime.txt` is ignored when render.yaml is present.
+#   `sync: false` env vars must be set manually in the dashboard and are
+#   read too late to affect venv creation.
+#
+# THE ONE FIX THAT WORKS:
+#   PYTHON_VERSION as a hardcoded `value:` in envVars.
+#   Render reads this during infrastructure setup, before the venv is created.
+#   It must be a fully-qualified version string: major.minor.patch
+#   Source: https://render.com/docs/python-version
 
 services:
   - type: web
     name: onesong-api
     runtime: python
-    pythonVersion: "3.11.9"      # ← THE critical fix. Forces cp311 interpreter.
     region: oregon
-    plan: starter                # free tier (512MB) OOMs on Essentia analysis
+    plan: starter
 
     buildCommand: |
       set -e
 
-      echo "=== Python version check ==="
+      echo "=== Python version check (must be 3.11) ==="
       python --version
+      python -c "
+      import sys
+      v = sys.version_info[:2]
+      assert v == (3, 11), f'Wrong Python {sys.version} — PYTHON_VERSION env var was not applied before venv creation'
+      print(f'Python {sys.version} OK')
+      "
 
-      echo "=== Installing system deps (ffmpeg) ==="
+      echo "=== System deps (ffmpeg required for yt-dlp audio conversion) ==="
       apt-get update -qq
       apt-get install -y --no-install-recommends ffmpeg libsndfile1
       apt-get clean && rm -rf /var/lib/apt/lists/*
 
-      echo "=== Upgrading pip ==="
+      echo "=== Python deps ==="
       pip install --upgrade pip
-
-      echo "=== Installing Python deps ==="
       pip install -r requirements.txt
 
-      echo "=== Installing essentia (non-fatal if wheel missing) ==="
+      echo "=== Essentia (optional — non-fatal if wheel unavailable) ==="
       pip install "essentia==2.1b6.dev1110" || \
-        echo "[build] essentia wheel unavailable — synthetic analysis fallback will be used"
+        echo "[build] essentia wheel not available for this platform — synthetic analysis will be used"
 
       echo "=== Smoke test ==="
       python -c "
-      import sys
-      assert sys.version_info[:2] == (3, 11), f'Wrong Python: {sys.version}'
       import fastapi, uvicorn, jwt, bcrypt, psycopg2, httpx, numpy, yt_dlp
-      print(f'All imports OK  python={sys.version}  numpy={numpy.__version__}')
+      import shutil
+      print(f'All imports OK')
+      print(f'ffmpeg on PATH: {shutil.which(\"ffmpeg\")}')
+      print(f'yt-dlp on PATH: {shutil.which(\"yt-dlp\")}')
       "
 
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --log-level info
@@ -53,9 +62,16 @@ services:
     healthCheckPath: /health
 
     envVars:
+      # THE CRITICAL FIX — must be value: not sync: false
+      # Render reads this before creating the virtualenv.
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+
       - key: JWT_SECRET
         generateValue: true
+
       - key: DATABASE_URL
         sync: false
+
       - key: LASTFM_API_KEY
         sync: false
