@@ -20,8 +20,7 @@
 // FIX [E1]: Dynamic API base. To use a separate backend host, set:
 //   <script>window.ONESONG_API = 'https://your-api.onrender.com';</script>
 //   BEFORE this script tag in index.html.
-const API = window.ONESONG_API || window.location.origin;
-
+const API = 'https://onesong.onrender.com';
 // ── Global state ──────────────────────────────────────────
 let authToken    = null;
 let currentUser  = null;
