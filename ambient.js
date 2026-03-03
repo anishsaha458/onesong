@@ -592,8 +592,8 @@ const Ambient = (() => {
 
       // Smooth bloom + shake toward targets
       // [C1] Bass bloom multiplier halved
-      _bloomStr += (0.5 + targetBass * 1.1 - _bloomStr) * dt * 4;
-      _shakeAmt += (targetBass * 0.010       - _shakeAmt) * dt * 8;
+      _bloomStr += (0.5 + targetBass * 1.5 - _bloomStr) * dt * 4;
+      _shakeAmt += (targetBass * 0.050       - _shakeAmt) * dt * 8;
 
       // Primary hue follows spectral centroid; flux adds momentary color kick
       const hueTarget = isActive
@@ -605,7 +605,7 @@ const Ambient = (() => {
       const secondaryHue = _palHue + 150 + targetBass * 40;
 
       // [V9] Adaptive compute throttle — skip every other frame at very low energy
-      const energy      = targetLoud + targetBass * 0.5;
+      const energy      = targetLoud + targetBass * 0.2;
       const doCompute   = energy > 0.04 || !_skipFrame;
       _skipFrame        = !_skipFrame;
 
