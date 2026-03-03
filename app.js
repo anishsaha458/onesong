@@ -65,6 +65,14 @@ let _sHigh = 0;   // smoothed high
 let _prevBassRaw  = 0;
 let _beatCooldown = 0;
 
+// [N1] Running peak trackers — used to normalize bands to true [0,1]
+// Peaks decay slowly so normalization adapts to the song's dynamic range.
+// On a quiet track, a moderate kick still reads near 1.0.
+let _bassPeak = 0.01;   // minimum 0.01 prevents div-by-zero
+let _midPeak  = 0.01;
+let _highPeak = 0.01;
+const PEAK_DECAY = 0.9995;  // per-frame decay (~0.03% per frame = very slow)
+
 // ── DOM refs ──────────────────────────────────────────────
 let elPlayBtn, elPlayIco, elPauseIco, elProgress, elTimeCur, elTimeTot;
 let elSeekSlider, elAnalysisStatus;
@@ -484,6 +492,7 @@ function _teardownAudio() {
   audioCtx = null; audioSrc = null; analyserNode = null; gainNode = null;
   _audioReady = false; _audioRetried = false; _playRetrying = false;
   _sBass = 0; _sMid = 0; _sHigh = 0; _prevBassRaw = 0; _beatCooldown = 0;
+  _bassPeak = 0.01; _midPeak = 0.01; _highPeak = 0.01;
   _setPlayState(false); _setPlayBtnEnabled(false);
 }
 
@@ -552,59 +561,79 @@ function _stopClockPoller() {
 }
 
 // ─────────────────────────────────────────────────────────
-// AUDIO FEATURE EXTRACTION  v6.0
+// AUDIO FEATURE EXTRACTION  v7.0
 //
 // FFT_SIZE=2048 → frequencyBinCount=1024 bins
 // Sample rate ≈ 44100 Hz  →  Hz per bin ≈ 43.1 Hz
 //
-// [A2] Band boundaries (all verified with bin_hz = sr/FFT_SIZE):
-//
+// [A2] Band boundaries:
 //   uBass  — bins 0–2   ≈   0– 86 Hz   Sub-bass / kick / 808
 //   uMid   — bins 9–46  ≈ 387–1980 Hz  Vocals / snare / synth leads
-//   uHigh  — bins 116+  ≈ 4996–22050Hz Cymbals / hi-hats / air
+//   uHigh  — bins 116–255 ≈ 4996–10977Hz  Cymbals / hi-hats / air
 //
-// [A3] Lerp strategy:
+// [A3] Asymmetric lerp:
 //   uBass : raw (no smoothing) — instant physical impact
 //   uMid  : α=0.12 — heavy smoothing, swirl builds/lingers
 //   uHigh : α=0.20 — catches cymbal transients, avoids spikes
 //
-// [A4] Beat: onset detector on raw bass, cooldown=12 frames (~192ms)
+// [N1] NORMALIZATION: bands divided by their running peak.
+//   Each band is normalized against its own maximum observed value.
+//   This means a loud track and a quiet track both use the full
+//   0→1 range — shaders always get meaningful signal.
+//   Peak decays at PEAK_DECAY rate so it adapts to song dynamics.
+//
+// [N2] BEAT THRESHOLD: fires when bass > peak * 0.9.
+//   Peak-relative threshold means the beat detector adapts to the
+//   song's loudness — a soft song's soft kick still fires, while
+//   a loud song's noise floor doesn't fire constantly.
 // ─────────────────────────────────────────────────────────
 function _feedRealTimeFeatures() {
   if (!freqData || freqData.length === 0) return;
   const len = freqData.length;   // 1024 bins with FFT_SIZE=2048
 
-  // ── [A2] BASS: bins 0–2 (~0–86Hz) ──────────────────────
-  // Raw, no smoothing — kick drum needs instant response
+  // ── [A2] RAW BAND SUMS ──────────────────────────────────
+
+  // BASS: bins 0–2 (~0–86Hz) — sub-bass / kick
   let bassSum = 0;
   for (let i = 0; i <= 2; i++) bassSum += freqData[i];
   const bassRaw = bassSum / (3 * 255);
 
-  // ── [A2] MID: bins 9–46 (~387–1980Hz) ──────────────────
+  // MID: bins 9–46 (~387–1980Hz) — vocals / snare body
   let midSum = 0;
   for (let i = 9; i <= 46; i++) midSum += freqData[i];
   const midRaw = midSum / (38 * 255);
 
-  // ── [A2] HIGH: bins 116–255 (~4996–10977Hz) ─────────────
-  // Using 116–255 instead of full 116–1023 keeps it practical;
-  // above ~11kHz the signal is mostly noise in compressed audio.
+  // HIGH: bins 116–255 (~4996–10977Hz) — cymbals / hi-hats
   let highSum = 0;
   for (let i = 116; i <= 255; i++) highSum += freqData[i];
   const highRaw = highSum / (140 * 255);
 
-  // ── [A3] ASYMMETRIC LERPING ─────────────────────────────
-  // Bass: NO lerp — raw value goes straight to shader
-  const uBass = bassRaw;
+  // ── [N1] UPDATE RUNNING PEAKS ───────────────────────────
+  // Peak tracks the maximum seen, decays slowly each frame.
+  // Floor at 0.01 prevents div-by-zero on silence.
+  _bassPeak = Math.max(0.01, Math.max(_bassPeak * PEAK_DECAY, bassRaw));
+  _midPeak  = Math.max(0.01, Math.max(_midPeak  * PEAK_DECAY, midRaw));
+  _highPeak = Math.max(0.01, Math.max(_highPeak * PEAK_DECAY, highRaw));
 
-  // Mid: heavy smoothing (τ ≈ 7 frames = ~112ms attack)
-  _sMid += (midRaw - _sMid) * 0.12;
+  // ── [N1] NORMALIZE to [0,1] ─────────────────────────────
+  // Clamped — occasionally a single bin spike can exceed the rolling peak
+  const bassNorm = Math.min(bassRaw / _bassPeak, 1.0);
+  const midNorm  = Math.min(midRaw  / _midPeak,  1.0);
+  const highNorm = Math.min(highRaw / _highPeak,  1.0);
+
+  // ── [A3] ASYMMETRIC LERPING ─────────────────────────────
+  // uBass: NO lerp on normalized value — instant kick response
+  const uBass = bassNorm;
+
+  // uMid: heavy smoothing — swirl builds and lingers (~112ms)
+  _sMid += (midNorm - _sMid) * 0.12;
   const uMid = _sMid;
 
-  // High: medium smoothing (τ ≈ 4 frames = ~64ms attack)
-  _sHigh += (highRaw - _sHigh) * 0.20;
+  // uHigh: medium smoothing — catches transients, avoids spikes (~64ms)
+  _sHigh += (highNorm - _sHigh) * 0.20;
   const uHigh = _sHigh;
 
-  // ── Full-band RMS loudness (used by GradientController path) ──
+  // ── Full-band RMS loudness ───────────────────────────────
   let sq = 0;
   for (let i = 0; i < len; i++) sq += freqData[i] * freqData[i];
   const loud = Math.sqrt(sq / len) / 255;
@@ -614,7 +643,7 @@ function _feedRealTimeFeatures() {
   for (let i = 0; i < len; i++) { wSum += i * freqData[i]; total += freqData[i]; }
   const centroid = total > 0 ? wSum / (total * len) : 0;
 
-  // ── 8-band mel (kept for GradientController compatibility) ──
+  // ── 8-band mel (GradientController compatibility) ────────
   const melbands = new Float32Array(8);
   const logStart = Math.log(1), logEnd = Math.log(len);
   for (let b = 0; b < 8; b++) {
@@ -625,13 +654,16 @@ function _feedRealTimeFeatures() {
     melbands[b] = count > 0 ? s / (count * 255) : 0;
   }
 
-  // ── [A4] ONSET BEAT DETECTION ───────────────────────────
-  // Uses raw (unsmoothed) bass for sharp transient detection.
-  // Threshold 0.08 (lower than v5 because bass bins are now truly sub-bass).
-  // Cooldown 12 frames ≈ 192ms — prevents 808 re-triggering.
+  // ── [N2] PEAK-RELATIVE BEAT DETECTION ───────────────────
+  // Fires when: normalized bass > 0.90 AND rising transient detected.
+  // Peak-relative: quiet songs fire on their loud kicks too.
+  // onset (bassRise > 0.10 normalized) prevents sustain re-fires.
+  // Cooldown 12 frames ≈ 192ms prevents 808 sub-harmonic double-fires.
   _beatCooldown = Math.max(0, _beatCooldown - 1);
-  const bassRise  = uBass - _prevBassRaw;
-  const beatFired = _beatCooldown === 0 && bassRise > 0.08 && uBass > 0.15;
+  const bassRiseNorm = uBass - _prevBassRaw;
+  const beatFired    = _beatCooldown === 0
+                    && bassRiseNorm > 0.10     // onset (normalized derivative)
+                    && uBass > 0.90;           // [N2] threshold: 90% of peak — per spec
   if (beatFired) _beatCooldown = 12;
   _prevBassRaw = uBass;
 
@@ -640,12 +672,11 @@ function _feedRealTimeFeatures() {
     loudness: loud,
     centroid,
     melbands,
-    beat:     beatFired ? uBass : 0,
-    // [A1-A3] New distinct band uniforms
-    uBass,
-    uMid,
-    uHigh,
-    freqData,   // raw array — Ambient uses for spectral flux
+    beat:    beatFired ? uBass : 0,
+    uBass,   // normalized [0,1], raw (no smoothing)
+    uMid,    // normalized [0,1], smoothed α=0.12
+    uHigh,   // normalized [0,1], smoothed α=0.20
+    freqData,
   });
 }
 
