@@ -252,7 +252,7 @@ const Ambient = (() => {
         float rng3 = fract(sin(dot(uv + u_time * 0.001, vec2(419.2, 371.9))) * 43758.5453);
         float th   = rng1 * 6.28318;
         float ph   = acos(2.0 * rng2 - 1.0);
-        float rr   = bias * (0.15 + rng3 * 0.85);
+        float rr   = bias * (0.15 + rng3 * 0.55);
 
         // Bass energy → respawn burst slightly further out
         rr = mix(rr, rr * 1.3, u_bass * 0.4);
@@ -366,10 +366,10 @@ const Ambient = (() => {
     for (let i = 0; i < n; i++) {
       const th = Math.random() * Math.PI * 2;
       const ph = Math.acos(2 * Math.random() - 1);
-      const r  = 0.1 + Math.random() * 0.9;
+      const r  = 0.2 + Math.random() * 0.5;
       data[i*4]   = Math.sin(ph) * Math.cos(th) * r;
       data[i*4+1] = Math.sin(ph) * Math.sin(th) * r;
-      data[i*4+2] = Math.cos(ph) * r * 0.4;
+      data[i*4+2] = Math.cos(ph) * r * 0.2;
       data[i*4+3] = Math.random();   // random initial age [0,1]
     }
     return data;
@@ -536,8 +536,8 @@ const Ambient = (() => {
       Math.floor(innerHeight * 0.5),
     );
 
-    // [C1] Threshold raised to 0.35, radius tightened to 0.4
-    bloomPass = new THREE.UnrealBloomPass(bloomRes, 0.6, 0.4, 0.35);
+    // [C1] Threshold raised to 0.20, radius tightened to 0.3
+    bloomPass = new THREE.UnrealBloomPass(bloomRes, 0.6, 0.3, 0.20);
     composer.addPass(bloomPass);
   }
 
@@ -642,15 +642,15 @@ const Ambient = (() => {
       mat.uniforms.u_time.value           = t;
 
       // [V3] Continuous camera orbit — Lissajous figure-8 path
-      _orbitT += dt * (0.06 + targetLoud * 0.04);   // speed up slightly with loudness
-      const orbitR = 0.18 + targetBass * 0.12;       // orbit radius grows with bass
+      _orbitT += dt * (0.06 + targetLoud * 0.05);   // speed up slightly with loudness
+      const orbitR = 0.18 + targetBass * 0.15;       // orbit radius grows with bass
       const orbitX = Math.sin(_orbitT * 1.0) * orbitR;
       const orbitY = Math.sin(_orbitT * 2.0) * orbitR * 0.55;  // figure-8 ratio
 
       // [V10] Smooth LFO shake — sin/cos at ~3 Hz scaled by bass, NOT random
-      const lfoFreq = 3.0 + targetBass * 2.0;
-      _shakeLFO_x = Math.sin(t * lfoFreq * 1.0) * _shakeAmt;
-      _shakeLFO_y = Math.cos(t * lfoFreq * 1.3) * _shakeAmt;
+      const lfoFreq = 3.0 + targetBass * 3.0;
+      _shakeLFO_x = Math.sin(t * lfoFreq * 3.0) * _shakeAmt;
+      _shakeLFO_y = Math.cos(t * lfoFreq * 1.4) * _shakeAmt;
 
       camera.position.x = orbitX + _shakeLFO_x;
       camera.position.y = orbitY + _shakeLFO_y;
@@ -670,7 +670,7 @@ const Ambient = (() => {
       }
 
       // Decay beat
-      _audio.beat *= 0.88;
+      _audio.beat *= 0.78;
     })();
   }
 
@@ -739,8 +739,8 @@ const Ambient = (() => {
         if (window.GradientController) {
           const hue = _palShift / 360;
           const top = [
-            Math.cos(hue * Math.PI * 2) * 0.4 + 0.5,
-            Math.sin(hue * Math.PI * 2) * 0.2 + 0.3,
+            Math.cos(hue * Math.PI * 2) * 0.5 + 0.5,
+            Math.sin(hue * Math.PI * 2) * 0.4 + 0.3,
             0.7 - hue * 0.3,
           ];
           GradientController.setBasePalette(top, [0.02, 0.02, 0.06]);
