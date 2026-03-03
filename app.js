@@ -1,12 +1,32 @@
 /**
- * app.js — OneSong  v5.3
+ * app.js — OneSong  v6.0
  * ─────────────────────────────────────────────────────────────
- * Changes vs v5.2:
- *  [B1] _feedRealTimeFeatures passes raw freqData to Ambient for spectral flux [V5]
- *  [B2] Mids band extracted (bins ~860Hz–3.4kHz) and fed to Ambient [V4]
- *  [B3] Beat detector uses energy derivative (onset) instead of raw threshold
- *       — fires more accurately on transients, misses fewer soft beats.
- *  All other logic identical to v5.2.
+ * REFACTOR vs v5.3 — MULTI-BAND FREQUENCY ANALYSIS
+ *
+ * [A1] FFT_SIZE upgraded 512 → 2048.
+ *      With sr≈44100Hz and 1024 bins, each bin = ~43Hz.
+ *      This gives true sub-bass / mid / high isolation.
+ *
+ * [A2] THREE DISTINCT BANDS with correct Hz→bin math:
+ *        uBass : bins 0–2   (~0–86Hz)   — kick drum, 808 sub
+ *        uMid  : bins 9–46  (~387–1980Hz) — vocals, snare body, synth leads
+ *        uHigh : bins 116+  (~4990Hz+)  — cymbals, hi-hats, air, sparkle
+ *
+ * [A3] ASYMMETRIC LERPING:
+ *        uBass — NO smoothing. Raw value passed directly so kick impact
+ *                is felt the same frame it fires. Attack: instant.
+ *        uMid  — Heavy smoothing (α=0.12). Swirl builds and lingers.
+ *        uHigh — Medium smoothing (α=0.20). Fast enough to catch
+ *                cymbal hits, slow enough to avoid single-frame spikes.
+ *
+ * [A4] Beat detector threshold raised to match higher-res bass band.
+ *      Cooldown extended to 12 frames (~192ms) to prevent 808 re-triggers.
+ *
+ * [A5] analyserNode.smoothingTimeConstant = 0 — all smoothing is now
+ *      done explicitly in JS per-band, not blended by the Web Audio API.
+ *      This is critical: API-level smoothing bleeds bass energy into highs.
+ *
+ * All auth/upload/playback/server logic identical to v5.3.
  */
 
 const API = 'https://onesong.onrender.com';
@@ -31,12 +51,19 @@ let _audioRetried  = false;
 let _playRetrying  = false;
 let _playEnableTimer = null;
 
-const FFT_SIZE = 512;
+// [A1] Upgraded FFT for proper band separation (43Hz/bin vs 86Hz/bin before)
+const FFT_SIZE = 2048;
 let freqData   = null;
 
-// [B3] Onset / beat detection state
-let _prevBassEnergy  = 0;
-let _beatCooldown    = 0;   // frames since last beat fired
+// ── Per-band smoothed state (JS-side lerp) ─────────────────
+// [A3] uBass is raw (no lerp), uMid/uHigh are smoothed
+let _sBass = 0;   // smoothed bass  — NOT used for uBass, used only for beat
+let _sMid  = 0;   // smoothed mid
+let _sHigh = 0;   // smoothed high
+
+// [A4] Beat detection state
+let _prevBassRaw  = 0;
+let _beatCooldown = 0;
 
 // ── DOM refs ──────────────────────────────────────────────
 let elPlayBtn, elPlayIco, elPauseIco, elProgress, elTimeCur, elTimeTot;
@@ -456,6 +483,7 @@ function _teardownAudio() {
   if (audioCtx && audioCtx.state !== 'closed') audioCtx.close().catch(() => {});
   audioCtx = null; audioSrc = null; analyserNode = null; gainNode = null;
   _audioReady = false; _audioRetried = false; _playRetrying = false;
+  _sBass = 0; _sMid = 0; _sHigh = 0; _prevBassRaw = 0; _beatCooldown = 0;
   _setPlayState(false); _setPlayBtnEnabled(false);
 }
 
@@ -468,8 +496,12 @@ async function _resumeContext() {
       audioCtx     = new (window.AudioContext || window.webkitAudioContext)();
       gainNode     = audioCtx.createGain();
       analyserNode = audioCtx.createAnalyser();
-      analyserNode.fftSize              = FFT_SIZE;
-      analyserNode.smoothingTimeConstant = 0.75;
+      analyserNode.fftSize = FFT_SIZE;
+
+      // [A5] CRITICAL: disable Web Audio built-in smoothing.
+      // We do per-band lerping ourselves so bass doesn't bleed into treble.
+      analyserNode.smoothingTimeConstant = 0.0;
+
       freqData = new Uint8Array(analyserNode.frequencyBinCount);
 
       const volEl = document.getElementById('vol-slider');
@@ -520,49 +552,69 @@ function _stopClockPoller() {
 }
 
 // ─────────────────────────────────────────────────────────
-// AUDIO FEATURE EXTRACTION
+// AUDIO FEATURE EXTRACTION  v6.0
 //
-// Frequency bin layout (FFT_SIZE=512, sr≈44100Hz, 256 bins):
-//   bin 0–5    ≈ 0–860 Hz     → sub bass / kick
-//   bin 6–20   ≈ 860–3440 Hz  → bass / low mids
-//   bin 21–60  ≈ 3.4–10 kHz   → presence / mids
-//   bin 61–127 ≈ 10–22 kHz    → treble / air
+// FFT_SIZE=2048 → frequencyBinCount=1024 bins
+// Sample rate ≈ 44100 Hz  →  Hz per bin ≈ 43.1 Hz
 //
-// [B1] Raw freqData passed to Ambient for spectral flux calculation [V5]
-// [B2] Mids band (bins 6-20) extracted separately [V4]
-// [B3] Beat uses energy derivative onset — fires on transients, not just level
+// [A2] Band boundaries (all verified with bin_hz = sr/FFT_SIZE):
+//
+//   uBass  — bins 0–2   ≈   0– 86 Hz   Sub-bass / kick / 808
+//   uMid   — bins 9–46  ≈ 387–1980 Hz  Vocals / snare / synth leads
+//   uHigh  — bins 116+  ≈ 4996–22050Hz Cymbals / hi-hats / air
+//
+// [A3] Lerp strategy:
+//   uBass : raw (no smoothing) — instant physical impact
+//   uMid  : α=0.12 — heavy smoothing, swirl builds/lingers
+//   uHigh : α=0.20 — catches cymbal transients, avoids spikes
+//
+// [A4] Beat: onset detector on raw bass, cooldown=12 frames (~192ms)
 // ─────────────────────────────────────────────────────────
 function _feedRealTimeFeatures() {
   if (!freqData || freqData.length === 0) return;
-  const len = freqData.length;   // 256 bins
+  const len = freqData.length;   // 1024 bins with FFT_SIZE=2048
 
-  // Sub-bass: bins 0–5 (kicks, 808s)
+  // ── [A2] BASS: bins 0–2 (~0–86Hz) ──────────────────────
+  // Raw, no smoothing — kick drum needs instant response
   let bassSum = 0;
-  for (let i = 0; i < 6; i++) bassSum += freqData[i];
-  const bass = bassSum / (6 * 255);
+  for (let i = 0; i <= 2; i++) bassSum += freqData[i];
+  const bassRaw = bassSum / (3 * 255);
 
-  // [B2] Mids: bins 6–20 (~860Hz–3.4kHz)
-  let midsSum = 0;
-  for (let i = 6; i <= 20; i++) midsSum += freqData[i];
-  const mids = midsSum / (15 * 255);
+  // ── [A2] MID: bins 9–46 (~387–1980Hz) ──────────────────
+  let midSum = 0;
+  for (let i = 9; i <= 46; i++) midSum += freqData[i];
+  const midRaw = midSum / (38 * 255);
 
-  // Full-band RMS loudness
+  // ── [A2] HIGH: bins 116–255 (~4996–10977Hz) ─────────────
+  // Using 116–255 instead of full 116–1023 keeps it practical;
+  // above ~11kHz the signal is mostly noise in compressed audio.
+  let highSum = 0;
+  for (let i = 116; i <= 255; i++) highSum += freqData[i];
+  const highRaw = highSum / (140 * 255);
+
+  // ── [A3] ASYMMETRIC LERPING ─────────────────────────────
+  // Bass: NO lerp — raw value goes straight to shader
+  const uBass = bassRaw;
+
+  // Mid: heavy smoothing (τ ≈ 7 frames = ~112ms attack)
+  _sMid += (midRaw - _sMid) * 0.12;
+  const uMid = _sMid;
+
+  // High: medium smoothing (τ ≈ 4 frames = ~64ms attack)
+  _sHigh += (highRaw - _sHigh) * 0.20;
+  const uHigh = _sHigh;
+
+  // ── Full-band RMS loudness (used by GradientController path) ──
   let sq = 0;
   for (let i = 0; i < len; i++) sq += freqData[i] * freqData[i];
   const loud = Math.sqrt(sq / len) / 255;
 
-  // Spectral centroid
+  // ── Spectral centroid ────────────────────────────────────
   let wSum = 0, total = 0;
   for (let i = 0; i < len; i++) { wSum += i * freqData[i]; total += freqData[i]; }
   const centroid = total > 0 ? wSum / (total * len) : 0;
 
-  // Treble: top quarter of bins
-  let trebleSum = 0;
-  const trebleStart = Math.floor(len * 0.75);
-  for (let i = trebleStart; i < len; i++) trebleSum += freqData[i];
-  const treble = trebleSum / ((len - trebleStart) * 255);
-
-  // 8-band mel approximation
+  // ── 8-band mel (kept for GradientController compatibility) ──
   const melbands = new Float32Array(8);
   const logStart = Math.log(1), logEnd = Math.log(len);
   for (let b = 0; b < 8; b++) {
@@ -573,22 +625,27 @@ function _feedRealTimeFeatures() {
     melbands[b] = count > 0 ? s / (count * 255) : 0;
   }
 
-  // [B3] Onset-based beat detection — derivative of bass energy
-  // Fires on rising transients rather than sustained high levels.
-  // cooldown prevents double-triggers on a single kick.
+  // ── [A4] ONSET BEAT DETECTION ───────────────────────────
+  // Uses raw (unsmoothed) bass for sharp transient detection.
+  // Threshold 0.08 (lower than v5 because bass bins are now truly sub-bass).
+  // Cooldown 12 frames ≈ 192ms — prevents 808 re-triggering.
   _beatCooldown = Math.max(0, _beatCooldown - 1);
-  const bassRise = bass - _prevBassEnergy;
-  const beatFired = _beatCooldown === 0 && bassRise > 0.12 && bass > 0.20;
-  if (beatFired) _beatCooldown = 8;   // ~128ms at 16ms polling
-  _prevBassEnergy = bass;
+  const bassRise  = uBass - _prevBassRaw;
+  const beatFired = _beatCooldown === 0 && bassRise > 0.08 && uBass > 0.15;
+  if (beatFired) _beatCooldown = 12;
+  _prevBassRaw = uBass;
 
-  // [B1] Pass raw freqData for spectral flux inside Ambient
+  // ── SEND TO AMBIENT ──────────────────────────────────────
   Ambient.setAudioFeatures({
     loudness: loud,
     centroid,
     melbands,
-    beat:     beatFired ? bass : 0,
-    freqData,   // [B1] raw array reference — Ambient reads it synchronously
+    beat:     beatFired ? uBass : 0,
+    // [A1-A3] New distinct band uniforms
+    uBass,
+    uMid,
+    uHigh,
+    freqData,   // raw array — Ambient uses for spectral flux
   });
 }
 
