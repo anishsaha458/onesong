@@ -587,13 +587,13 @@ const Ambient = (() => {
       // [V7] Idle hue drift — slow rotation when no audio
       const isActive = targetLoud > 0.05;
       if (!isActive) {
-        _idleHue = (_idleHue + dt * 4.0) % 360;   // ~4°/s idle drift
+        _idleHue = (_idleHue + dt * 3.0) % 360;   // ~4°/s idle drift
       }
 
       // Smooth bloom + shake toward targets
       // [C1] Bass bloom multiplier halved
-      _bloomStr += (0.5 + targetBass * 1.5 - _bloomStr) * dt * 4;
-      _shakeAmt += (targetBass * 0.050       - _shakeAmt) * dt * 8;
+      _bloomStr += (0.5 + targetBass * 1.8 - _bloomStr) * dt * 4;
+      _shakeAmt += (targetBass * 0.100       - _shakeAmt) * dt * 8;
 
       // Primary hue follows spectral centroid; flux adds momentary color kick
       const hueTarget = isActive
