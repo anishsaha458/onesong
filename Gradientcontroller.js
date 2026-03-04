@@ -85,7 +85,7 @@ const GradientController = (() => {
     if (gfx.pulse  < 0.001) gfx.pulse  = 0;
     if (gfx.pulse2 < 0.001) gfx.pulse2 = 0;
 
-    const targetBright = 0.70 + _vol * 1.2;
+    const targetBright = 0.50 + _vol * 1.1;
     gfx.intensity += (targetBright - gfx.intensity) * dt * 5;
 
     gfx.centroid = _spec;

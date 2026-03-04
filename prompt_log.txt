@@ -17,14 +17,10 @@ Outcome: Initial concept was a list of favorite songs. Authentication gated a pe
 Prompt: "I just want one song and one song only that plays when they log in which adds to the personal experience immensely — as if they're keeping their favorite song close to them"
 Outcome: This single prompt transformed the project. Changed from a generic list CRUD app to something with emotional resonance. One song per user means simpler schema (song data lives directly on the users table), cleaner UX, and a memorable demo moment when the song plays on login.
 
-5. Spotify API Integration
-Prompt: "Does the Spotify API still exist?"
-Outcome: Confirmed Spotify Web API is active. Initially planned to use it for song search and metadata. Learned about Client Credentials Flow (no user OAuth needed for search), album art URLs, and 30-second preview clips.
-
 6. Switching to YouTube
 Prompt: "Instead of Spotify which requires premium, can we use a different medium like YouTube?"
 Outcome: Pivoted to YouTube embedding — no API keys required at all, full songs play (not 30-second previews), much simpler implementation. Users paste a YouTube URL, the backend extracts the video ID via regex, and the frontend embeds it. Also removed the requests library from requirements.txt.
-
+Would later switch from YouTube
 
 Multiple deployment troubleshooting sessions
 Pydantic build failure due to Python 3.14 on Render — fixed by adding runtime.txt specifying Python 3.11.9
