@@ -34,10 +34,20 @@
 /* ── Reset ────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-html { background: #000; height: 100%; }
+/* CRITICAL: html must NOT be opaque. The render stack is:
+   html (deep space gradient) → canvas z:-1 (transparent, particles) → UI z:0+
+   If html is black, the canvas alpha:0 clear punches through to black
+   instead of to the gradient, killing all particle visibility at edges.  */
+html {
+  background: radial-gradient(ellipse at 38% 62%, #06012a 0%, #02000f 55%, #000 100%);
+  height: 100%;
+}
 
 body {
-  background: radial-gradient(ellipse at 40% 60%, #04011a 0%, #010009 60%, #000 100%);
+  /* Body is transparent — html gradient IS the backdrop.
+     Do NOT set a background here; it would occlude the canvas
+     on browsers where body paints over html. */
+  background: transparent !important;
   min-height: 100vh;
   font-family: var(--font-mono);
   color: var(--text-primary);

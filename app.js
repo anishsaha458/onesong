@@ -1,32 +1,19 @@
 /**
- * app.js — OneSong  v6.0
+ * app.js — OneSong  v6.1
  * ─────────────────────────────────────────────────────────────
- * REFACTOR vs v5.3 — MULTI-BAND FREQUENCY ANALYSIS
+ * PATCHES vs v6.0
+ * ───────────────
+ * [U1] _onTimeUpdate() — progress bar uses transform:scaleX instead of
+ *      width. Eliminates layout reflow on every timeupdate event (~60/sec).
+ *      Requires .progress-fill to have transform-origin:left center (set
+ *      in styles.css v2.0).
  *
- * [A1] FFT_SIZE upgraded 512 → 2048.
- *      With sr≈44100Hz and 1024 bins, each bin = ~43Hz.
- *      This gives true sub-bass / mid / high isolation.
+ * [U2] _feedRealTimeFeatures() — calls window._setHudHighFreq(uHigh)
+ *      after Ambient.setAudioFeatures(). This feeds the uHigh value into
+ *      the progress-bar glow bridge defined in index.html, making the
+ *      full-width progress track pulse with cymbal/hi-hat energy.
  *
- * [A2] THREE DISTINCT BANDS with correct Hz→bin math:
- *        uBass : bins 0–2   (~0–86Hz)   — kick drum, 808 sub
- *        uMid  : bins 9–46  (~387–1980Hz) — vocals, snare body, synth leads
- *        uHigh : bins 116+  (~4990Hz+)  — cymbals, hi-hats, air, sparkle
- *
- * [A3] ASYMMETRIC LERPING:
- *        uBass — NO smoothing. Raw value passed directly so kick impact
- *                is felt the same frame it fires. Attack: instant.
- *        uMid  — Heavy smoothing (α=0.12). Swirl builds and lingers.
- *        uHigh — Medium smoothing (α=0.20). Fast enough to catch
- *                cymbal hits, slow enough to avoid single-frame spikes.
- *
- * [A4] Beat detector threshold raised to match higher-res bass band.
- *      Cooldown extended to 12 frames (~192ms) to prevent 808 re-triggers.
- *
- * [A5] analyserNode.smoothingTimeConstant = 0 — all smoothing is now
- *      done explicitly in JS per-band, not blended by the Web Audio API.
- *      This is critical: API-level smoothing bleeds bass energy into highs.
- *
- * All auth/upload/playback/server logic identical to v5.3.
+ * All other logic identical to v6.0.
  */
 
 const API = 'https://onesong.onrender.com';
@@ -51,27 +38,23 @@ let _audioRetried  = false;
 let _playRetrying  = false;
 let _playEnableTimer = null;
 
-// [A1] Upgraded FFT for proper band separation (43Hz/bin vs 86Hz/bin before)
 const FFT_SIZE = 2048;
 let freqData   = null;
 
-// ── Per-band smoothed state (JS-side lerp) ─────────────────
-// [A3] uBass is raw (no lerp), uMid/uHigh are smoothed
-let _sBass = 0;   // smoothed bass  — NOT used for uBass, used only for beat
-let _sMid  = 0;   // smoothed mid
-let _sHigh = 0;   // smoothed high
+// ── Per-band smoothed state ────────────────────────────────
+let _sBass = 0;
+let _sMid  = 0;
+let _sHigh = 0;
 
-// [A4] Beat detection state
+// ── Beat detection ─────────────────────────────────────────
 let _prevBassRaw  = 0;
 let _beatCooldown = 0;
 
-// [N1] Running peak trackers — used to normalize bands to true [0,1]
-// Peaks decay slowly so normalization adapts to the song's dynamic range.
-// On a quiet track, a moderate kick still reads near 1.0.
-let _bassPeak = 0.01;   // minimum 0.01 prevents div-by-zero
+// ── Running peak trackers ──────────────────────────────────
+let _bassPeak = 0.01;
 let _midPeak  = 0.01;
 let _highPeak = 0.01;
-const PEAK_DECAY = 0.9995;  // per-frame decay (~0.03% per frame = very slow)
+const PEAK_DECAY = 0.9995;
 
 // ── DOM refs ──────────────────────────────────────────────
 let elPlayBtn, elPlayIco, elPauseIco, elProgress, elTimeCur, elTimeTot;
@@ -117,7 +100,7 @@ function _checkAuthFromStorage() {
 }
 
 async function _bootAsync() {
-  _showVeil('Connecting…');
+  _showVeil('CONNECTING');
   await _pingServer();
   _hideVeil();
   _checkAuth();
@@ -136,7 +119,7 @@ async function _pingServer() {
     }
   } catch (e) {
     console.warn('[Boot] Server ping failed:', e.message);
-    _showVeil('⚠ Server waking up — one moment…', true);
+    _showVeil('SERVER WAKING UP — ONE MOMENT', true);
     await new Promise(res => setTimeout(res, 2500));
   }
 }
@@ -196,7 +179,7 @@ async function signup() {
   const password = _val('signup-password');
   if (!username || !email || !password) { _setAuthErr('Fill in all fields'); return; }
   if (password.length < 6) { _setAuthErr('Password must be ≥ 6 characters'); return; }
-  _showVeil('Creating account…');
+  _showVeil('CREATING ACCOUNT');
   try {
     const r = await fetch(`${API}/auth/signup`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -214,7 +197,7 @@ async function login() {
   const email    = _val('login-email');
   const password = _val('login-password');
   if (!email || !password) { _setAuthErr('Fill in all fields'); return; }
-  _showVeil('Signing in…');
+  _showVeil('AUTHENTICATING');
   try {
     const r = await fetch(`${API}/auth/login`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -243,7 +226,7 @@ function logout() {
 // LOAD SONG
 // ─────────────────────────────────────────────────────────
 async function _loadUserSong() {
-  _showVeil('Loading your song…');
+  _showVeil('LOADING YOUR SONG');
   try {
     const r = await fetch(`${API}/user/song`, {
       headers: { Authorization: `Bearer ${authToken}` },
@@ -283,7 +266,7 @@ function _resetUploadUI() {
   const barWrap   = document.getElementById('upload-bar-wrap');
   const bar       = document.getElementById('upload-bar');
   if (fileInput) fileInput.value = '';
-  if (fileLabel) fileLabel.textContent = 'Choose audio file…';
+  if (fileLabel) fileLabel.textContent = 'CHOOSE FILE';
   if (bar)       bar.style.width = '0%';
   if (barWrap)   barWrap.classList.add('hidden');
 }
@@ -375,7 +358,7 @@ function _displaySong(song) {
   _playRetrying = false;
   _setPlayState(false);
   _setPlayBtnEnabled(false);
-  _setAnalysisStatus('⏳ Loading audio…');
+  _setAnalysisStatus('LOADING AUDIO');
 
   try { Ambient.setSong(song.song_name, song.artist_name, authToken); }
   catch (e) { console.warn('[displaySong] Ambient.setSong:', e); }
@@ -420,7 +403,7 @@ function _setupAudio(song) {
     if (!_audioReady) {
       _audioReady = true;
       _setPlayBtnEnabled(true);
-      _setAnalysisStatus('⏳ Tap Play to start');
+      _setAnalysisStatus('TAP PLAY TO START');
     }
   }, 12000);
 }
@@ -446,11 +429,15 @@ function _onAudioMeta() {
   }
 }
 
+// [U1] Progress bar uses transform:scaleX — zero layout reflow.
+// .progress-fill must have transform-origin:left center (styles.css v2.0).
 function _onTimeUpdate() {
   const cur = audioEl.currentTime, dur = audioEl.duration;
   if (elTimeCur) elTimeCur.textContent = _fmt(cur);
-  if (elProgress && isFinite(dur) && dur > 0)
-    elProgress.style.width = `${(cur / dur) * 100}%`;
+  if (elProgress && isFinite(dur) && dur > 0) {
+    // [U1] scaleX instead of width — eliminates layout reflow at 60fps
+    elProgress.style.transform = `scaleX(${cur / dur})`;
+  }
   if (elSeekSlider && isFinite(dur) && dur > 0)
     elSeekSlider.value = cur.toFixed(1);
 }
@@ -463,16 +450,16 @@ function _onAudioEnded() {
 
 function _onAudioError() {
   const code = audioEl.error?.code || 0;
-  const msgs = { 1:'⚠ Playback aborted', 2:'⚠ Network error', 3:'⚠ Audio decode error', 4:'⚠ Format not supported' };
+  const msgs = { 1:'PLAYBACK ABORTED', 2:'NETWORK ERROR', 3:'DECODE ERROR', 4:'FORMAT UNSUPPORTED' };
   console.error('[Audio] MediaError:', code, audioEl.error?.message);
 
   if (code === 2 && !_audioRetried && currentSong) {
     _audioRetried = true;
-    _setAnalysisStatus('⏳ Retrying…');
+    _setAnalysisStatus('RETRYING');
     setTimeout(() => { if (currentSong) _setupAudio(currentSong); }, 2000);
     return;
   }
-  _setAnalysisStatus(msgs[code] || `⚠ Audio error (${code})`);
+  _setAnalysisStatus(msgs[code] || `AUDIO ERROR (${code})`);
   _setPlayBtnEnabled(true);
 }
 
@@ -506,11 +493,7 @@ async function _resumeContext() {
       gainNode     = audioCtx.createGain();
       analyserNode = audioCtx.createAnalyser();
       analyserNode.fftSize = FFT_SIZE;
-
-      // [A5] CRITICAL: disable Web Audio built-in smoothing.
-      // We do per-band lerping ourselves so bass doesn't bleed into treble.
       analyserNode.smoothingTimeConstant = 0.0;
-
       freqData = new Uint8Array(analyserNode.frequencyBinCount);
 
       const volEl = document.getElementById('vol-slider');
@@ -561,89 +544,55 @@ function _stopClockPoller() {
 }
 
 // ─────────────────────────────────────────────────────────
-// AUDIO FEATURE EXTRACTION  v7.0
-//
-// FFT_SIZE=2048 → frequencyBinCount=1024 bins
-// Sample rate ≈ 44100 Hz  →  Hz per bin ≈ 43.1 Hz
-//
-// [A2] Band boundaries:
-//   uBass  — bins 0–2   ≈   0– 86 Hz   Sub-bass / kick / 808
-//   uMid   — bins 9–46  ≈ 387–1980 Hz  Vocals / snare / synth leads
-//   uHigh  — bins 116–255 ≈ 4996–10977Hz  Cymbals / hi-hats / air
-//
-// [A3] Asymmetric lerp:
-//   uBass : raw (no smoothing) — instant physical impact
-//   uMid  : α=0.12 — heavy smoothing, swirl builds/lingers
-//   uHigh : α=0.20 — catches cymbal transients, avoids spikes
-//
-// [N1] NORMALIZATION: bands divided by their running peak.
-//   Each band is normalized against its own maximum observed value.
-//   This means a loud track and a quiet track both use the full
-//   0→1 range — shaders always get meaningful signal.
-//   Peak decays at PEAK_DECAY rate so it adapts to song dynamics.
-//
-// [N2] BEAT THRESHOLD: fires when bass > peak * 0.9.
-//   Peak-relative threshold means the beat detector adapts to the
-//   song's loudness — a soft song's soft kick still fires, while
-//   a loud song's noise floor doesn't fire constantly.
+// AUDIO FEATURE EXTRACTION
 // ─────────────────────────────────────────────────────────
 function _feedRealTimeFeatures() {
   if (!freqData || freqData.length === 0) return;
-  const len = freqData.length;   // 1024 bins with FFT_SIZE=2048
+  const len = freqData.length;
 
-  // ── [A2] RAW BAND SUMS ──────────────────────────────────
-
-  // BASS: bins 0–2 (~0–86Hz) — sub-bass / kick
+  // BASS: bins 0–2 (~0–86Hz)
   let bassSum = 0;
   for (let i = 0; i <= 2; i++) bassSum += freqData[i];
   const bassRaw = bassSum / (3 * 255);
 
-  // MID: bins 9–46 (~387–1980Hz) — vocals / snare body
+  // MID: bins 9–46 (~387–1980Hz)
   let midSum = 0;
   for (let i = 9; i <= 46; i++) midSum += freqData[i];
   const midRaw = midSum / (38 * 255);
 
-  // HIGH: bins 116–255 (~4996–10977Hz) — cymbals / hi-hats
+  // HIGH: bins 116–255 (~4996–10977Hz)
   let highSum = 0;
   for (let i = 116; i <= 255; i++) highSum += freqData[i];
   const highRaw = highSum / (140 * 255);
 
-  // ── [N1] UPDATE RUNNING PEAKS ───────────────────────────
-  // Peak tracks the maximum seen, decays slowly each frame.
-  // Floor at 0.01 prevents div-by-zero on silence.
+  // Running peaks
   _bassPeak = Math.max(0.01, Math.max(_bassPeak * PEAK_DECAY, bassRaw));
   _midPeak  = Math.max(0.01, Math.max(_midPeak  * PEAK_DECAY, midRaw));
   _highPeak = Math.max(0.01, Math.max(_highPeak * PEAK_DECAY, highRaw));
 
-  // ── [N1] NORMALIZE to [0,1] ─────────────────────────────
-  // Clamped — occasionally a single bin spike can exceed the rolling peak
+  // Normalize
   const bassNorm = Math.min(bassRaw / _bassPeak, 1.0);
   const midNorm  = Math.min(midRaw  / _midPeak,  1.0);
   const highNorm = Math.min(highRaw / _highPeak,  1.0);
 
-  // ── [A3] ASYMMETRIC LERPING ─────────────────────────────
-  // uBass: NO lerp on normalized value — instant kick response
+  // Asymmetric lerping
   const uBass = bassNorm;
-
-  // uMid: heavy smoothing — swirl builds and lingers (~112ms)
-  _sMid += (midNorm - _sMid) * 0.12;
-  const uMid = _sMid;
-
-  // uHigh: medium smoothing — catches transients, avoids spikes (~64ms)
+  _sMid  += (midNorm  - _sMid)  * 0.12;
   _sHigh += (highNorm - _sHigh) * 0.20;
+  const uMid  = _sMid;
   const uHigh = _sHigh;
 
-  // ── Full-band RMS loudness ───────────────────────────────
+  // Full-band RMS
   let sq = 0;
   for (let i = 0; i < len; i++) sq += freqData[i] * freqData[i];
   const loud = Math.sqrt(sq / len) / 255;
 
-  // ── Spectral centroid ────────────────────────────────────
+  // Spectral centroid
   let wSum = 0, total = 0;
   for (let i = 0; i < len; i++) { wSum += i * freqData[i]; total += freqData[i]; }
   const centroid = total > 0 ? wSum / (total * len) : 0;
 
-  // ── 8-band mel (GradientController compatibility) ────────
+  // 8-band mel
   const melbands = new Float32Array(8);
   const logStart = Math.log(1), logEnd = Math.log(len);
   for (let b = 0; b < 8; b++) {
@@ -654,37 +603,36 @@ function _feedRealTimeFeatures() {
     melbands[b] = count > 0 ? s / (count * 255) : 0;
   }
 
-  // ── [N2] PEAK-RELATIVE BEAT DETECTION ───────────────────
-  // Fires when: normalized bass > 0.90 AND rising transient detected.
-  // Peak-relative: quiet songs fire on their loud kicks too.
-  // onset (bassRise > 0.10 normalized) prevents sustain re-fires.
-  // Cooldown 12 frames ≈ 192ms prevents 808 sub-harmonic double-fires.
+  // Beat detection
   _beatCooldown = Math.max(0, _beatCooldown - 1);
   const bassRiseNorm = uBass - _prevBassRaw;
   const beatFired    = _beatCooldown === 0
-                    && bassRiseNorm > 0.10     // onset (normalized derivative)
-                    && uBass > 0.90;           // [N2] threshold: 90% of peak — per spec
+                    && bassRiseNorm > 0.10
+                    && uBass > 0.90;
   if (beatFired) _beatCooldown = 12;
   _prevBassRaw = uBass;
 
-  // ── SEND TO AMBIENT ──────────────────────────────────────
+  // Send to Ambient
   Ambient.setAudioFeatures({
     loudness: loud,
     centroid,
     melbands,
     beat:    beatFired ? uBass : 0,
-    uBass,   // normalized [0,1], raw (no smoothing)
-    uMid,    // normalized [0,1], smoothed α=0.12
-    uHigh,   // normalized [0,1], smoothed α=0.20
+    uBass,
+    uMid,
+    uHigh,
     freqData,
   });
+
+  // [U2] Feed uHigh to HUD progress glow bridge (index.html inline script)
+  if (window._setHudHighFreq) window._setHudHighFreq(uHigh);
 }
 
 // ─────────────────────────────────────────────────────────
 // AUDIO ANALYSIS (Essentia JSON)
 // ─────────────────────────────────────────────────────────
 async function _fetchAudioAnalysis(song) {
-  _setAnalysisStatus('🔍 Analysing…');
+  _setAnalysisStatus('ANALYSING');
   try {
     const params = new URLSearchParams({ track: song.song_name, artist: song.artist_name });
     const r = await fetch(`${API}/audio_analysis?${params}`, {
@@ -697,7 +645,7 @@ async function _fetchAudioAnalysis(song) {
       if (window.GradientController) GradientController.loadAudioData(data);
       analysisLoaded = true;
       const bpm = data.tempo?.toFixed(0) ?? '?';
-      _setAnalysisStatus(`✓ ${bpm} BPM · ${data.beats?.length ?? 0} beats`);
+      _setAnalysisStatus(`${bpm} BPM · ${data.beats?.length ?? 0} BEATS`);
       setTimeout(() => _setAnalysisStatus(''), 4000);
     } else {
       _setAnalysisStatus('');
@@ -718,7 +666,7 @@ async function togglePlay() {
   if (audioEl.paused) {
     try {
       _setPlayBtnEnabled(false);
-      _setAnalysisStatus('⏳ Buffering…');
+      _setAnalysisStatus('BUFFERING');
       await audioEl.play();
       _playRetrying = false;
       _setPlayState(true);
@@ -728,15 +676,15 @@ async function togglePlay() {
     } catch (e) {
       _setPlayBtnEnabled(true);
       if (e.name === 'NotAllowedError') {
-        _setAnalysisStatus('⚠ Tap Play again to start');
+        _setAnalysisStatus('TAP PLAY AGAIN TO START');
       } else if (e.name === 'NotSupportedError') {
-        _setAnalysisStatus('⚠ Format not supported');
+        _setAnalysisStatus('FORMAT NOT SUPPORTED');
       } else if (e.name === 'AbortError' && !_playRetrying) {
         _playRetrying = true;
-        _setAnalysisStatus('⏳ Stream starting…');
+        _setAnalysisStatus('STREAM STARTING');
         setTimeout(() => { _playRetrying = false; if (audioEl?.paused) togglePlay(); }, 1000);
       } else {
-        _setAnalysisStatus('⚠ ' + e.message);
+        _setAnalysisStatus('ERROR: ' + e.message);
       }
     }
   } else {
@@ -769,7 +717,7 @@ function _setPlayState(playing) {
 function _setPlayBtnEnabled(enabled) {
   if (!elPlayBtn) return;
   elPlayBtn.disabled      = !enabled;
-  elPlayBtn.style.opacity = enabled ? '1' : '0.45';
+  elPlayBtn.style.opacity = enabled ? '1' : '0.35';
   elPlayBtn.style.cursor  = enabled ? 'pointer' : 'wait';
 }
 
@@ -788,7 +736,7 @@ document.addEventListener('keydown', e => {
 // ─────────────────────────────────────────────────────────
 function _showVeil(msg, noSpinner = false) {
   const veil = document.getElementById('loading-veil');
-  const ring = veil?.querySelector('.veil-ring');
+  const ring = veil?.querySelector('.veil-scanner');
   const txt  = document.getElementById('loading-msg');
   if (veil) veil.classList.remove('hidden');
   if (ring) ring.style.display = noSpinner ? 'none' : '';
@@ -796,7 +744,7 @@ function _showVeil(msg, noSpinner = false) {
 }
 function _hideVeil() {
   document.getElementById('loading-veil')?.classList.add('hidden');
-  const ring = document.querySelector('.veil-ring');
+  const ring = document.querySelector('.veil-scanner');
   if (ring) ring.style.display = '';
 }
 

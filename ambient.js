@@ -436,7 +436,7 @@ const Ambient = (() => {
 
     try {
       renderer = new THREE.WebGLRenderer({
-        canvas, antialias: false, alpha: true,
+        canvas, antialias: true, alpha: true,
         powerPreference: 'high-performance', preserveDrawingBuffer: false,
       });
     } catch (e) {
@@ -447,7 +447,10 @@ const Ambient = (() => {
 
     renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
     renderer.setSize(innerWidth, innerHeight);
-    renderer.setClearColor(0x04010d, 0.0);
+    // alpha:true + clearAlpha:0 → canvas is fully transparent.
+    // Particles composite over the html background gradient.
+    // Color value is irrelevant at alpha=0 — using 0x000000 (canonical).
+    renderer.setClearColor(0x000000, 0);
 
     const gl       = renderer.getContext();
     const isWebGL2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
