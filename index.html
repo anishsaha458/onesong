@@ -6,270 +6,258 @@
   <title>OneSong</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
 
-  <!-- ═══════════════════════════════════════════════════════
-       GPGPU CANVAS — sits at z-index:-1, behind everything.
-       Must exist in DOM before any scripts run.
-       ═══════════════════════════════════════════════════════ -->
+  <!-- GPGPU canvas — z-index:-1, behind everything -->
   <canvas id="ambient-canvas"></canvas>
 
-  <!-- Headless audio element — drives Web Audio API -->
+  <!-- Headless audio -->
   <audio id="headless-audio" preload="metadata"></audio>
 
-  <!-- ═══════════════════════════════════════════════════════
-       LOADING VEIL
-       ═══════════════════════════════════════════════════════ -->
+  <!-- ── LOADING VEIL ──────────────────────────────────── -->
   <div id="loading-veil" class="veil">
-    <div class="veil-ring"></div>
-    <p id="loading-msg">Connecting…</p>
+    <div class="veil-scanner"></div>
+    <p id="loading-msg">INITIALIZING</p>
   </div>
 
-  <!-- ═══════════════════════════════════════════════════════
-       AUTH CONTAINER
-       ═══════════════════════════════════════════════════════ -->
-  <div id="auth-container" class="panel-wrap">
-    <div class="panel auth-panel">
+  <!-- ── AUTH OVERLAY ──────────────────────────────────── -->
+  <div id="auth-container" class="overlay-wrap">
+    <div class="hud-panel auth-panel">
 
       <div class="brand">
         <svg class="brand-mark" viewBox="0 0 40 40" fill="none">
-          <circle cx="20" cy="20" r="18" stroke="currentColor" stroke-width="1.5"/>
-          <path d="M13 14 L13 26 L28 20 Z" fill="currentColor"/>
+          <circle cx="20" cy="20" r="18" stroke="currentColor" stroke-width="1"/>
+          <path d="M15 13 L15 27 L29 20 Z" fill="currentColor"/>
         </svg>
-        <span class="brand-name">OneSong</span>
+        <span class="brand-name">ONESONG</span>
       </div>
 
-      <!-- Login form -->
+      <!-- Login -->
       <div id="login-form">
-        <h2 class="panel-heading">Sign in</h2>
+        <h2 class="panel-heading">SIGN IN</h2>
         <p class="panel-sub">Your one song. Always playing.</p>
         <div class="field-group">
-          <label class="field-label">Email</label>
+          <label class="field-label">EMAIL</label>
           <input id="login-email" type="email" class="field-input" placeholder="you@example.com" autocomplete="email" />
         </div>
         <div class="field-group">
-          <label class="field-label">Password</label>
+          <label class="field-label">PASSWORD</label>
           <input id="login-password" type="password" class="field-input" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter') login()" />
         </div>
         <p id="auth-error" class="form-err hidden"></p>
-        <button class="btn btn-primary" onclick="login()">Sign in</button>
+        <button class="btn btn-primary" onclick="login()">AUTHENTICATE</button>
         <p class="auth-switch">No account? <a href="#" onclick="showSignup(event)">Create one →</a></p>
       </div>
 
-      <!-- Signup form -->
+      <!-- Signup -->
       <div id="signup-form" class="hidden">
-        <h2 class="panel-heading">Create account</h2>
+        <h2 class="panel-heading">CREATE ACCOUNT</h2>
         <p class="panel-sub">Pick your one song. Own it forever.</p>
         <div class="field-group">
-          <label class="field-label">Username</label>
+          <label class="field-label">USERNAME</label>
           <input id="signup-username" type="text" class="field-input" placeholder="yourname" autocomplete="username" />
         </div>
         <div class="field-group">
-          <label class="field-label">Email</label>
+          <label class="field-label">EMAIL</label>
           <input id="signup-email" type="email" class="field-input" placeholder="you@example.com" autocomplete="email" />
         </div>
         <div class="field-group">
-          <label class="field-label">Password</label>
+          <label class="field-label">PASSWORD</label>
           <input id="signup-password" type="password" class="field-input" placeholder="6+ characters" autocomplete="new-password" onkeydown="if(event.key==='Enter') signup()" />
         </div>
-        <button class="btn btn-primary" onclick="signup()">Create account</button>
+        <button class="btn btn-primary" onclick="signup()">CREATE ACCOUNT</button>
         <p class="auth-switch">Have an account? <a href="#" onclick="showLogin(event)">Sign in →</a></p>
       </div>
 
     </div>
   </div>
 
-  <!-- ═══════════════════════════════════════════════════════
-       APP CONTAINER
-       ═══════════════════════════════════════════════════════ -->
+  <!-- ── APP SHELL ─────────────────────────────────────── -->
   <div id="app-container" class="hidden">
 
-    <!-- Top bar -->
+    <!-- Top HUD bar — brand + user -->
     <header class="topbar">
       <div class="brand">
         <svg class="brand-mark" viewBox="0 0 40 40" fill="none">
-          <circle cx="20" cy="20" r="18" stroke="currentColor" stroke-width="1.5"/>
-          <path d="M13 14 L13 26 L28 20 Z" fill="currentColor"/>
+          <circle cx="20" cy="20" r="18" stroke="currentColor" stroke-width="1"/>
+          <path d="M15 13 L15 27 L29 20 Z" fill="currentColor"/>
         </svg>
-        <span class="brand-name">OneSong</span>
+        <span class="brand-name">ONESONG</span>
       </div>
       <div class="topbar-right">
         <span class="user-chip">
           <svg viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6"/></svg>
           <span id="user-label"></span>
         </span>
-        <button class="btn btn-ghost btn-sm" onclick="logout()">Sign out</button>
+        <button class="btn-text" onclick="logout()">SIGN OUT</button>
       </div>
     </header>
 
-    <!-- ── NOW PLAYING ────────────────────────────────── -->
-    <div id="now-playing" class="content-wrap hidden">
+    <!-- ── NOW PLAYING ──────────────────────────────────── -->
+    <div id="now-playing" class="screen hidden">
 
-      <div class="now-playing-card">
-
-        <!-- Song info -->
-        <div class="song-info">
-          <div class="vinyl-ring">
-            <div class="vinyl-groove"></div>
-            <div class="vinyl-center"></div>
-          </div>
-          <div class="song-text">
-            <h1 id="song-title" class="song-title">—</h1>
-            <p  id="song-artist" class="song-artist">—</p>
-          </div>
-        </div>
-
-        <!-- Waveform bars (decorative, audio-reactive via CSS) -->
-        <div class="waveform" id="waveform-bars" aria-hidden="true">
-          <span></span><span></span><span></span><span></span><span></span>
-          <span></span><span></span><span></span><span></span><span></span>
-          <span></span><span></span><span></span><span></span><span></span>
-        </div>
-
-        <!-- Seek bar -->
-        <div class="seek-wrap">
-          <span id="time-cur" class="time-label">0:00</span>
-          <div class="progress-track" onclick="seekTo(event.offsetX / this.offsetWidth * parseFloat(document.getElementById('seek-slider').max))">
-            <div id="progress-fill" class="progress-fill"></div>
-          </div>
-          <span id="time-tot" class="time-label">—:——</span>
-        </div>
-        <!-- Hidden range input for seek logic -->
-        <input id="seek-slider" type="range" min="0" max="300" step="0.1" value="0"
-               class="sr-only" oninput="seekTo(this.value)" />
-
-        <!-- Transport controls -->
-        <div class="controls-row">
-          <button class="btn-icon" title="Change song" onclick="showSongSelection()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M12 5v14M5 12l7-7 7 7"/>
-            </svg>
-          </button>
-
-          <button id="play-btn" class="btn-play" onclick="togglePlay()" disabled title="Play / Pause">
-            <span id="ico-play">
-              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 3l14 9-14 9V3z"/></svg>
-            </span>
-            <span id="ico-pause" class="hidden">
-              <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
-            </span>
-          </button>
-
-          <div class="vol-wrap" title="Volume">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M11 5L6 9H2v6h4l5 4V5z"/>
-              <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
-              <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
-            </svg>
-            <input id="vol-slider" type="range" min="0" max="1" step="0.01" value="0.85"
-                   class="vol-slider" oninput="setVolume(this.value)" />
-          </div>
-        </div>
-
-        <!-- Analysis status badge -->
+      <!-- Song identity — top-center floating tag -->
+      <div class="song-identity">
+        <p id="song-artist" class="song-artist">—</p>
+        <h1 id="song-title" class="song-title">—</h1>
         <p id="analysis-status" class="analysis-status"></p>
+      </div>
 
-      </div><!-- /.now-playing-card -->
+      <!-- Waveform bars — decorative -->
+      <div class="waveform" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span>
+        <span></span><span></span><span></span><span></span><span></span>
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
 
+      <!-- Bottom HUD transport bar -->
+      <div class="transport-bar">
+
+        <!-- Spectrum progress track — full width, transform:scaleX -->
+        <div class="progress-wrap">
+          <div class="progress-track"
+               onclick="seekTo(event.offsetX / this.offsetWidth * parseFloat(document.getElementById('seek-slider').max))">
+            <div id="progress-fill" class="progress-fill"></div>
+            <!-- Glow pulse element driven by uHigh via JS class -->
+            <div id="progress-glow" class="progress-glow"></div>
+          </div>
+          <input id="seek-slider" type="range" min="0" max="300" step="0.1" value="0"
+                 class="sr-only" oninput="seekTo(this.value)" />
+        </div>
+
+        <!-- Controls row -->
+        <div class="controls-row">
+          <div class="controls-left">
+            <span id="time-cur" class="time-label">0:00</span>
+            <span class="time-sep">/</span>
+            <span id="time-tot" class="time-label">—:——</span>
+          </div>
+
+          <div class="controls-center">
+            <!-- Change song -->
+            <button class="hud-btn" title="Change song" onclick="showSongSelection()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                <path d="M4 6h16M4 12h10M4 18h7"/>
+                <path d="M19 15l3 3-3 3"/>
+              </svg>
+            </button>
+
+            <!-- Play / Pause -->
+            <button id="play-btn" class="hud-btn play-btn" onclick="togglePlay()" disabled title="Play / Pause">
+              <span id="ico-play">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 3l14 9-14 9V3z"/></svg>
+              </span>
+              <span id="ico-pause" class="hidden">
+                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+              </span>
+            </button>
+
+            <!-- Volume -->
+            <div class="vol-wrap">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+                <path d="M11 5L6 9H2v6h4l5 4V5z"/>
+                <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+              </svg>
+              <input id="vol-slider" type="range" min="0" max="1" step="0.01" value="0.85"
+                     class="vol-slider" oninput="setVolume(this.value)" />
+            </div>
+          </div>
+
+          <div class="controls-right">
+            <!-- Spectrum dots — visual accent, driven by CSS -->
+            <div class="spec-dots" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /.transport-bar -->
     </div><!-- /#now-playing -->
 
-    <!-- ── SONG SELECTION ─────────────────────────────── -->
-    <div id="song-selection" class="content-wrap hidden">
-
-      <div class="panel upload-panel">
-        <h2 class="panel-heading">Your Song</h2>
+    <!-- ── SONG SELECTION ───────────────────────────────── -->
+    <div id="song-selection" class="screen hidden">
+      <div class="hud-panel upload-panel">
+        <div class="panel-header-row">
+          <h2 class="panel-heading">YOUR SONG</h2>
+          <button id="cancel-btn" class="btn-text hidden" onclick="cancelSongSelection()">← BACK</button>
+        </div>
         <p class="panel-sub">Upload an audio file. One song. Make it count.</p>
 
         <div class="field-group">
-          <label class="field-label">Song name</label>
+          <label class="field-label">SONG TITLE</label>
           <input id="inp-song" type="text" class="field-input" placeholder="Song title" />
         </div>
         <div class="field-group">
-          <label class="field-label">Artist</label>
+          <label class="field-label">ARTIST</label>
           <input id="inp-artist" type="text" class="field-input" placeholder="Artist name" />
         </div>
 
         <div class="field-group">
-          <label class="field-label">Audio file</label>
+          <label class="field-label">AUDIO FILE</label>
           <label class="file-drop" for="inp-file">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
               <polyline points="17 8 12 3 7 8"/>
               <line x1="12" y1="3" x2="12" y2="15"/>
             </svg>
-            <span id="file-label">Choose audio file…</span>
-            <small>MP3, WAV, FLAC, OGG, M4A · Max 50 MB</small>
+            <span id="file-label">CHOOSE FILE</span>
+            <small>MP3 · WAV · FLAC · OGG · M4A · MAX 50MB</small>
           </label>
           <input id="inp-file" type="file"
                  accept=".mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.weba"
-                 class="sr-only"
-                 onchange="onFileSelected(this)" />
+                 class="sr-only" onchange="onFileSelected(this)" />
         </div>
 
-        <!-- Upload progress bar -->
         <div id="upload-bar-wrap" class="upload-bar-wrap hidden">
           <div id="upload-bar" class="upload-bar"></div>
         </div>
 
         <p id="form-err" class="form-err hidden"></p>
 
-        <div class="btn-row">
-          <button id="cancel-btn" class="btn btn-ghost hidden" onclick="cancelSongSelection()">Cancel</button>
-          <button class="btn btn-primary" onclick="saveSong()">Save &amp; Visualize</button>
-        </div>
-
+        <button class="btn btn-primary" onclick="saveSong()">UPLOAD &amp; VISUALIZE</button>
       </div>
-
     </div><!-- /#song-selection -->
 
   </div><!-- /#app-container -->
 
-
-  <!-- ═══════════════════════════════════════════════════════
-       SCRIPTS — ORDER IS CRITICAL
-       ═══════════════════════════════════════════════════════
-
-    Load order:
-      1. Three.js r128 core (defines THREE namespace)
-      2. GPUComputationRenderer (extends THREE)
-      3. Post-processing shaders (CopyShader, LuminosityHighPassShader)
-      4. EffectComposer + passes (depend on shaders)
-      5. gradientController.js (optional Essentia timeline reader)
-      6. ambient.js (depends on THREE + GPUComputationRenderer + EffectComposer)
-      7. app.js (depends on ambient.js + DOM)
-
-       The GPUComputationRenderer and EffectComposer are in Three.js'
-       examples/js directory — they extend the THREE namespace so they
-       must load AFTER Three.js core and BEFORE ambient.js.
-       ═══════════════════════════════════════════════════════ -->
-
-  <!-- 1. Three.js r128 core -->
+  <!-- Scripts — order critical -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-
-  <!-- 2. GPUComputationRenderer — GPGPU ping-pong simulation -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/misc/GPUComputationRenderer.js"></script>
-
-  <!-- 3. Shaders required by post-processing passes -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
-
-  <!-- 4. EffectComposer + render/bloom passes -->
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
-
-  <!-- 5. Essentia timeline → gradient controller (optional, degrades gracefully) -->
   <script src="gradientController.js"></script>
-
-  <!-- 6. GPGPU visual engine — starts loop on init() -->
   <script src="ambient.js"></script>
-
-  <!-- 7. App logic — calls Ambient.init() on DOMContentLoaded -->
   <script src="app.js"></script>
+
+  <!-- uHigh → progress glow bridge -->
+  <script>
+    // Lightweight RAF bridge: reads uHigh from Ambient audio state
+    // and drives the progress bar glow intensity via CSS custom property.
+    // Runs outside the main render loop — no WebGL coupling.
+    (function hudBridge() {
+      const glow = document.getElementById('progress-glow');
+      const bar  = document.getElementById('app-container');
+      let   prev = 0;
+      function tick() {
+        requestAnimationFrame(tick);
+        // Ambient exposes _audio indirectly; we tap the DOM class set by app.js
+        const playing = document.body.classList.contains('is-playing');
+        if (!playing) { prev *= 0.85; } 
+        // Glow intensity is set by app.js calling a global hook (see below)
+        if (glow) glow.style.setProperty('--glow-intensity', prev.toFixed(3));
+      }
+      tick();
+      // Hook for app.js to push uHigh each analysis frame
+      window._setHudHighFreq = function(v) { prev = v; };
+    })();
+  </script>
 
 </body>
 </html>
